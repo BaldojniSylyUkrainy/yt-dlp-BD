@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { downloadDir } from "@tauri-apps/api/path";
 import { open } from "@tauri-apps/plugin-dialog";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
+import brandLogo from "./assets/logo.png";
 import "./App.css";
 
 type ComponentStatus = {
@@ -47,6 +48,8 @@ type Job = {
   eta: string;
   message: string;
 };
+
+type RuntimeStage = "ytDlp" | "ffmpeg" | "deno" | null;
 
 type IconName =
   | "download"
@@ -94,8 +97,10 @@ function shortVersion(value: string | null): string {
 }
 
 function App() {
+  const maintenanceStarted = useRef(false);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [runtimeBusy, setRuntimeBusy] = useState(false);
+  const [runtimeStage, setRuntimeStage] = useState<RuntimeStage>(null);
   const [runtimeError, setRuntimeError] = useState("");
   const [url, setUrl] = useState("");
   const [outputDir, setOutputDir] = useState(localStorage.getItem("outputDir") || "");
@@ -114,28 +119,45 @@ function App() {
 
   const active = job && ["starting", "downloading"].includes(job.status);
   const host = useMemo(() => hostFromInput(url), [url]);
+  const runtimeReady = Boolean(runtime?.ytDlp.installed && runtime?.ffmpeg.installed && runtime?.deno.installed);
 
-  const refreshRuntime = useCallback(async () => {
-    try {
-      setRuntime(await invoke<RuntimeStatus>("runtime_status"));
-      setRuntimeError("");
-    } catch (error) {
-      setRuntimeError(String(error));
-    }
-  }, []);
-
-  const installRuntime = useCallback(async () => {
+  const maintainRuntime = useCallback(async () => {
     setRuntimeBusy(true);
     setRuntimeError("");
+    const issues: string[] = [];
     try {
       let status = await invoke<RuntimeStatus>("runtime_status");
-      if (!status.ytDlp.installed) status = await invoke<RuntimeStatus>("install_ytdlp");
-      if (!status.ffmpeg.installed) status = await invoke<RuntimeStatus>("install_ffmpeg");
-      if (!status.deno.installed) status = await invoke<RuntimeStatus>("install_deno");
       setRuntime(status);
+
+      setRuntimeStage("ytDlp");
+      try {
+        status = await invoke<RuntimeStatus>(status.ytDlp.installed ? "update_ytdlp" : "install_ytdlp");
+        setRuntime(status);
+      } catch (error) {
+        issues.push(`yt-dlp: ${String(error)}`);
+      }
+
+      setRuntimeStage("ffmpeg");
+      try {
+        status = await invoke<RuntimeStatus>("install_ffmpeg");
+        setRuntime(status);
+      } catch (error) {
+        issues.push(`ffmpeg: ${String(error)}`);
+      }
+
+      setRuntimeStage("deno");
+      try {
+        status = await invoke<RuntimeStatus>("install_deno");
+        setRuntime(status);
+      } catch (error) {
+        issues.push(`Deno: ${String(error)}`);
+      }
+
+      setRuntimeError(issues.join(" · "));
     } catch (error) {
       setRuntimeError(String(error));
     } finally {
+      setRuntimeStage(null);
       setRuntimeBusy(false);
     }
   }, []);
@@ -148,17 +170,12 @@ function App() {
         return directory;
       });
     }).catch(() => undefined);
-    (async () => {
-      try {
-        const status = await invoke<RuntimeStatus>("runtime_status");
-        setRuntime(status);
-        if (!status.ytDlp.installed || !status.ffmpeg.installed || !status.deno.installed) await installRuntime();
-      } catch {
-        // The runtime card exposes a retry action.
-      }
-    })();
+    if (!maintenanceStarted.current) {
+      maintenanceStarted.current = true;
+      maintainRuntime();
+    }
     check({ timeout: 8_000 }).then(setUpdate).catch(() => undefined);
-  }, [installRuntime]);
+  }, [maintainRuntime]);
 
   useEffect(() => {
     const unlisten = listen<DownloadEvent>("download-event", ({ payload }) => {
@@ -228,8 +245,8 @@ function App() {
       setFormError("Оберіть папку для завантаження");
       return;
     }
-    if (!runtime?.ytDlp.installed) {
-      setFormError("Зачекайте, поки yt-dlp буде встановлено");
+    if (!runtimeReady) {
+      setFormError("Компоненти ще готуються. Зачекайте кілька секунд");
       return;
     }
 
@@ -296,7 +313,7 @@ function App() {
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand">
-          <div className="brand-mark"><span>BD</span></div>
+          <div className="brand-mark"><img src={brandLogo} alt="" /></div>
           <div><strong>yt-dlp BD</strong><small>Baldojnyi Downloader</small></div>
         </div>
         <nav>
@@ -305,12 +322,10 @@ function App() {
           <button className="nav-item"><Icon name="settings" />Налаштування<span className="soon">згодом</span></button>
         </nav>
         <div className="runtime-panel">
-          <div className="runtime-heading"><span>Компоненти</span><button aria-label="Оновити статус" onClick={refreshRuntime}><Icon name="refresh" size={15}/></button></div>
-          <RuntimeRow label="yt-dlp" component={runtime?.ytDlp} loading={runtimeBusy} />
-          <RuntimeRow label="ffmpeg" component={runtime?.ffmpeg} />
-          <RuntimeRow label="Deno" component={runtime?.deno} />
-          {(!runtime?.ytDlp.installed || !runtime?.ffmpeg.installed || !runtime?.deno.installed) && <button className="runtime-action" disabled={runtimeBusy} onClick={installRuntime}>{runtimeBusy ? "Встановлення…" : "Встановити компоненти"}</button>}
-          {runtime?.ytDlp.installed && runtime?.ffmpeg.installed && runtime?.deno.installed && <button className="runtime-action ghost" disabled={runtimeBusy} onClick={async () => { setRuntimeBusy(true); try { let status = await invoke<RuntimeStatus>("update_ytdlp"); if (status.ffmpeg.managed) status = await invoke<RuntimeStatus>("install_ffmpeg"); if (status.deno.managed) status = await invoke<RuntimeStatus>("install_deno"); setRuntime(status); } catch (error) { setRuntimeError(String(error)); } finally { setRuntimeBusy(false); } }}>Оновити компоненти</button>}
+          <div className="runtime-heading"><span>Компоненти</span><small>{runtimeBusy ? "перевірка" : runtimeReady ? "готові" : "очікуємо"}</small></div>
+          <RuntimeRow label="yt-dlp" component={runtime?.ytDlp} loading={runtimeStage === "ytDlp"} />
+          <RuntimeRow label="ffmpeg" component={runtime?.ffmpeg} loading={runtimeStage === "ffmpeg"} />
+          <RuntimeRow label="Deno" component={runtime?.deno} loading={runtimeStage === "deno"} />
           {runtimeError && <p className="runtime-error">{runtimeError}</p>}
         </div>
         <div className="sidebar-footer"><span className="status-dot"/>Версія 0.1.0 · Apple Silicon</div>
@@ -319,13 +334,12 @@ function App() {
       <main className="main-content">
         <header className="topbar">
           <div><p className="eyebrow">НОВЕ ЗАВАНТАЖЕННЯ</p><h1>Збережіть те, що хочете</h1><p>Вставте посилання — усе інше зробить yt-dlp BD.</p></div>
-          <div className="top-actions">
-            {update && <button className="update-pill" disabled={updateBusy} onClick={installAppUpdate}><Icon name="refresh" size={16}/>{updateBusy ? `Оновлення ${updateProgress}%` : `Доступна v${update.version}`}</button>}
-            <div className="security-pill"><Icon name="shield" size={16}/><span>VPN-захист</span><strong>увімкнено</strong></div>
-          </div>
+          {update && <button className="update-pill" disabled={updateBusy} onClick={installAppUpdate}><Icon name="refresh" size={16}/>{updateBusy ? `Оновлення ${updateProgress}%` : `Доступна v${update.version}`}</button>}
+          <img className="hero-mark" src={brandLogo} alt="" aria-hidden="true" />
         </header>
 
         <section className="download-card">
+          <div className="folk-thread" aria-hidden="true"><span/><span/><i/><span/><span/></div>
           <label className="field-label" htmlFor="media-url">Посилання</label>
           <div className={`url-field ${host ? "valid" : ""}`}>
             <Icon name="link" />
@@ -359,7 +373,8 @@ function App() {
           </div>
 
           {formError && <div className="inline-error">{formError}</div>}
-          <button className="primary-button" disabled={!url.trim() || !!active || pendingStart || runtimeBusy} onClick={() => beginDownload()}><Icon name="download" />{pendingStart ? "Перевіряємо…" : active ? "Завантаження триває" : "Завантажити"}</button>
+          {runtimeBusy && <div className="runtime-notice"><span/><div><strong>Готуємо компоненти</strong><small>Перевіряємо {runtimeStage === "ytDlp" ? "yt-dlp" : runtimeStage === "ffmpeg" ? "ffmpeg" : runtimeStage === "deno" ? "Deno" : "середовище"}. Завантаження стане доступним автоматично.</small></div></div>}
+          <button className="primary-button" disabled={!url.trim() || !!active || pendingStart || runtimeBusy || !runtimeReady} onClick={() => beginDownload()}><Icon name="download" />{runtimeBusy ? "Оновлюємо компоненти…" : pendingStart ? "Перевіряємо…" : active ? "Завантаження триває" : "Завантажити"}</button>
           <p className="legal-note">Завантажуйте лише матеріали, на які маєте відповідні права.</p>
         </section>
 
@@ -402,7 +417,7 @@ function App() {
 
 function RuntimeRow({ label, component, loading = false }: { label: string; component?: ComponentStatus; loading?: boolean }) {
   const ready = component?.installed;
-  return <div className="runtime-row"><span className={`component-dot ${loading ? "loading" : ready ? "ready" : "missing"}`}/><div><strong>{label}</strong><small>{loading ? "Оновлюємо…" : ready ? shortVersion(component.version) : "Потрібне встановлення"}</small></div>{ready && <Icon name="check" size={15}/>}</div>;
+  return <div className="runtime-row"><span className={`component-dot ${loading ? "loading" : ready ? "ready" : "missing"}`}/><div><strong>{label}</strong><small>{loading ? "Перевіряємо й оновлюємо…" : ready ? shortVersion(component.version) : "Готуємо автоматично"}</small></div>{ready && !loading && <Icon name="check" size={15}/>}</div>;
 }
 
 export default App;

@@ -7,8 +7,8 @@
 ## Що вже працює
 
 - нативний Tauri 2 застосунок для macOS Apple Silicon;
-- автоматичне встановлення офіційного yt-dlp nightly;
-- автоматичне виявлення ffmpeg та portable-інсталятор для чистих Mac;
+- автоматичне встановлення й оновлення офіційного стабільного yt-dlp;
+- власні керовані ffmpeg/ffprobe, що автоматично відновлюються й оновлюються;
 - автоматичне встановлення офіційного Deno для повної підтримки YouTube;
 - відео, audio-only, вибір якості, субтитри та папка збереження;
 - живий прогрес і скасування завантаження;
@@ -45,7 +45,7 @@ npm run build:mac
 
 ## Runtime-джерела
 
-- yt-dlp: офіційний [nightly release channel](https://github.com/yt-dlp/yt-dlp-nightly-builds/releases);
+- yt-dlp: офіційні [стабільні релізи](https://github.com/yt-dlp/yt-dlp/releases);
 - Deno: офіційні [Deno releases](https://github.com/denoland/deno/releases);
 - ffmpeg/ffprobe для Apple Silicon: підписані macOS release builds із [Martin Riedl’s FFmpeg Build Server](https://ffmpeg.martin-riedl.de/), з обов’язковою SHA-256 перевіркою.
 

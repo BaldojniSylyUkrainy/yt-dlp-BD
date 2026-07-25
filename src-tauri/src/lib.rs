@@ -15,8 +15,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use url::Url;
 use uuid::Uuid;
 
-const YTDLP_RELEASE_BASE: &str =
-    "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download";
+const YTDLP_RELEASE_BASE: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download";
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -104,47 +103,38 @@ fn command_version(path: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn find_ffmpeg(app: &AppHandle) -> Result<ComponentStatus, String> {
-    let managed_path = runtime_dir(app)?.join(if cfg!(target_os = "windows") {
+    let directory = runtime_dir(app)?;
+    let managed_path = directory.join(if cfg!(target_os = "windows") {
         "ffmpeg.exe"
     } else {
         "ffmpeg"
     });
+    let probe_path = directory.join(if cfg!(target_os = "windows") {
+        "ffprobe.exe"
+    } else {
+        "ffprobe"
+    });
 
-    let mut candidates = vec![(managed_path, true)];
-    #[cfg(target_os = "macos")]
-    {
-        candidates.push((PathBuf::from("/opt/homebrew/bin/ffmpeg"), false));
-        candidates.push((PathBuf::from("/usr/local/bin/ffmpeg"), false));
-    }
-
-    for (path, managed) in candidates {
-        if path.is_file() {
-            if let Some(version) = command_version(&path, &["-version"]) {
-                let first_line = version.lines().next().unwrap_or(&version).to_string();
-                return Ok(ComponentStatus {
-                    installed: true,
-                    version: Some(first_line),
-                    path: Some(path.to_string_lossy().to_string()),
-                    managed,
-                });
-            }
+    if managed_path.is_file() && probe_path.is_file() {
+        if let (Some(version), Some(_)) = (
+            command_version(&managed_path, &["-version"]),
+            command_version(&probe_path, &["-version"]),
+        ) {
+            let first_line = version.lines().next().unwrap_or(&version).to_string();
+            return Ok(ComponentStatus {
+                installed: true,
+                version: Some(first_line),
+                path: Some(managed_path.to_string_lossy().to_string()),
+                managed: true,
+            });
         }
-    }
-
-    if let Some(version) = command_version(Path::new("ffmpeg"), &["-version"]) {
-        return Ok(ComponentStatus {
-            installed: true,
-            version: Some(version.lines().next().unwrap_or(&version).to_string()),
-            path: Some("ffmpeg".into()),
-            managed: false,
-        });
     }
 
     Ok(ComponentStatus {
         installed: false,
         version: None,
         path: None,
-        managed: false,
+        managed: true,
     })
 }
 
@@ -154,40 +144,22 @@ fn find_deno(app: &AppHandle) -> Result<ComponentStatus, String> {
     } else {
         "deno"
     });
-    let mut candidates = vec![(managed_path, true)];
-    #[cfg(target_os = "macos")]
-    {
-        candidates.push((PathBuf::from("/opt/homebrew/bin/deno"), false));
-        candidates.push((PathBuf::from("/usr/local/bin/deno"), false));
-        if let Ok(home) = app.path().home_dir() {
-            candidates.push((home.join(".deno/bin/deno"), false));
+    if managed_path.is_file() {
+        if let Some(version) = command_version(&managed_path, &["--version"]) {
+            return Ok(ComponentStatus {
+                installed: true,
+                version: Some(version.lines().next().unwrap_or(&version).to_string()),
+                path: Some(managed_path.to_string_lossy().to_string()),
+                managed: true,
+            });
         }
     }
-    for (path, managed) in candidates {
-        if path.is_file() {
-            if let Some(version) = command_version(&path, &["--version"]) {
-                return Ok(ComponentStatus {
-                    installed: true,
-                    version: Some(version.lines().next().unwrap_or(&version).to_string()),
-                    path: Some(path.to_string_lossy().to_string()),
-                    managed,
-                });
-            }
-        }
-    }
-    if let Some(version) = command_version(Path::new("deno"), &["--version"]) {
-        return Ok(ComponentStatus {
-            installed: true,
-            version: Some(version.lines().next().unwrap_or(&version).to_string()),
-            path: Some("deno".into()),
-            managed: false,
-        });
-    }
+
     Ok(ComponentStatus {
         installed: false,
         version: None,
         path: None,
-        managed: false,
+        managed: true,
     })
 }
 
@@ -228,7 +200,28 @@ async fn fetch_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, Str
     Ok(bytes.to_vec())
 }
 
-fn verify_sha256(bytes: &[u8], checksum_file: &[u8], label: &str) -> Result<(), String> {
+fn ffmpeg_release_asset(page: &str, filename: &str) -> Result<String, String> {
+    let release_section = page
+        .split_once("<h2>Download Release Build</h2>")
+        .map(|(_, section)| section)
+        .ok_or_else(|| "Сервер ffmpeg не повідомив про стабільний реліз".to_string())?;
+    let architecture_prefix = "/download/macos/arm64/";
+
+    for candidate in release_section.split("href=\"").skip(1) {
+        let Some(path) = candidate.split('"').next() else {
+            continue;
+        };
+        if path.starts_with(architecture_prefix) && path.ends_with(filename) {
+            return Ok(format!("https://ffmpeg.martin-riedl.de{path}"));
+        }
+    }
+
+    Err(format!(
+        "Сервер ffmpeg не надав {filename} для macOS Apple Silicon"
+    ))
+}
+
+fn checksum_value(checksum_file: &[u8], label: &str) -> Result<String, String> {
     let checksum = String::from_utf8(checksum_file.to_vec())
         .map_err(|_| format!("Контрольна сума {label} має неправильний формат"))?;
     let expected = checksum
@@ -236,6 +229,11 @@ fn verify_sha256(bytes: &[u8], checksum_file: &[u8], label: &str) -> Result<(), 
         .next()
         .ok_or_else(|| format!("Контрольна сума {label} порожня"))?
         .to_ascii_lowercase();
+    Ok(expected)
+}
+
+fn verify_sha256(bytes: &[u8], checksum_file: &[u8], label: &str) -> Result<(), String> {
+    let expected = checksum_value(checksum_file, label)?;
     let actual = format!("{:x}", Sha256::digest(bytes));
     if actual != expected {
         return Err(format!("Контрольна сума {label} не збігається"));
@@ -243,7 +241,11 @@ fn verify_sha256(bytes: &[u8], checksum_file: &[u8], label: &str) -> Result<(), 
     Ok(())
 }
 
-fn extract_binary(archive_bytes: &[u8], binary_name: &str, destination: &Path) -> Result<(), String> {
+fn extract_binary(
+    archive_bytes: &[u8],
+    binary_name: &str,
+    destination: &Path,
+) -> Result<(), String> {
     let reader = Cursor::new(archive_bytes);
     let mut archive = zip::ZipArchive::new(reader)
         .map_err(|error| format!("Не вдалося відкрити архів {binary_name}: {error}"))?;
@@ -252,7 +254,11 @@ fn extract_binary(archive_bytes: &[u8], binary_name: &str, destination: &Path) -
             archive
                 .by_index(*index)
                 .ok()
-                .and_then(|file| Path::new(file.name()).file_name().map(|name| name == binary_name))
+                .and_then(|file| {
+                    Path::new(file.name())
+                        .file_name()
+                        .map(|name| name == binary_name)
+                })
                 .unwrap_or(false)
         })
         .ok_or_else(|| format!("В архіві не знайдено {binary_name}"))?;
@@ -286,27 +292,56 @@ async fn install_ffmpeg(app: AppHandle) -> Result<RuntimeStatus, String> {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        const BASE: &str =
-            "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release";
+        const RELEASES_PAGE: &str = "https://ffmpeg.martin-riedl.de/";
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::limited(10))
             .build()
             .map_err(|error| format!("Не вдалося підготувати завантаження: {error}"))?;
-        let ffmpeg_url = format!("{BASE}/ffmpeg.zip");
-        let ffmpeg_checksum_url = format!("{BASE}/ffmpeg.zip.sha256");
-        let ffprobe_url = format!("{BASE}/ffprobe.zip");
-        let ffprobe_checksum_url = format!("{BASE}/ffprobe.zip.sha256");
-        let (ffmpeg_zip, ffmpeg_checksum, ffprobe_zip, ffprobe_checksum) = tokio::try_join!(
-            fetch_bytes(&client, &ffmpeg_url),
+        let page = fetch_bytes(&client, RELEASES_PAGE).await?;
+        let page = String::from_utf8(page)
+            .map_err(|_| "Сторінка релізів ffmpeg має неправильний формат".to_string())?;
+        let ffmpeg_url = ffmpeg_release_asset(&page, "ffmpeg.zip")?;
+        let ffprobe_url = ffmpeg_release_asset(&page, "ffprobe.zip")?;
+        eprintln!("Перевіряємо стабільний ffmpeg: {ffmpeg_url}");
+        let ffmpeg_checksum_url = format!("{ffmpeg_url}.sha256");
+        let ffprobe_checksum_url = format!("{ffprobe_url}.sha256");
+        let (ffmpeg_checksum, ffprobe_checksum) = tokio::try_join!(
             fetch_bytes(&client, &ffmpeg_checksum_url),
-            fetch_bytes(&client, &ffprobe_url),
             fetch_bytes(&client, &ffprobe_checksum_url)
+        )?;
+        let ffmpeg_expected = checksum_value(&ffmpeg_checksum, "ffmpeg")?;
+        let ffprobe_expected = checksum_value(&ffprobe_checksum, "ffprobe")?;
+        let directory = runtime_dir(&app)?;
+        let ffmpeg_path = directory.join("ffmpeg");
+        let ffprobe_path = directory.join("ffprobe");
+        let ffmpeg_stamp = directory.join(".ffmpeg.sha256");
+        let ffprobe_stamp = directory.join(".ffprobe.sha256");
+        let current = command_version(&ffmpeg_path, &["-version"]).is_some()
+            && command_version(&ffprobe_path, &["-version"]).is_some()
+            && fs::read_to_string(&ffmpeg_stamp)
+                .map(|value| value.trim() == ffmpeg_expected)
+                .unwrap_or(false)
+            && fs::read_to_string(&ffprobe_stamp)
+                .map(|value| value.trim() == ffprobe_expected)
+                .unwrap_or(false);
+        if current {
+            eprintln!("Керований ffmpeg вже актуальний");
+            return runtime_status(app);
+        }
+
+        eprintln!("Завантажуємо керовані ffmpeg та ffprobe");
+        let (ffmpeg_zip, ffprobe_zip) = tokio::try_join!(
+            fetch_bytes(&client, &ffmpeg_url),
+            fetch_bytes(&client, &ffprobe_url)
         )?;
         verify_sha256(&ffmpeg_zip, &ffmpeg_checksum, "ffmpeg")?;
         verify_sha256(&ffprobe_zip, &ffprobe_checksum, "ffprobe")?;
-        let directory = runtime_dir(&app)?;
-        extract_binary(&ffmpeg_zip, "ffmpeg", &directory.join("ffmpeg"))?;
-        extract_binary(&ffprobe_zip, "ffprobe", &directory.join("ffprobe"))?;
+        extract_binary(&ffmpeg_zip, "ffmpeg", &ffmpeg_path)?;
+        extract_binary(&ffprobe_zip, "ffprobe", &ffprobe_path)?;
+        fs::write(ffmpeg_stamp, ffmpeg_expected)
+            .map_err(|error| format!("Не вдалося зберегти версію ffmpeg: {error}"))?;
+        fs::write(ffprobe_stamp, ffprobe_expected)
+            .map_err(|error| format!("Не вдалося зберегти версію ffprobe: {error}"))?;
         runtime_status(app)
     }
 }
@@ -333,17 +368,29 @@ async fn install_deno(app: AppHandle) -> Result<RuntimeStatus, String> {
         .redirect(reqwest::redirect::Policy::limited(10))
         .build()
         .map_err(|error| format!("Не вдалося підготувати завантаження Deno: {error}"))?;
-    let (archive, checksum) = tokio::try_join!(
-        fetch_bytes(&client, &archive_url),
-        fetch_bytes(&client, &checksum_url)
-    )?;
-    verify_sha256(&archive, &checksum, "Deno")?;
+    let checksum = fetch_bytes(&client, &checksum_url).await?;
+    let expected = checksum_value(&checksum, "Deno")?;
     let filename = if cfg!(target_os = "windows") {
         "deno.exe"
     } else {
         "deno"
     };
-    extract_binary(&archive, filename, &runtime_dir(&app)?.join(filename))?;
+    let directory = runtime_dir(&app)?;
+    let destination = directory.join(filename);
+    let stamp = directory.join(".deno.sha256");
+    let current = command_version(&destination, &["--version"]).is_some()
+        && fs::read_to_string(&stamp)
+            .map(|value| value.trim() == expected)
+            .unwrap_or(false);
+    if current {
+        return runtime_status(app);
+    }
+
+    let archive = fetch_bytes(&client, &archive_url).await?;
+    verify_sha256(&archive, &checksum, "Deno")?;
+    extract_binary(&archive, filename, &destination)?;
+    fs::write(stamp, expected)
+        .map_err(|error| format!("Не вдалося зберегти версію Deno: {error}"))?;
     runtime_status(app)
 }
 
@@ -365,10 +412,7 @@ async fn install_ytdlp(app: AppHandle) -> Result<RuntimeStatus, String> {
     let binary_url = format!("{YTDLP_RELEASE_BASE}/{asset_name}");
     let checksums_url = format!("{YTDLP_RELEASE_BASE}/SHA2-256SUMS");
 
-    let (binary, checksums) = tokio::try_join!(
-        fetch_bytes(&client, &binary_url),
-        fetch_bytes(&client, &checksums_url)
-    )?;
+    let checksums = fetch_bytes(&client, &checksums_url).await?;
     let checksums = String::from_utf8(checksums)
         .map_err(|_| "Файл контрольних сум має неправильний формат".to_string())?;
     let expected = checksums
@@ -381,12 +425,23 @@ async fn install_ytdlp(app: AppHandle) -> Result<RuntimeStatus, String> {
             (filename.trim_start_matches('*') == asset_name).then(|| hash.to_lowercase())
         })
         .ok_or_else(|| "Не вдалося знайти контрольну суму yt-dlp".to_string())?;
+
+    let destination = yt_dlp_path(&app)?;
+    let current = fs::read(&destination)
+        .map(|binary| format!("{:x}", Sha256::digest(binary)) == expected)
+        .unwrap_or(false)
+        && command_version(&destination, &["--version"]).is_some();
+    if current {
+        return runtime_status(app);
+    }
+
+    eprintln!("Завантажуємо стабільний yt-dlp");
+    let binary = fetch_bytes(&client, &binary_url).await?;
     let actual = format!("{:x}", Sha256::digest(&binary));
     if actual != expected {
         return Err("Контрольна сума yt-dlp не збігається. Файл не встановлено".into());
     }
 
-    let destination = yt_dlp_path(&app)?;
     let temporary = destination.with_extension("download");
     fs::write(&temporary, &binary)
         .map_err(|error| format!("Не вдалося записати yt-dlp: {error}"))?;
@@ -409,19 +464,12 @@ async fn install_ytdlp(app: AppHandle) -> Result<RuntimeStatus, String> {
 }
 
 #[tauri::command]
-fn update_ytdlp(app: AppHandle) -> Result<RuntimeStatus, String> {
-    let path = yt_dlp_path(&app)?;
-    if !path.is_file() {
-        return Err("yt-dlp ще не встановлено".into());
+async fn update_ytdlp(app: AppHandle) -> Result<RuntimeStatus, String> {
+    let result = install_ytdlp(app).await;
+    if let Err(error) = &result {
+        eprintln!("Не вдалося оновити yt-dlp: {error}");
     }
-    let output = Command::new(&path)
-        .args(["--update-to", "nightly"])
-        .output()
-        .map_err(|error| format!("Не вдалося запустити оновлення: {error}"))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-    }
-    runtime_status(app)
+    result
 }
 
 fn is_tunnel_interface(interface_name: &str) -> bool {
@@ -466,24 +514,16 @@ fn check_vpn(host: String) -> Result<VpnStatus, String> {
             .as_deref()
             .map(is_tunnel_interface)
             .unwrap_or(false);
-        let system_vpn_connected = Command::new("/usr/sbin/scutil")
-            .args(["--nc", "list"])
-            .output()
-            .ok()
-            .map(|output| String::from_utf8_lossy(&output.stdout).contains("(Connected)"))
-            .unwrap_or(false);
-        let detected = routed_through_tunnel || system_vpn_connected;
+        let detected = routed_through_tunnel;
         let detail = if routed_through_tunnel {
-            "Маршрут до ресурсу проходить через тунельний інтерфейс"
-        } else if system_vpn_connected {
-            "macOS повідомляє про активне VPN-з'єднання"
+            "Маршрут саме до цього ресурсу проходить через VPN-тунель"
         } else {
-            "Активне VPN-з'єднання не виявлено"
+            "Маршрут до цього ресурсу не проходить через VPN-тунель"
         };
         return Ok(VpnStatus {
             detected,
             interface_name,
-            confidence: if routed_through_tunnel { "high" } else { "best-effort" }.into(),
+            confidence: "high".into(),
             detail: detail.into(),
         });
     }
@@ -505,9 +545,18 @@ fn emit_line(app: &AppHandle, id: &str, line: &str) {
             .next()
             .map(str::trim)
             .and_then(|value| value.trim_end_matches('%').trim().parse::<f32>().ok());
-        let speed = values.next().map(str::trim).filter(|value| !value.is_empty());
-        let eta = values.next().map(str::trim).filter(|value| !value.is_empty());
-        let message = values.next().map(str::trim).filter(|value| !value.is_empty());
+        let speed = values
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let eta = values
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let message = values
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
         let _ = app.emit(
             "download-event",
             DownloadEvent {
@@ -604,7 +653,10 @@ fn start_download(
     let ffmpeg = find_ffmpeg(&app)?;
     if let Some(path) = ffmpeg.path.filter(|path| path != "ffmpeg") {
         let ffmpeg_directory = Path::new(&path).parent().unwrap_or(&runtime);
-        command.args(["--ffmpeg-location", ffmpeg_directory.to_string_lossy().as_ref()]);
+        command.args([
+            "--ffmpeg-location",
+            ffmpeg_directory.to_string_lossy().as_ref(),
+        ]);
     }
 
     if request.mode == "audio" {
@@ -668,9 +720,17 @@ fn start_download(
     let monitor_app = app.clone();
     let monitor_id = id.clone();
     thread::spawn(move || loop {
-        let result = child.lock().ok().and_then(|mut child| child.try_wait().ok()).flatten();
+        let result = child
+            .lock()
+            .ok()
+            .and_then(|mut child| child.try_wait().ok())
+            .flatten();
         if let Some(status) = result {
-            manager.jobs.lock().ok().map(|mut jobs| jobs.remove(&monitor_id));
+            manager
+                .jobs
+                .lock()
+                .ok()
+                .map(|mut jobs| jobs.remove(&monitor_id));
             let cancelled = manager
                 .cancelled
                 .lock()
