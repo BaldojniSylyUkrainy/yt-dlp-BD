@@ -1,0 +1,54 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "yt-dlp BD",
+  "version": "0.1.0",
+  "identifier": "app.ytdlp.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "yt-dlp BD — Baldojnyi Downloader",
+        "width": 1120,
+        "height": 760,
+        "minWidth": 900,
+        "minHeight": 640,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Utility",
+    "shortDescription": "Зручне завантаження медіа через офіційний yt-dlp",
+    "longDescription": "Нативна оболонка для yt-dlp з незалежним runtime, чергою завантажень та автоматичними оновленнями.",
+    "createUpdaterArtifacts": true,
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDEyMzUxNEM2RDFEQTlDRApSV1ROcVIxdFRGRWpBUTJPbVF6eWxKVDh5KzN4V3NzVVdNaXVrSWthbkRsdGpiY3dOK2dNZ3l4Kwo=",
+      "endpoints": [
+        "https://github.com/BaldojniSylyUkrainy/yt-dlp-BD/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}
