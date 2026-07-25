@@ -16,6 +16,17 @@ dist-ssr
 src-tauri/target/
 release/
 
+# Signing credentials and private keys must never be committed
+*.p12
+*.pfx
+*.p8
+*.key
+*.pem
+*.mobileprovision
+*.provisionprofile
+*.jks
+*.keystore
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
