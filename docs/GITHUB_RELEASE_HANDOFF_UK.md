@@ -62,9 +62,10 @@ labels: larger runners тарифікуються окремо.
 `workflow_dispatch` уже вимагає ручного запуску. Protected environment додає
 другий ручний gate перед тим, як macOS/Windows jobs отримають secrets.
 
-## 4. Додати Environment secrets і variable
+## 4. Додати Actions secrets і variable
 
-У **Settings → Environments → release** додайте:
+Якщо collaborator бачить лише **Settings → Secrets and variables → Actions**,
+це нормально. У вкладці **Secrets** створіть такі **Repository secrets**:
 
 | Type | Назва | Значення |
 |---|---|---|
@@ -75,7 +76,21 @@ labels: larger runners тарифікуються окремо.
 | Secret | `APPLE_API_ISSUER` | Issuer ID App Store Connect API |
 | Secret | `APPLE_API_KEY` | Key ID App Store Connect API |
 | Secret | `APPLE_API_KEY_CONTENT` | Повний вміст `AuthKey_....p8`, включно з BEGIN/END |
+
+У вкладці **Variables** створіть Repository variable:
+
+| Type | Назва | Значення |
+|---|---|---|
 | Variable | `APPLE_SIGNING_IDENTITY` | `Developer ID Application: NAME (TEAMID)` |
+
+Jobs із `environment: release` отримають ці repository secrets лише після
+environment approval. Зовнішні pull requests із forks їх не отримують.
+
+Альтернатива для власника/admin: додати ті самі значення безпосередньо в
+**Settings → Environments → release**. Це сильніше звужує область дії, але не є
+обов’язковим для двох довірених collaborators. Не дублюйте однакову назву на
+repository й environment рівнях, бо environment value перекриє repository
+value.
 
 Apple-значення описані покроково в
 [`APPLE_NOTARIZATION_SECRETS_UK.md`](APPLE_NOTARIZATION_SECRETS_UK.md).
@@ -93,7 +108,7 @@ Apple-значення описані покроково в
 2. Відкрийте **Actions → Manual signed release → Run workflow**.
 3. Branch: `main`.
 4. `tag`: чотирикомпонентний public tag із `package.json`, наприклад
-   `v0.2.0.0`.
+   `v0.2.0.1`.
 5. `notes`: короткий текст для updater-вікна.
 6. Натисніть **Run workflow** і вручну approve jobs для environment `release`.
 
@@ -122,3 +137,19 @@ code-signing certificate SmartScreen може показати попередж�
 видавця на першому встановленні. Це не блокує складання або Tauri auto-update;
 прибрати таке попередження можна лише додаванням окремого Authenticode
 certificate у майбутньому.
+
+## Перший повторний запуск після CI hotfix
+
+Перед повторним запуском обов’язково перезапишіть `APPLE_CERTIFICATE` із
+перевіреного оригінального `.p12`:
+
+```bash
+P12_FILE="/absolute/path/to/certificate.p12"
+openssl pkcs12 -legacy -in "$P12_FILE" -noout
+base64 -i "$P12_FILE" | pbcopy
+```
+
+Вставте clipboard як нове значення `APPLE_CERTIFICATE`, а потім запустіть
+workflow з tag `v0.2.0.1`. CI використовує системні macOS `base64` і
+`security import`, тому валідний старий Keychain PKCS#12 із `RC2-40-CBC` більше
+не відхиляється OpenSSL 3.

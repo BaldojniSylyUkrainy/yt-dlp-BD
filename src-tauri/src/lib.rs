@@ -424,7 +424,7 @@ fn checksum_for_asset(checksum_file: &[u8], asset_name: &str) -> Result<String, 
         .ok_or_else(|| format!("Не знайдено контрольну суму для {asset_name}"))
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 fn macos_ffmpeg_release_asset(page: &str, filename: &str) -> Result<String, String> {
     let release_section = page
         .split_once("<h2>Download Release Build</h2>")

@@ -1,8 +1,14 @@
 # Apple Developer: де взяти секрети для GitHub notarization
 
-Усі значення нижче додаються тільки в
-**GitHub repository → Settings → Environments → release**. Не додавайте їх у
-repository variables, `.env`, Issue, чат, GitHub Artifact або файли проєкту.
+Секретні значення нижче додаються через
+**GitHub repository → Settings → Secrets and variables → Actions → Secrets**.
+Якщо власник repository керує секретами сам, він може натомість додати їх у
+**Settings → Environments → release → Environment secrets**. Не створюйте
+однакові назви одночасно на обох рівнях: environment secret має вищий пріоритет.
+
+`APPLE_SIGNING_IDENTITY` не є секретом і додається у вкладці **Variables** на
+тому самому рівні. Нічого з цих значень не додавайте в `.env`, Issue, чат,
+GitHub Artifact або файли проєкту.
 
 ## Передумови
 
@@ -52,13 +58,23 @@ Developer ID Application: YOUR NAME (TEAMID)
 APPLE_SIGNING_IDENTITY
 ```
 
-Закодуйте `.p12` одним base64-рядком, не друкуючи його в термінал:
+Перевірте саме експортований файл і пароль. Старі версії Keychain можуть
+використовувати `RC2-40-CBC`, тому для локального OpenSSL 3 потрібен `-legacy`:
 
 ```bash
-openssl base64 -A -in /absolute/path/to/certificate.p12 -out /tmp/yt-dlp-bd-certificate-base64.txt
+P12_FILE="/absolute/path/to/certificate.p12"
+openssl pkcs12 -legacy -in "$P12_FILE" -noout \
+  && echo "✅ Пароль правильний, .p12 валідний"
 ```
 
-Вміст тимчасового `.txt` вставте в Environment secret:
+Скопіюйте Base64 у clipboard системною macOS-утилітою, не друкуючи його в
+термінал:
+
+```bash
+base64 -i "$P12_FILE" | pbcopy
+```
+
+Вставте clipboard у GitHub secret:
 
 ```text
 APPLE_CERTIFICATE
@@ -70,9 +86,15 @@ APPLE_CERTIFICATE
 APPLE_CERTIFICATE_PASSWORD
 ```
 
-Після збереження secrets видаліть тимчасові `.p12` і base64 `.txt`, якщо вони не
-зберігаються у вашому зашифрованому password manager. Не видаляйте certificate і
-private key із Keychain до перевірки першого release.
+Workflow декодує secret системною macOS `base64`, а `.p12` імпортує системною
+`security import`. Він навмисно не перевіряє PKCS#12 через OpenSSL: сучасний
+OpenSSL без legacy provider відхиляє коректні Keychain-експорти з
+`RC2-40-CBC`. Саме `security import` є остаточною CI-перевіркою Base64, файла і
+пароля.
+
+Після збереження secret не залишайте незашифровані копії `.p12` поза захищеним
+сховищем. Не видаляйте certificate і private key із Keychain до перевірки
+першого release.
 
 ## 2. App Store Connect API key для notarization
 
@@ -85,7 +107,7 @@ private key із Keychain до перевірки першого release.
 4. Завантажте `AuthKey_<KEY_ID>.p8`. Apple дозволяє завантажити цей файл лише
    один раз, тому відразу зробіть зашифровану резервну копію.
 
-Додайте Environment secrets:
+Додайте GitHub Actions secrets:
 
 | GitHub secret | Що вставити |
 |---|---|
@@ -107,7 +129,7 @@ Apple certificate не замінює updater key. Для macOS і Windows ви�
 pbcopy < .secrets/updater.key
 ```
 
-Вставте значення безпосередньо в:
+Вставте значення безпосередньо в GitHub Actions secret:
 
 ```text
 TAURI_SIGNING_PRIVATE_KEY
@@ -123,7 +145,8 @@ TAURI_SIGNING_PRIVATE_KEY
 ## 4. Безпечна перевірка
 
 Після додавання secrets GitHub не покаже їх назад. Перевірка робиться лише
-ручним запуском `Manual signed release` з `main`.
+ручним запуском `Manual signed release` з `main`. Для поточного hotfix у полі
+`tag` введіть `v0.2.0.1`.
 
 Безпечний workflow:
 

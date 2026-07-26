@@ -11,11 +11,18 @@
 
 ## Як передати секрети майбутньому GitHub Actions
 
-Секрети додаються тільки через **Settings → Environments → release → Environment secrets**. Job публікації повинен посилатися на environment `release`; для нього варто ввімкнути ручне підтвердження власником repository.
+Collaborator із write-доступом може додати секрети через **Settings → Secrets
+and variables → Actions → Repository secrets**. Job публікації посилається на
+environment `release`, тому environment approval усе одно лишається ручним
+gate. Якщо значення додає власник/admin, він може натомість використати
+**Settings → Environments → release → Environment secrets**. Не дублюйте одну
+назву на обох рівнях: environment secret перекриває repository secret.
 
 Плановані назви:
 
-- `APPLE_CERTIFICATE` — `.p12`, закодований у base64 перед додаванням у Secret;
+- `APPLE_CERTIFICATE` — `.p12`, перевірений через
+  `openssl pkcs12 -legacy -in "$P12_FILE" -noout` і скопійований через
+  `base64 -i "$P12_FILE" | pbcopy`;
 - `APPLE_CERTIFICATE_PASSWORD`;
 - `APPLE_API_KEY` — Key ID з App Store Connect;
 - `APPLE_API_ISSUER`;
@@ -23,7 +30,10 @@
 - `TAURI_SIGNING_PRIVATE_KEY`;
 - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
 
-Окремо задайте `APPLE_SIGNING_IDENTITY` як release environment variable або repository variable: це повне ім’я імпортованого `Developer ID Application` certificate. Воно потрібне release-скрипту, але не є приватним ключем і не потребує Secret.
+Окремо задайте `APPLE_SIGNING_IDENTITY` як repository variable або release
+environment variable: це повне ім’я імпортованого `Developer ID Application`
+certificate. Воно потрібне release-скрипту, але не є приватним ключем і не
+потребує Secret.
 
 Base64 не є шифруванням. Результат base64 також не можна вставляти в код або надсилати у звичайному чаті — лише безпосередньо в поле GitHub Secret.
 
@@ -32,6 +42,10 @@ Base64 не є шифруванням. Результат base64 також не
 - `APPLE_API_ISSUER` — Issuer ID;
 - `APPLE_API_KEY` — Key ID;
 - `APPLE_API_KEY_PATH` — шлях до тимчасово materialized `.p8`.
+
+Для `.p12` workflow використовує системні macOS `base64` і `security import`.
+Не додавайте CI-перевірку через звичайний `openssl pkcs12`: OpenSSL 3 без
+legacy provider відхиляє валідні Keychain-експорти з `RC2-40-CBC`.
 
 Не друкуйте в лог значення секрету, base64-вміст, повний environment dump або шлях до тимчасового ключа.
 
