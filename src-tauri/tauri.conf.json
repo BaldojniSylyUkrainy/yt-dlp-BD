@@ -48,7 +48,7 @@
       "windows": {
         "installMode": "passive"
       },
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDEyMzUxNEM2RDFEQTlDRApSV1ROcVIxdFRGRWpBUTJPbVF6eWxKVDh5KzN4V3NzVVdNaXVrSWthbkRsdGpiY3dOK2dNZ3l4Kwo=",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNDQjczNEUzRDRFOUE5QUQKUldTdHFlblU0elMzUEg3MTBXeTNnOGYrTXVONVlLcm1Dcm83SS9iWU5HV2pQeTZQVU84L2J4YzYK",
       "endpoints": [
         "https://github.com/BaldojniSylyUkrainy/yt-dlp-BD/releases/latest/download/latest.json"
       ]
