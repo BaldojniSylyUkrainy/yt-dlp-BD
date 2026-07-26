@@ -4203,6 +4203,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
@@ -5437,6 +5438,7 @@ dependencies = [
 name = "yt-dlp-desktop"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
