@@ -24,6 +24,7 @@ type RuntimeStatus = {
   ffmpeg: ComponentStatus;
   deno: ComponentStatus;
   runtimeDir: string;
+  platform: string;
 };
 
 type VpnStatus = {
@@ -76,6 +77,11 @@ export function runtimeInstallCommand(stage: Exclude<RuntimeStage, null>): strin
   if (stage === "ytDlp") return "install_ytdlp";
   if (stage === "ffmpeg") return "install_ffmpeg";
   return "install_deno";
+}
+
+export function defaultCookieBrowser(platform: string, stored: string | null): string {
+  if (stored && !(platform === "windows" && stored === "safari")) return stored;
+  return platform === "windows" ? "edge" : "safari";
 }
 
 export function isCurrentProbe(currentSequence: number, responseSequence: number): boolean {
@@ -162,6 +168,7 @@ type MediaPreview = {
   title: string;
   thumbnail: string | null;
   duration: number | null;
+  durationIsTotal: boolean;
   uploader: string | null;
   extractor: string | null;
   webpageUrl: string | null;
@@ -319,7 +326,10 @@ function App() {
   const [update, setUpdate] = useState<Update | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
   const [updateProgress, setUpdateProgress] = useState(0);
-  const [cookieBrowser, setCookieBrowser] = useState(localStorage.getItem("cookieBrowser") || "safari");
+  const initialPlatform = navigator.userAgent.includes("Windows") ? "windows" : "macos";
+  const [cookieBrowser, setCookieBrowser] = useState(
+    defaultCookieBrowser(initialPlatform, localStorage.getItem("cookieBrowser")),
+  );
   const [probeState, setProbeState] = useState<ProbeState>("idle");
   const [preview, setPreview] = useState<MediaPreview | null>(null);
   const [probeError, setProbeError] = useState("");
@@ -334,8 +344,15 @@ function App() {
 
   const active = job && ["starting", "downloading", "postprocessing", "converting"].includes(job.status);
   const runtimeReady = Boolean(runtime?.ytDlp.installed && runtime?.ffmpeg.installed && runtime?.deno.installed);
+  const isWindows = runtime?.platform === "windows";
   const quickThumbnail = youtubeThumbnailFromInput(url);
   const multiItemCandidate = isLikelyMultiItemUrl(url);
+
+  useEffect(() => {
+    if (!isWindows || cookieBrowser !== "safari") return;
+    setCookieBrowser("edge");
+    localStorage.setItem("cookieBrowser", "edge");
+  }, [cookieBrowser, isWindows]);
 
   useEffect(() => {
     const restored = cancelledDownloadRestore.current;
@@ -722,6 +739,7 @@ function App() {
           title: preview?.title || null,
           duration: preview?.duration || null,
           itemCount: preview?.itemCount || null,
+          durationIsTotal: preview?.durationIsTotal ?? null,
         },
       });
       setOutputFreeSpace(result.availableSpace);
@@ -884,7 +902,7 @@ function App() {
           </div>}
           {preview && probeState === "valid" && <div className="media-preview">
             {preview.thumbnail ? <img src={preview.thumbnail} alt="" /> : <div className="media-preview-placeholder"><Icon name="check"/></div>}
-            <div><strong>{preview.title}</strong><p>{[preview.uploader, formatDuration(preview.duration), preview.itemCount && preview.itemCount > 1 ? `${preview.itemCount} елементів` : null, preview.extractor].filter(Boolean).join(" · ")}</p><small><Icon name="check" size={13}/>Посилання доступне; формати перевіримо перед стартом</small></div>
+            <div><strong>{preview.title}</strong><p>{[preview.uploader, preview.duration ? `${formatDuration(preview.duration)}${preview.durationIsTotal ? "" : " на елемент"}` : null, preview.itemCount && preview.itemCount > 1 ? `${preview.itemCount} елементів` : null, preview.extractor].filter(Boolean).join(" · ")}</p><small><Icon name="check" size={13}/>Посилання доступне; формати перевіримо перед стартом</small></div>
           </div>}
           {probeState === "unverified" && <div className="url-warning" title={probeError}><span aria-hidden="true">!</span><span>Не вдалося швидко підтвердити посилання. yt-dlp все одно може спробувати його завантажити.</span></div>}
           {probeState === "invalid" && <div className="url-error"><Icon name="x" size={14}/><span>{probeError || "yt-dlp не може завантажити це посилання"}</span></div>}
@@ -985,7 +1003,7 @@ function App() {
           <p className="eyebrow">ПОТРІБНА АВТОРИЗАЦІЯ</p>
           <h2 id="auth-title">Увійдіть через браузер</h2>
           <p>Сайт просить підтвердити вік, акаунт або що ви не бот. Увійдіть на цей сайт у браузері та виберіть його нижче.</p>
-          <label className="browser-picker">Ваш браузер<select value={cookieBrowser} onChange={(event) => setCookieBrowser(event.target.value)}><option value="safari">Safari</option><option value="chrome">Google Chrome</option><option value="firefox">Firefox</option><option value="brave">Brave</option><option value="edge">Microsoft Edge</option><option value="vivaldi">Vivaldi</option></select></label>
+          <label className="browser-picker">Ваш браузер<select value={cookieBrowser} onChange={(event) => setCookieBrowser(event.target.value)}>{!isWindows && <option value="safari">Safari</option>}<option value="edge">Microsoft Edge</option><option value="chrome">Google Chrome</option><option value="firefox">Firefox</option><option value="brave">Brave</option><option value="vivaldi">Vivaldi</option></select></label>
           <div className="modal-detail">yt-dlp прочитає cookies безпосередньо з обраного браузера лише для повторної спроби. yt-dlp BD не експортує їх у файл і не зберігає.</div>
           <div className="modal-actions"><button className="secondary-button" onClick={() => setJob(null)}>Скасувати</button><button className="warning-button auth" disabled={pendingStart} onClick={retryWithCookies}>{pendingStart ? "Перевіряємо…" : "Повторити з cookies"}</button></div>
         </div>

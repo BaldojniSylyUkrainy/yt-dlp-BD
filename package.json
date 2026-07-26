@@ -1,12 +1,13 @@
 {
   "name": "yt-dlp-desktop",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
+  "releaseVersion": "0.2.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "test": "vitest run",
+    "test": "vitest run && node --test scripts/*.node-test.mjs",
     "build:mac": "bash scripts/build-macos.sh",
     "release:json": "node scripts/generate-release-json.mjs",
     "preview": "vite preview",

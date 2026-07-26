@@ -23,6 +23,8 @@
 - `TAURI_SIGNING_PRIVATE_KEY`;
 - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
 
+Окремо задайте `APPLE_SIGNING_IDENTITY` як release environment variable або repository variable: це повне ім’я імпортованого `Developer ID Application` certificate. Воно потрібне release-скрипту, але не є приватним ключем і не потребує Secret.
+
 Base64 не є шифруванням. Результат base64 також не можна вставляти в код або надсилати у звичайному чаті — лише безпосередньо в поле GitHub Secret.
 
 Під час notarization workflow має створити тимчасовий файл `.p8` з `APPLE_API_KEY_CONTENT`, встановити для нього права `600`, передати його локальний шлях через `APPLE_API_KEY_PATH` і гарантовано видалити файл у cleanup step. Tauri/notarytool очікують таку трійку:
@@ -34,3 +36,11 @@ Base64 не є шифруванням. Результат base64 також не
 Не друкуйте в лог значення секрету, base64-вміст, повний environment dump або шлях до тимчасового ключа.
 
 GitHub не показує збережене значення Secret назад. Workflow отримує лише ті секрети, які явно передані конкретному job. Не друкуйте секрети в лог і не запускайте release-job для неперевіреного коду.
+
+`scripts/build-macos.sh` також підтримує локальний `APPLE_NOTARY_KEYCHAIN_PROFILE`. Для CI він приймає updater private key безпосередньо через `TAURI_SIGNING_PRIVATE_KEY`, а локально — через ignored-файл `.secrets/updater.key`. Release-build з ad-hoc identity, неповними Apple credentials або відсутнім updater key завершується помилкою до публікації артефактів.
+
+Покроково, де саме створити та як безпечно перенести Apple credentials:
+[APPLE_NOTARIZATION_SECRETS_UK.md](APPLE_NOTARIZATION_SECRETS_UK.md).
+
+Повні repository/environment налаштування для власника:
+[GITHUB_RELEASE_HANDOFF_UK.md](GITHUB_RELEASE_HANDOFF_UK.md).

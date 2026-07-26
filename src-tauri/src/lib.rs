@@ -20,8 +20,13 @@ use uuid::Uuid;
 use std::os::unix::process::CommandExt;
 
 const YTDLP_RELEASE_BASE: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download";
+#[cfg(target_os = "windows")]
+const FFMPEG_RELEASE_BASE: &str =
+    "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest";
 const MIN_FREE_SPACE_RESERVE: u64 = 500 * 1024 * 1024;
 const DISK_GUARD_TRIGGER: u64 = MIN_FREE_SPACE_RESERVE + 128 * 1024 * 1024;
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +44,7 @@ struct RuntimeStatus {
     ffmpeg: ComponentStatus,
     deno: ComponentStatus,
     runtime_dir: String,
+    platform: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -64,6 +70,7 @@ struct MediaPreview {
     title: String,
     thumbnail: Option<String>,
     duration: Option<f64>,
+    duration_is_total: bool,
     uploader: Option<String>,
     extractor: Option<String>,
     webpage_url: Option<String>,
@@ -82,6 +89,7 @@ struct PreflightRequest {
     title: Option<String>,
     duration: Option<f64>,
     item_count: Option<u64>,
+    duration_is_total: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -188,8 +196,27 @@ fn yt_dlp_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(runtime_dir(app)?.join(filename))
 }
 
+fn configure_command(command: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = command;
+}
+
+fn configure_tokio_command(command: &mut tokio::process::Command) {
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+    #[cfg(not(target_os = "windows"))]
+    let _ = command;
+}
+
 fn command_version(path: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new(path).args(args).output().ok()?;
+    let mut command = Command::new(path);
+    configure_command(&mut command);
+    let output = command.args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -277,6 +304,7 @@ fn runtime_status(app: AppHandle) -> Result<RuntimeStatus, String> {
         ffmpeg: find_ffmpeg(&app)?,
         deno: find_deno(&app)?,
         runtime_dir: directory.to_string_lossy().to_string(),
+        platform: std::env::consts::OS.into(),
     })
 }
 
@@ -366,8 +394,7 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
-fn verify_sha256_file(path: &Path, checksum_file: &[u8], label: &str) -> Result<(), String> {
-    let expected = checksum_value(checksum_file, label)?;
+fn verify_sha256_file_expected(path: &Path, expected: &str, label: &str) -> Result<(), String> {
     let actual = sha256_file(path)?;
     if actual != expected {
         return Err(format!("Контрольна сума {label} не збігається"));
@@ -375,7 +402,29 @@ fn verify_sha256_file(path: &Path, checksum_file: &[u8], label: &str) -> Result<
     Ok(())
 }
 
-fn ffmpeg_release_asset(page: &str, filename: &str) -> Result<String, String> {
+fn verify_sha256_file(path: &Path, checksum_file: &[u8], label: &str) -> Result<(), String> {
+    let expected = checksum_value(checksum_file, label)?;
+    verify_sha256_file_expected(path, &expected, label)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn checksum_for_asset(checksum_file: &[u8], asset_name: &str) -> Result<String, String> {
+    let checksums = String::from_utf8(checksum_file.to_vec())
+        .map_err(|_| "Файл контрольних сум FFmpeg має неправильний формат".to_string())?;
+    checksums
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            Some((parts.next()?, parts.next()?))
+        })
+        .find_map(|(hash, filename)| {
+            let normalized = filename.trim_start_matches('*').trim_start_matches("./");
+            (normalized == asset_name).then(|| hash.to_ascii_lowercase())
+        })
+        .ok_or_else(|| format!("Не знайдено контрольну суму для {asset_name}"))
+}
+
+fn macos_ffmpeg_release_asset(page: &str, filename: &str) -> Result<String, String> {
     let release_section = page
         .split_once("<h2>Download Release Build</h2>")
         .map(|(_, section)| section)
@@ -437,6 +486,10 @@ fn extract_binary_from_file(
         .map_err(|error| format!("Не вдалося створити {binary_name}: {error}"))?;
     std::io::copy(&mut archived_binary, &mut output)
         .map_err(|error| format!("Не вдалося розпакувати {binary_name}: {error}"))?;
+    output
+        .sync_all()
+        .map_err(|error| format!("Не вдалося завершити запис {binary_name}: {error}"))?;
+    drop(output);
 
     #[cfg(unix)]
     {
@@ -454,9 +507,6 @@ fn extract_binary_from_file(
 
 #[tauri::command]
 async fn install_ffmpeg(app: AppHandle) -> Result<(), String> {
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    return Err("Portable ffmpeg поки налаштовано лише для macOS Apple Silicon".into());
-
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         const RELEASES_PAGE: &str = "https://ffmpeg.martin-riedl.de/";
@@ -464,8 +514,8 @@ async fn install_ffmpeg(app: AppHandle) -> Result<(), String> {
         let page = fetch_bytes(&client, RELEASES_PAGE).await?;
         let page = String::from_utf8(page)
             .map_err(|_| "Сторінка релізів ffmpeg має неправильний формат".to_string())?;
-        let ffmpeg_url = ffmpeg_release_asset(&page, "ffmpeg.zip")?;
-        let ffprobe_url = ffmpeg_release_asset(&page, "ffprobe.zip")?;
+        let ffmpeg_url = macos_ffmpeg_release_asset(&page, "ffmpeg.zip")?;
+        let ffprobe_url = macos_ffmpeg_release_asset(&page, "ffprobe.zip")?;
         eprintln!("Перевіряємо стабільний ffmpeg: {ffmpeg_url}");
         let ffmpeg_checksum_url = format!("{ffmpeg_url}.sha256");
         let ffprobe_checksum_url = format!("{ffprobe_url}.sha256");
@@ -520,6 +570,57 @@ async fn install_ffmpeg(app: AppHandle) -> Result<(), String> {
             .map_err(|error| format!("Не вдалося зберегти версію ffprobe: {error}"))?;
         Ok(())
     }
+
+    #[cfg(target_os = "windows")]
+    {
+        #[cfg(target_arch = "x86_64")]
+        let asset_name = "ffmpeg-master-latest-win64-gpl.zip";
+        #[cfg(target_arch = "aarch64")]
+        let asset_name = "ffmpeg-master-latest-winarm64-gpl.zip";
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        return Err("Portable FFmpeg підтримує лише Windows x64 та ARM64".into());
+
+        let client = download_client()?;
+        let archive_url = format!("{FFMPEG_RELEASE_BASE}/{asset_name}");
+        let checksums_url = format!("{FFMPEG_RELEASE_BASE}/checksums.sha256");
+        let checksums = fetch_bytes(&client, &checksums_url).await?;
+        let expected = checksum_for_asset(&checksums, asset_name)?;
+        let directory = runtime_dir(&app)?;
+        let ffmpeg_path = directory.join("ffmpeg.exe");
+        let ffprobe_path = directory.join("ffprobe.exe");
+        let stamp = directory.join(".ffmpeg.sha256");
+        let current = command_version(&ffmpeg_path, &["-version"]).is_some()
+            && command_version(&ffprobe_path, &["-version"]).is_some()
+            && fs::read_to_string(&stamp)
+                .map(|value| value.trim() == expected)
+                .unwrap_or(false);
+        if current {
+            return Ok(());
+        }
+
+        eprintln!("Завантажуємо керовані FFmpeg та FFprobe для Windows");
+        let archive = directory.join(".ffmpeg.zip.download");
+        if let Err(error) = fetch_to_file(&app, &client, &archive_url, &archive, "ffmpeg").await {
+            let _ = fs::remove_file(&archive);
+            return Err(error);
+        }
+        let install_result = (|| {
+            verify_sha256_file_expected(&archive, &expected, "FFmpeg")?;
+            extract_binary_from_file(&archive, "ffmpeg.exe", &ffmpeg_path)?;
+            extract_binary_from_file(&archive, "ffprobe.exe", &ffprobe_path)
+        })();
+        let _ = fs::remove_file(&archive);
+        install_result?;
+        fs::write(stamp, expected)
+            .map_err(|error| format!("Не вдалося зберегти версію FFmpeg: {error}"))?;
+        Ok(())
+    }
+
+    #[cfg(not(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        target_os = "windows"
+    )))]
+    Err("Portable FFmpeg поки підтримує лише macOS Apple Silicon та Windows".into())
 }
 
 #[tauri::command]
@@ -824,6 +925,7 @@ async fn probe_oembed(url: &str, endpoint: &str, extractor: &str) -> Result<Medi
             .and_then(|value| value.as_str())
             .map(str::to_string),
         duration: metadata.get("duration").and_then(|value| value.as_f64()),
+        duration_is_total: true,
         uploader: metadata
             .get("author_name")
             .and_then(|value| value.as_str())
@@ -857,6 +959,7 @@ async fn probe_url_inner(
     }
 
     let mut command = tokio::process::Command::new(yt_dlp);
+    configure_tokio_command(&mut command);
     command.args([
         "--ignore-config",
         "--simulate",
@@ -918,21 +1021,28 @@ async fn probe_url_inner(
                 .map(str::to_string)
         })
     };
-    let duration = if playlist {
-        entries.and_then(|entries| {
-            entries
+    let (duration, duration_is_total) = if playlist {
+        if let Some(entries) = entries.filter(|entries| !entries.is_empty()) {
+            let durations = entries
                 .iter()
-                .map(|entry| json_number(entry.get("duration")))
-                .collect::<Option<Vec<_>>>()
-                .map(|durations| durations.into_iter().sum())
-        })
+                .filter_map(|entry| json_number(entry.get("duration")))
+                .collect::<Vec<_>>();
+            if durations.len() == entries.len() {
+                (Some(durations.into_iter().sum()), true)
+            } else {
+                (durations.first().copied(), false)
+            }
+        } else {
+            (json_number(metadata.get("duration")), true)
+        }
     } else {
-        json_number(metadata.get("duration"))
+        (json_number(metadata.get("duration")), true)
     };
     Ok(MediaPreview {
         title: title.to_string(),
         thumbnail: playlist_string("thumbnail"),
         duration,
+        duration_is_total,
         uploader: playlist_string("uploader").or_else(|| playlist_string("channel")),
         extractor: playlist_string("extractor_key").or_else(|| playlist_string("extractor")),
         webpage_url: string_field("webpage_url"),
@@ -989,6 +1099,9 @@ fn is_tunnel_interface(interface_name: &str) -> bool {
     ["utun", "tun", "tap", "wg", "wireguard", "ppp"]
         .iter()
         .any(|prefix| value.starts_with(prefix))
+        || ["vpn", "tailscale", "mullvad", "nordlynx", "proton"]
+            .iter()
+            .any(|marker| value.contains(marker))
 }
 
 #[tauri::command]
@@ -1040,7 +1153,57 @@ fn check_vpn(host: String) -> Result<VpnStatus, String> {
         })
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        let ip = (host.as_str(), 443)
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut addresses| addresses.next())
+            .map(|address| address.ip().to_string());
+        let interface_name = ip.as_ref().and_then(|ip| {
+            let mut command = Command::new("powershell.exe");
+            configure_command(&mut command);
+            command
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "$route = Find-NetRoute -RemoteIPAddress $env:YTDLP_ROUTE_IP -ErrorAction Stop | Select-Object -First 1; $route.InterfaceAlias",
+                ])
+                .env("YTDLP_ROUTE_IP", ip)
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| {
+                    String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .map(str::trim)
+                        .find(|line| !line.is_empty())
+                        .map(str::to_string)
+                })
+        });
+        let routed_through_tunnel = interface_name
+            .as_deref()
+            .map(is_tunnel_interface)
+            .unwrap_or(false);
+        let route_known = interface_name.is_some();
+        Ok(VpnStatus {
+            detected: routed_through_tunnel,
+            interface_name,
+            confidence: if route_known { "high" } else { "unknown" }.into(),
+            detail: if routed_through_tunnel {
+                "Маршрут саме до цього ресурсу проходить через VPN-тунель"
+            } else if route_known {
+                "Маршрут до цього ресурсу не проходить через відомий VPN-інтерфейс"
+            } else {
+                "Не вдалося визначити Windows-інтерфейс для маршруту до цього ресурсу"
+            }
+            .into(),
+        })
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     Ok(VpnStatus {
         detected: false,
         interface_name: None,
@@ -1339,29 +1502,20 @@ fn selected_media_from_value(
     )
 }
 
-#[cfg(unix)]
 fn available_disk_space(path: &Path) -> Option<u64> {
-    use std::ffi::CString;
-    use std::mem::MaybeUninit;
-    use std::os::unix::ffi::OsStrExt;
-
-    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut stats = MaybeUninit::<libc::statvfs>::uninit();
-    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
-        return None;
-    }
-    let stats = unsafe { stats.assume_init() };
-    let block_size = if stats.f_frsize > 0 {
-        stats.f_frsize
-    } else {
-        stats.f_bsize
-    };
-    (stats.f_bavail as u64).checked_mul(block_size)
+    fs2::available_space(path).ok()
 }
 
-#[cfg(not(unix))]
-fn available_disk_space(_path: &Path) -> Option<u64> {
-    None
+fn scale_playlist_estimate(
+    estimate: Option<u64>,
+    item_count: u64,
+    duration_is_total: bool,
+) -> Option<u64> {
+    if duration_is_total {
+        estimate
+    } else {
+        estimate.and_then(|value| value.checked_mul(item_count))
+    }
 }
 
 #[tauri::command]
@@ -1413,9 +1567,14 @@ fn preflight_download(request: PreflightRequest) -> Result<PreflightResult, Stri
         fps: Some(30.0),
         total_bitrate_kbps: None,
     });
-    let final_total = estimate.as_ref().and_then(|estimate| {
+    let per_duration_estimate = estimate.as_ref().and_then(|estimate| {
         estimated_output_size(estimate, request.mode != "audio", &request.audio_format)
     });
+    let final_total = scale_playlist_estimate(
+        per_duration_estimate,
+        item_count,
+        !request.multi_item || request.duration_is_total.unwrap_or(false),
+    );
     // A fast preflight intentionally reuses already-fetched preview metadata instead of
     // asking yt-dlp to resolve every selected format again. At peak disk usage the source
     // and converted output coexist, so using the output estimate for both is conservative.
@@ -1572,11 +1731,32 @@ fn stop_child_process_group(child: &Arc<Mutex<Child>>) -> Result<(), String> {
     }
 
     #[cfg(not(unix))]
-    child
-        .lock()
-        .map_err(|_| "Не вдалося зупинити процес".to_string())?
-        .kill()
-        .map_err(|error| format!("Не вдалося зупинити процес: {error}"))
+    {
+        let process_id = child
+            .lock()
+            .map_err(|_| "Не вдалося зупинити процес".to_string())?
+            .id();
+        #[cfg(target_os = "windows")]
+        {
+            let mut command = Command::new("taskkill");
+            configure_command(&mut command);
+            let status = command
+                .args(["/PID", &process_id.to_string(), "/T", "/F"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map_err(|error| format!("Не вдалося запустити taskkill: {error}"))?;
+            if status.success() {
+                return Ok(());
+            }
+        }
+        child
+            .lock()
+            .map_err(|_| "Не вдалося зупинити процес".to_string())?
+            .kill()
+            .map_err(|error| format!("Не вдалося зупинити процес: {error}"))
+    }
 }
 
 fn ffprobe_path(ffmpeg_path: &Path) -> PathBuf {
@@ -1603,7 +1783,9 @@ fn parse_frame_rate(value: &str) -> Option<f64> {
 }
 
 fn media_info(ffmpeg_path: &Path, input: &Path) -> Result<MediaInfo, String> {
-    let output = Command::new(ffprobe_path(ffmpeg_path))
+    let mut command = Command::new(ffprobe_path(ffmpeg_path));
+    configure_command(&mut command);
+    let output = command
         .args([
             "-v",
             "error",
@@ -1647,7 +1829,9 @@ fn media_info(ffmpeg_path: &Path, input: &Path) -> Result<MediaInfo, String> {
 }
 
 fn media_duration(ffmpeg_path: &Path, input: &Path) -> Result<f64, String> {
-    let output = Command::new(ffprobe_path(ffmpeg_path))
+    let mut command = Command::new(ffprobe_path(ffmpeg_path));
+    configure_command(&mut command);
+    let output = command
         .args([
             "-v",
             "error",
@@ -1711,7 +1895,9 @@ fn conversion_percent(elapsed: f64, duration: f64, file_index: usize, file_count
 }
 
 fn videotoolbox_encoder_available(ffmpeg_path: &Path) -> bool {
-    Command::new(ffmpeg_path)
+    let mut command = Command::new(ffmpeg_path);
+    configure_command(&mut command);
+    command
         .args([
             "-hide_banner",
             "-loglevel",
@@ -1785,6 +1971,7 @@ fn convert_downloaded_media(
         output_format
     ));
     let mut command = Command::new(ffmpeg_path);
+    configure_command(&mut command);
     command
         .args([
             "-hide_banner",
@@ -2035,6 +2222,7 @@ fn start_download(
     }
     let runtime = runtime_dir(&app)?;
     let mut command = Command::new(yt_dlp);
+    configure_command(&mut command);
     command.args([
         "--ignore-config",
         "--no-simulate",
@@ -2222,6 +2410,7 @@ fn start_download(
                         *error = None;
                     }
                     let mut retry_command = Command::new(&retry_program);
+                    configure_command(&mut retry_command);
                     retry_command
                         .args(&retry_args)
                         .stdout(Stdio::piped())
@@ -2444,6 +2633,37 @@ mod tests {
             SizeConfidence::Unknown
         );
         assert!(selected_media_from_value(&unknown).0.is_none());
+    }
+
+    #[test]
+    fn finds_named_asset_in_multi_file_checksum_list() {
+        let checksums = b"aaaaaaaa  other.zip\nbbbbbbbb *ffmpeg-master-latest-win64-gpl.zip\n";
+        assert_eq!(
+            checksum_for_asset(checksums, "ffmpeg-master-latest-win64-gpl.zip").unwrap(),
+            "bbbbbbbb"
+        );
+        assert!(checksum_for_asset(checksums, "missing.zip").is_err());
+    }
+
+    #[test]
+    fn reports_available_space_for_existing_directory() {
+        assert!(available_disk_space(&std::env::temp_dir()).is_some());
+    }
+
+    #[test]
+    fn playlist_estimate_scales_only_sample_duration() {
+        assert_eq!(scale_playlist_estimate(Some(100), 12, false), Some(1200));
+        assert_eq!(scale_playlist_estimate(Some(1200), 12, true), Some(1200));
+        assert_eq!(scale_playlist_estimate(Some(u64::MAX), 2, false), None);
+    }
+
+    #[test]
+    fn recognizes_common_macos_and_windows_vpn_interfaces() {
+        assert!(is_tunnel_interface("utun4"));
+        assert!(is_tunnel_interface("WireGuard Tunnel"));
+        assert!(is_tunnel_interface("NordLynx"));
+        assert!(is_tunnel_interface("ProtonVPN"));
+        assert!(!is_tunnel_interface("Ethernet"));
     }
 
     #[test]

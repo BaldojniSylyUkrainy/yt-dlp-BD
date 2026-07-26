@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   applyDownloadEvent,
+  defaultCookieBrowser,
   isCurrentProbe,
   isLikelyMultiItemUrl,
   preflightAllowsStart,
@@ -114,5 +115,17 @@ describe("preflight and retry guards", () => {
     const audioJob = { ...startingJob, outputFormat: "MP3" };
     const next = applyDownloadEvent(audioJob, event("conversion_progress", { percent: 50 }));
     expect(next).toMatchObject({ status: "converting", outputFormat: "MP3", percent: 50 });
+  });
+});
+
+describe("platform defaults", () => {
+  it("uses Edge instead of Safari on Windows", () => {
+    expect(defaultCookieBrowser("windows", null)).toBe("edge");
+    expect(defaultCookieBrowser("windows", "safari")).toBe("edge");
+    expect(defaultCookieBrowser("windows", "chrome")).toBe("chrome");
+  });
+
+  it("keeps Safari as the macOS default", () => {
+    expect(defaultCookieBrowser("macos", null)).toBe("safari");
   });
 });

@@ -13,10 +13,10 @@ Read this file before each task. Inspect only the files relevant to the requeste
 ## Project
 
 - Repository: `BaldojniSylyUkrainy/yt-dlp-BD`
-- Local path: `/Users/iad/Desktop/S9/Baldoj/yt-dlp bd`
+- Local path in the current workspace: `/Users/orangem1/Documents/YTD-Baldiozh-GUI/yt-dlp-BD`
 - Stack: Tauri 2, Rust, React 19, TypeScript, Vite.
-- Target: native macOS Apple Silicon application with a Ukrainian UI.
-- Managed runtimes: yt-dlp, ffmpeg/ffprobe, and Deno in the Tauri app-local-data runtime directory (`~/Library/Application Support/app.ytdlp.desktop/runtime` on macOS).
+- Targets: macOS Apple Silicon (minimum macOS 12.3) and Windows x64, with a Ukrainian UI.
+- Managed runtimes: yt-dlp, ffmpeg/ffprobe, and Deno in the Tauri app-local-data runtime directory. Runtime downloads use official release checksums on both supported platforms.
 
 ## Architecture and Current Behavior
 
@@ -24,7 +24,7 @@ Read this file before each task. Inspect only the files relevant to the requeste
 - URL preview has a 450 ms debounce. Only one backend probe task remains active; a new probe aborts the previous oEmbed/yt-dlp task. YouTube/Vimeo oEmbed is described only as metadata availability, not full yt-dlp format validation.
 - `.ru`/`.рф` domains require the VPN decision before thumbnail, oEmbed, or yt-dlp probing. Approval is cached only for the same normalized URL.
 - URLs that may contain a collection show an explicit `Лише це відео` / `Уся добірка` choice. Single is the default and always sends `--no-playlist`; collection mode sends `--yes-playlist` and pacing options.
-- The preflight is an invisible, single-click safety step: it is network-free, reuses preview duration/item count plus local disk data, and immediately starts the download when space is sufficient. There is no preflight card or second confirmation click. Size/free-space details belong in the active job popup; the live disk guard remains authoritative.
+- The preflight is an invisible, single-click safety step: it is network-free, reuses preview duration/item count plus local disk data, and immediately starts the download when space is sufficient. Playlist estimates use the already-summed duration when every entry has one; otherwise they scale a representative item duration by item count without a second network request. There is no preflight card or second confirmation click. Size/free-space details belong in the active job popup; the live disk guard remains authoritative.
 - Preview uses a 450 ms debounce and a 4 s soft deadline. If it still cannot be verified, the UI explains that availability could not be determined quickly and permits a download attempt.
 - Starting a job clears the URL field. Successful completion keeps it empty; confirmed user cancellation restores the exact URL and playlist intent so the user can change the destination and retry immediately.
 - Unknown estimates remain visibly unknown. Start is allowed only above the runtime guard threshold, and a live guard checks free space during yt-dlp, merge, video FFmpeg, and audio FFmpeg.
@@ -32,6 +32,7 @@ Read this file before each task. Inspect only the files relevant to the requeste
 - Video downloads are merged to an intermediate file and converted by a managed FFmpeg process to controlled-bitrate H.264/AAC MP4 with real percent, speed, and ETA. The app probes VideoToolbox with a real one-frame encode and automatically falls back to `libx264` when the hardware encoder cannot create a session.
 - Audio downloads keep the source first, then the app runs managed FFmpeg for MP3, M4A, Opus, or WAV with real percent, speed, and ETA. The source is preserved if conversion fails.
 - Runtime assets stream directly to temporary files without a total transfer timeout, emit install progress, verify SHA-256 from disk, and expose per-component Retry without an app restart. Maintenance timestamps are written only after success.
+- Windows uses managed `yt-dlp.exe`, Deno, and `yt-dlp/FFmpeg-Builds` FFmpeg/FFprobe. Child commands use `CREATE_NO_WINDOW`; cancellation kills the complete Windows process tree; disk checks use the cross-platform filesystem API; cookie login defaults to Edge; `.ru` route checks resolve the active Windows interface through `Find-NetRoute`.
 - A restrictive Tauri CSP permits local scripts/styles, IPC, local assets, and HTTPS thumbnail images; it does not allow remote scripts or `unsafe-eval`.
 
 ## Build and Test Commands
@@ -46,15 +47,17 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 npm run tauri build -- --debug --no-bundle
 ```
 
-Current automated coverage includes size confidence, protected-reserve arithmetic, overflow safety, disk guard, FFmpeg progress/ETA clamping, selectors and playlist flags, friendly errors, output collisions, early/terminal frontend events, insufficient-space blocking, unknown estimates, stale probes, runtime Retry mapping, and audio conversion state.
+Current automated coverage includes size confidence, protected-reserve arithmetic, overflow safety, cross-platform disk lookup, disk guard, FFmpeg checksum parsing, FFmpeg progress/ETA clamping, selectors and playlist flags, friendly errors, output collisions, early/terminal frontend events, insufficient-space blocking, unknown estimates, stale probes, runtime Retry mapping, platform cookie defaults, combined release manifests, and audio conversion state.
 
 ## Release and Security Boundaries
 
 - `.secrets/`, signing material, build output, runtime binaries, and release artifacts are ignored and must remain untracked.
-- Tauri updater configuration exists, but there are currently no published tags/releases and no release workflow.
-- Do not create a release workflow or add GitHub secrets without a direct user request.
-- Any future workflow must be manual-only, use a protected `release` environment, and publish only after signing, notarization, stapling, and updater-signature verification.
+- `.github/workflows/release.yml` is manual-only (`workflow_dispatch`), uses the protected `release` environment and standard GitHub-hosted runners, builds Windows x64 plus macOS arm64, and creates a draft release only after signing, notarization, stapling, and updater-signature checks.
+- The public four-part release version is stored as `package.json.releaseVersion`; Cargo/Tauri retain the corresponding three-part SemVer because Tauri's updater parser requires SemVer. A release tag is `v${releaseVersion}`.
+- The combined `latest.json` contains `darwin-aarch64`, `windows-x86_64-nsis`, and compatibility alias `windows-x86_64`. The manifest generator fails closed if either platform or signature is missing.
 - Apple notarization variables are documented in `docs/SECRETS_UK.md`: `APPLE_API_ISSUER`, `APPLE_API_KEY` (Key ID), and `APPLE_API_KEY_PATH` pointing to a temporary `.p8` created from a protected secret and deleted during cleanup.
+- `scripts/build-macos.sh` is fail-closed: it accepts the updater key from a protected CI environment variable or ignored local file, requires a Developer ID Application identity plus either API-key or Keychain-profile notarization credentials, and verifies signature, hardened runtime, timestamp, DMG integrity, notarization, stapling, and Gatekeeper before generating release metadata.
+- Repository-owner setup is documented in `docs/GITHUB_RELEASE_HANDOFF_UK.md`; Apple credential creation and secret mapping are in `docs/APPLE_NOTARIZATION_SECRETS_UK.md`.
 
 ## Current Stabilization Work
 
@@ -73,10 +76,13 @@ Implemented from `HANDOFF_REVIEW_UK.md`:
 - notarization documentation correction.
 - verified H.264/AAC, MP3, M4A, Opus, and WAV encoding with the managed FFmpeg binary; added software H.264 fallback after a real VideoToolbox session failure was reproduced.
 - replaced the slow exhaustive size preflight with an immediate approximate calculation based on already-fetched preview metadata; no second network extraction occurs.
+- added production Windows behavior and manual cross-platform GitHub release assembly.
 
 ## Remaining Verification / Known Risks
 
-- Latest clean verification: `npm ci` (0 vulnerabilities), 11 frontend tests, 8 Rust tests, production frontend build, `cargo fmt --check`, strict Clippy with `-D warnings`, `git diff --check`, and native `tauri build --debug --no-bundle` all pass. Managed FFmpeg smoke tests produced valid H.264/AAC MP4, MP3, M4A, Opus, and WAV outputs.
-- Manually verify: single YouTube, `watch?v=...&list=...` single mode, explicit playlist, 480p–2160p, MP3/M4A/Opus/WAV, subtitles, cookies/auth, unknown HLS/DASH estimate, insufficient preflight space, low disk during each phase, cancellation in each phase, FFmpeg failure, duplicate filename, and disconnected external disk.
+- Latest clean local verification: `npm ci` (0 vulnerabilities), 13 frontend tests, 2 release-manifest tests, 12 Rust tests, production frontend build, `cargo fmt --check`, strict Clippy with `-D warnings`, workflow YAML parse, `git diff --check`, and native macOS `tauri build --debug --no-bundle` all pass.
+- A Windows Rust target download from the local Mac stalled before installation, so the first native Windows compile/NSIS proof remains the manual `windows-latest` workflow run. The workflow repeats the full test suite before bundling and refuses missing updater signatures.
+- Before the first public release, manually smoke-test the GitHub-built Windows installer on Windows 10/11: runtime install, one video, one audio conversion, cookie login via Edge, cancellation during yt-dlp and FFmpeg, updater install, and low-disk behavior. Also smoke-test the notarized macOS DMG/update.
+- Broader media/failure coverage remains: single YouTube, `watch?v=...&list=...` single mode, explicit playlist, 480p–2160p, MP3/M4A/Opus/WAV, subtitles, cookies/auth, unknown HLS/DASH estimate, insufficient preflight space, low disk during each phase, cancellation in each phase, FFmpeg failure, duplicate filename, and disconnected external disk.
 - The debug `.app` launches with a visible AppKit window and the main screen was visually inspected. Do not mark the media/network/manual fault matrix complete until representative real downloads and failure scenarios are exercised in the user's desktop session.
-- Do not create a GitHub Release until a signed/notarized artifact pipeline is explicitly requested and reviewed.
+- The automated workflow creates only a draft. Publish it only after both platform jobs pass and the artifacts have been smoke-tested.

@@ -1,0 +1,246 @@
+name: Manual signed release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Four-part release tag, for example v0.2.0.0"
+        required: true
+        type: string
+      notes:
+        description: "Release notes used in latest.json"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    environment: release
+    env:
+      REQUESTED_TAG: ${{ inputs.tag }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Select stable Rust
+        shell: pwsh
+        run: |
+          rustup update stable
+          rustup default stable
+
+      - name: Validate tag and required secret
+        shell: pwsh
+        run: |
+          $releaseVersion = node -p "require('./package.json').releaseVersion"
+          if ($env:REQUESTED_TAG -ne "v$releaseVersion") {
+            throw "Requested tag must be v$releaseVersion"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            throw "TAURI_SIGNING_PRIVATE_KEY is missing in the release environment"
+          }
+
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: Build signed NSIS installer
+        run: npm run tauri build -- --bundles nsis
+
+      - name: Normalize and verify Windows artifacts
+        shell: pwsh
+        run: |
+          $releaseVersion = node -p "require('./package.json').releaseVersion"
+          $bundleDir = Join-Path $PWD "src-tauri/target/release/bundle/nsis"
+          $installers = @(Get-ChildItem -Path $bundleDir -File -Filter "*.exe")
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one NSIS installer, found $($installers.Count)"
+          }
+          $signature = "$($installers[0].FullName).sig"
+          if (!(Test-Path -LiteralPath $signature) -or (Get-Item -LiteralPath $signature).Length -eq 0) {
+            throw "Tauri updater signature is missing or empty"
+          }
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          $target = "yt-dlp-BD_${releaseVersion}_windows-x86_64-setup.exe"
+          Copy-Item -LiteralPath $installers[0].FullName -Destination "release-assets/$target"
+          Copy-Item -LiteralPath $signature -Destination "release-assets/$target.sig"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 1
+
+  macos:
+    name: macOS Apple Silicon
+    runs-on: macos-15
+    environment: release
+    env:
+      REQUESTED_TAG: ${{ inputs.tag }}
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+      APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+      APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Select stable Rust
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup target add aarch64-apple-darwin
+
+      - name: Validate tag and required release credentials
+        run: |
+          RELEASE_VERSION="$(node -p "require('./package.json').releaseVersion")"
+          [[ "$REQUESTED_TAG" == "v$RELEASE_VERSION" ]] || {
+            echo "Requested tag must be v$RELEASE_VERSION"
+            exit 1
+          }
+          for NAME in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_CONTENT APPLE_SIGNING_IDENTITY TAURI_SIGNING_PRIVATE_KEY; do
+            [[ -n "${!NAME:-}" ]] || {
+              echo "$NAME is missing in the release environment"
+              exit 1
+            }
+          done
+
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: Import Developer ID certificate
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/yt-dlp-bd-signing.keychain-db"
+          CERTIFICATE_PATH="$RUNNER_TEMP/yt-dlp-bd-certificate.p12"
+          API_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+
+          printf '%s' "$APPLE_CERTIFICATE" | openssl base64 -d -A -out "$CERTIFICATE_PATH"
+          printf '%s' "$APPLE_API_KEY_CONTENT" > "$API_KEY_PATH"
+          chmod 600 "$CERTIFICATE_PATH" "$API_KEY_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" "$HOME/Library/Keychains/login.keychain-db"
+
+          {
+            echo "APPLE_API_KEY_PATH=$API_KEY_PATH"
+            echo "SIGNING_KEYCHAIN_PATH=$KEYCHAIN_PATH"
+            echo "SIGNING_CERTIFICATE_PATH=$CERTIFICATE_PATH"
+          } >> "$GITHUB_ENV"
+
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -F "$APPLE_SIGNING_IDENTITY"
+
+      - name: Build, notarize, staple, and verify macOS artifacts
+        run: npm run build:mac
+
+      - name: Verify expected macOS release files
+        run: |
+          RELEASE_VERSION="$(node -p "require('./package.json').releaseVersion")"
+          for FILE in \
+            "release/yt-dlp-BD_${RELEASE_VERSION}_aarch64.dmg" \
+            "release/yt-dlp-BD_${RELEASE_VERSION}_aarch64.app.tar.gz" \
+            "release/yt-dlp-BD_${RELEASE_VERSION}_aarch64.app.tar.gz.sig"; do
+            [[ -s "$FILE" ]] || {
+              echo "Missing or empty artifact: $FILE"
+              exit 1
+            }
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: |
+            release/*.dmg
+            release/*.app.tar.gz
+            release/*.app.tar.gz.sig
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Remove temporary signing material
+        if: always()
+        run: |
+          security list-keychains -d user -s "$HOME/Library/Keychains/login.keychain-db" || true
+          if [[ -n "${SIGNING_KEYCHAIN_PATH:-}" ]]; then
+            security delete-keychain "$SIGNING_KEYCHAIN_PATH" || true
+          fi
+          [[ -z "${SIGNING_CERTIFICATE_PATH:-}" ]] || rm -f "$SIGNING_CERTIFICATE_PATH"
+          [[ -z "${APPLE_API_KEY_PATH:-}" ]] || rm -f "$APPLE_API_KEY_PATH"
+
+  publish-draft:
+    name: Assemble draft release
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate and validate combined updater manifest
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+          RELEASE_NOTES: ${{ inputs.notes }}
+        run: |
+          RELEASE_VERSION="$(node -p "require('./package.json').releaseVersion")"
+          [[ "$REQUESTED_TAG" == "v$RELEASE_VERSION" ]] || {
+            echo "Requested tag must be v$RELEASE_VERSION"
+            exit 1
+          }
+          node scripts/generate-release-json.mjs --assets-dir release-assets --require-all
+          test -s release-assets/latest.json
+
+      - name: Create or update draft GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            IS_DRAFT="$(gh release view "$TAG" --json isDraft --jq .isDraft)"
+            [[ "$IS_DRAFT" == "true" ]] || {
+              echo "Release $TAG is already published; refusing to overwrite it"
+              exit 1
+            }
+          else
+            gh release create "$TAG" --draft --target "$GITHUB_SHA" --title "$TAG"
+          fi
+          gh release upload "$TAG" release-assets/* --clobber

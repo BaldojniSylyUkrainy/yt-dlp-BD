@@ -26,6 +26,8 @@ npm run tauri dev
 npm run build:mac
 ```
 
+Release-build є fail-closed: команда не створить `release/`, якщо немає updater key, Developer ID Application identity або Apple notarization credentials. Мінімальна підтримувана версія системи — macOS 12.3.
+
 Результат буде в `release/`:
 
 - `.dmg` — файл, який завантажує користувач;
@@ -55,6 +57,8 @@ export APPLE_SIGNING_IDENTITY="Developer ID Application: YOUR NAME (TEAMID)"
 npm run build:mac
 ```
 
+Ad-hoc identity `-` для release-build заборонена.
+
 ## Нотаризація
 
 Один раз збережіть credentials у Keychain через `notarytool store-credentials`. Після цього перед release-build вкажіть назву профілю:
@@ -66,17 +70,22 @@ npm run build:mac
 
 Пароль Apple ID, `.p8` або інші секрети не повинні лежати в репозиторії.
 
+У GitHub Actions замість Keychain profile використовується трійка `APPLE_API_ISSUER`, `APPLE_API_KEY` і `APPLE_API_KEY_PATH`. Workflow створює тимчасовий `.p8` із protected secret перед запуском команди. Після складання скрипт обов’язково перевіряє Developer ID signature, hardened runtime, timestamp, DMG, результат Apple notarization, stapled ticket і Gatekeeper assessment.
+
 ## GitHub і автооновлення
 
-1. Створіть порожній GitHub repository, наприклад `yt-dlp-BD`.
-2. Адреса репозиторію вже налаштована як `BaldojniSylyUkrainy/yt-dlp-BD` у `release.config.json`.
-3. Так само замініть endpoint у `src-tauri/tauri.conf.json`.
-4. Збільште `version` у `package.json`, `src-tauri/Cargo.toml` і `src-tauri/tauri.conf.json`.
-5. Запустіть `npm run build:mac`.
-6. На GitHub створіть Release із тегом тієї самої версії, наприклад `v0.1.1`.
-7. Додайте до Release всі чотири файли з папки `release/`.
+Repository уже налаштований як `BaldojniSylyUkrainy/yt-dlp-BD`. macOS і Windows
+release збирає ручний GitHub-hosted workflow, а не локальний upload окремих
+файлів. Повний handoff для власника repository:
 
-Після публікації `latest.json` встановлені копії yt-dlp BD побачать нову версію, перевірять криптографічний підпис і запропонують оновлення.
+- [GITHUB_RELEASE_HANDOFF_UK.md](GITHUB_RELEASE_HANDOFF_UK.md);
+- [APPLE_NOTARIZATION_SECRETS_UK.md](APPLE_NOTARIZATION_SECRETS_UK.md).
+
+Public tag має чотири компоненти (`v0.2.0.0`), а внутрішня Tauri/SemVer version —
+три (`0.2.0`). Workflow перевіряє відповідність і створює draft Release. Після
+ручної перевірки та публікації `latest.json` встановлені копії побачать нову
+версію, перевірять криптографічний підпис своєї платформи й запропонують
+оновлення.
 
 ## Найважливіше про updater key
 

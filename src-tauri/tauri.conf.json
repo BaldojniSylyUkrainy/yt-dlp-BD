@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "yt-dlp BD",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "app.ytdlp.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -32,7 +32,7 @@
     "longDescription": "Нативна оболонка для yt-dlp з незалежним runtime, чергою завантажень та автоматичними оновленнями.",
     "createUpdaterArtifacts": true,
     "macOS": {
-      "minimumSystemVersion": "11.0"
+      "minimumSystemVersion": "12.3"
     },
     "icon": [
       "icons/32x32.png",
@@ -45,6 +45,9 @@
   "plugins": {
     "updater": {
       "active": true,
+      "windows": {
+        "installMode": "passive"
+      },
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDEyMzUxNEM2RDFEQTlDRApSV1ROcVIxdFRGRWpBUTJPbVF6eWxKVDh5KzN4V3NzVVdNaXVrSWthbkRsdGpiY3dOK2dNZ3l4Kwo=",
       "endpoints": [
         "https://github.com/BaldojniSylyUkrainy/yt-dlp-BD/releases/latest/download/latest.json"

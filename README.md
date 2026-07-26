@@ -1,12 +1,13 @@
 # yt-dlp BD — Baldojnyi Downloader
 
-Нативний macOS-застосунок з українським інтерфейсом для завантаження відео, аудіо та субтитрів через офіційний [yt-dlp](https://github.com/yt-dlp/yt-dlp).
+Нативний macOS/Windows-застосунок з українським інтерфейсом для завантаження відео, аудіо та субтитрів через офіційний [yt-dlp](https://github.com/yt-dlp/yt-dlp).
 
-Застосунок сам встановлює та оновлює yt-dlp, ffmpeg/ffprobe і Deno, перевіряє завантажені компоненти та створює сумісний H.264/AAC MP4, який відкривається у QuickTime Player і підходить для монтажу.
+Застосунок сам встановлює та оновлює yt-dlp, ffmpeg/ffprobe і Deno, перевіряє
+завантажені компоненти та створює сумісні медіафайли з живим прогресом.
 
 ## Що вже працює
 
-- нативний Tauri 2 застосунок для macOS Apple Silicon;
+- нативний Tauri 2 застосунок для macOS Apple Silicon і Windows x64;
 - автоматичне встановлення й оновлення офіційного стабільного yt-dlp;
 - власні керовані ffmpeg/ffprobe, що автоматично відновлюються й оновлюються;
 - автоматичне встановлення офіційного Deno для повної підтримки YouTube;
@@ -20,7 +21,9 @@
 - автоматичне повернення до Downloads, якщо зовнішній диск від’єднано;
 - запит cookies із браузера, коли сайт вимагає логін, перевірку віку або anti-bot підтвердження;
 - окремий підписаний пакет Tauri updater;
-- локальна команда, що створює `.app`, `.dmg`, updater і `latest.json`.
+- локальна команда, що створює macOS `.app`, `.dmg` і updater;
+- ручний GitHub Actions release для Windows NSIS, нотаризованого macOS build і
+  спільного `latest.json`.
 
 ## Швидкий старт для розробки
 
@@ -35,7 +38,9 @@ npm run tauri dev
 npm run build:mac
 ```
 
-Готові файли з’являться в папці `release/`. Детальна інструкція для першого GitHub-релізу та Apple-підпису: [docs/START_HERE_UK.md](docs/START_HERE_UK.md).
+Готові файли з’являться в папці `release/`. Детальна інструкція для локального
+macOS build: [docs/START_HERE_UK.md](docs/START_HERE_UK.md). Налаштування ручного
+GitHub release: [docs/GITHUB_RELEASE_HANDOFF_UK.md](docs/GITHUB_RELEASE_HANDOFF_UK.md).
 
 ## Секрети
 
@@ -53,5 +58,8 @@ npm run build:mac
 - yt-dlp: офіційні [стабільні релізи](https://github.com/yt-dlp/yt-dlp/releases);
 - Deno: офіційні [Deno releases](https://github.com/denoland/deno/releases);
 - ffmpeg/ffprobe для Apple Silicon: підписані macOS release builds із [Martin Riedl’s FFmpeg Build Server](https://ffmpeg.martin-riedl.de/), з обов’язковою SHA-256 перевіркою.
+- ffmpeg/ffprobe для Windows: GPL builds із
+  [yt-dlp/FFmpeg-Builds](https://github.com/yt-dlp/FFmpeg-Builds), з обов’язковою
+  перевіркою SHA-256 із release checksums.
 
 Завантажуйте лише матеріали, на які маєте відповідні права.
