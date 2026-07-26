@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Four-part release tag, for example v0.2.0.0"
+        description: "Four-part release tag, for example v0.2.0.1"
         required: true
         type: string
       notes:
@@ -144,26 +144,32 @@ jobs:
           API_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
           KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
 
-          printf '%s' "$APPLE_CERTIFICATE" | tr -d '\r\n\t ' | openssl base64 -d -A -out "$CERTIFICATE_PATH"
-          openssl pkcs12 -in "$CERTIFICATE_PATH" -passin env:APPLE_CERTIFICATE_PASSWORD -noout || {
-            echo "APPLE_CERTIFICATE is not a valid Base64-encoded .p12, or APPLE_CERTIFICATE_PASSWORD is incorrect"
-            exit 1
-          }
-          printf '%s' "$APPLE_API_KEY_CONTENT" > "$API_KEY_PATH"
-          chmod 600 "$CERTIFICATE_PATH" "$API_KEY_PATH"
-
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security import "$CERTIFICATE_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security list-keychains -d user -s "$KEYCHAIN_PATH" "$HOME/Library/Keychains/login.keychain-db"
-
           {
             echo "APPLE_API_KEY_PATH=$API_KEY_PATH"
             echo "SIGNING_KEYCHAIN_PATH=$KEYCHAIN_PATH"
             echo "SIGNING_CERTIFICATE_PATH=$CERTIFICATE_PATH"
           } >> "$GITHUB_ENV"
+
+          printf '%s' "$APPLE_CERTIFICATE" | /usr/bin/base64 --decode > "$CERTIFICATE_PATH" || {
+            echo "APPLE_CERTIFICATE is not valid Base64"
+            exit 1
+          }
+          printf '%s' "$APPLE_API_KEY_CONTENT" > "$API_KEY_PATH"
+          chmod 600 "$CERTIFICATE_PATH" "$API_KEY_PATH"
+          [[ -s "$CERTIFICATE_PATH" ]] || {
+            echo "APPLE_CERTIFICATE decoded to an empty file"
+            exit 1
+          }
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH" || {
+            echo "Keychain could not import APPLE_CERTIFICATE; verify the Base64 source and .p12 password"
+            exit 1
+          }
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" "$HOME/Library/Keychains/login.keychain-db"
 
           security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -F "$APPLE_SIGNING_IDENTITY"
 
