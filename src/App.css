@@ -102,6 +102,8 @@ nav { margin-top: 30px; display: grid; gap: 6px; }
 .runtime-row strong { color: #dedad6; font-size: 12px; }
 .runtime-row small { max-width: 150px; overflow: hidden; color: #999592; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .runtime-row > svg { color: var(--success); }
+.runtime-retry { width: 28px; height: 28px; padding: 0; display: grid; place-items: center; border: 1px solid #4a3b43; color: var(--pink); background: #171317; cursor: pointer; }
+.runtime-retry:hover { color: var(--ink); border-color: var(--pink); }
 .component-dot { width: 6px; height: 6px; background: #484644; }
 .component-dot.ready { background: var(--success); }
 .component-dot.loading { background: var(--warning); animation: pulse .8s infinite; }
@@ -186,6 +188,10 @@ nav { margin-top: 30px; display: grid; gap: 6px; }
 .media-preview.checking { background: #121212; }
 .media-preview.checking img { opacity: .55; filter: grayscale(1); }
 .media-preview.checking small { color: var(--pink); }
+
+.collection-intent { margin-top: 20px; padding: 16px; border: 1px solid var(--line); background: #151515; }
+.collection-intent .segmented { max-width: 620px; }
+.collection-intent > small { display: block; margin-top: 9px; color: var(--muted); font-size: 11px; line-height: 1.45; }
 
 .choice-grid { margin: 30px 0 0; display: grid; grid-template-columns: 1fr 1fr; gap: 24px; background: transparent; border: 0; }
 .choice-grid > div { padding: 0; background: transparent; }

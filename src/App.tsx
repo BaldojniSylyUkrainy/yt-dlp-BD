@@ -33,7 +33,7 @@ type VpnStatus = {
   detail: string;
 };
 
-type DownloadEvent = {
+export type DownloadEvent = {
   id: string;
   kind: "progress" | "postprocess" | "conversion_progress" | "storage_estimate" | "retrying" | "log" | "completed" | "failed" | "cancelled" | "auth_required";
   percent: number | null;
@@ -50,7 +50,39 @@ type StorageEstimate = {
   sufficient: boolean | null;
 };
 
-type Job = {
+type PreflightResult = {
+  title: string;
+  itemCount: number;
+  intermediateSize: number | null;
+  finalOutputSize: number | null;
+  protectedReserve: number;
+  requiredSpace: number | null;
+  availableSpace: number;
+  confidence: "exact" | "approximate" | "unknown";
+  sufficient: boolean;
+};
+
+export function preflightAllowsStart(result: PreflightResult): boolean {
+  return result.sufficient;
+}
+
+export function preflightConfidenceLabel(confidence: PreflightResult["confidence"]): string {
+  if (confidence === "exact") return "Точні дані";
+  if (confidence === "approximate") return "Орієнтовно";
+  return "Розмір частково невідомий";
+}
+
+export function runtimeInstallCommand(stage: Exclude<RuntimeStage, null>): string {
+  if (stage === "ytDlp") return "install_ytdlp";
+  if (stage === "ffmpeg") return "install_ffmpeg";
+  return "install_deno";
+}
+
+export function isCurrentProbe(currentSequence: number, responseSequence: number): boolean {
+  return currentSequence === responseSequence;
+}
+
+export type Job = {
   id: string;
   url: string;
   title: string;
@@ -60,9 +92,71 @@ type Job = {
   eta: string;
   message: string;
   storage: StorageEstimate | null;
+  playlist: boolean;
+  outputFormat: string;
 };
 
+export function applyDownloadEvent(current: Job, payload: DownloadEvent): Job | null {
+  if (payload.kind === "cancelled") return null;
+  if (payload.kind === "storage_estimate") {
+    return { ...current, storage: payload.storage || current.storage };
+  }
+  if (payload.kind === "retrying") {
+    return {
+      ...current,
+      status: "starting",
+      speed: "—",
+      eta: "—",
+      message: payload.message || "Відновлюємо завантаження…",
+    };
+  }
+  if (payload.kind === "progress") {
+    return {
+      ...current,
+      status: "downloading",
+      percent: payload.percent ?? current.percent,
+      speed: payload.speed ?? current.speed,
+      eta: payload.eta ?? current.eta,
+      title: payload.message || current.title,
+    };
+  }
+  if (payload.kind === "postprocess") {
+    return {
+      ...current,
+      status: "postprocessing",
+      speed: payload.speed || "yt-dlp",
+      eta: "—",
+      message: payload.message || "Об’єднуємо завантажені потоки… Не закривайте застосунок",
+    };
+  }
+  if (payload.kind === "conversion_progress") {
+    return {
+      ...current,
+      status: "converting",
+      percent: payload.percent ?? current.percent,
+      speed: payload.speed || "VideoToolbox",
+      eta: payload.eta || "—",
+      message: payload.message || "Створюємо сумісний MP4… Не закривайте застосунок",
+    };
+  }
+  if (payload.kind === "log") {
+    return { ...current, message: payload.message || current.message };
+  }
+  return {
+    ...current,
+    status: payload.kind,
+    percent: payload.kind === "completed" ? 100 : current.percent,
+    message: payload.kind === "auth_required" ? "Потрібен вхід через браузер" : payload.message || current.message,
+  };
+}
+
 type RuntimeStage = "ytDlp" | "ffmpeg" | "deno" | null;
+
+type RuntimeInstallProgress = {
+  component: Exclude<RuntimeStage, null>;
+  downloaded: number;
+  total: number | null;
+};
 
 type MediaPreview = {
   title: string;
@@ -71,6 +165,7 @@ type MediaPreview = {
   uploader: string | null;
   extractor: string | null;
   webpageUrl: string | null;
+  itemCount: number | null;
 };
 
 type ProbeState = "idle" | "checking" | "valid" | "unverified" | "invalid";
@@ -113,11 +208,19 @@ function hostFromInput(value: string): string | null {
   }
 }
 
+function normalizeInputUrl(value: string): string | null {
+  try {
+    return new URL(/^https?:\/\//i.test(value.trim()) ? value.trim() : `https://${value.trim()}`).toString();
+  } catch {
+    return null;
+  }
+}
+
 function isRussianDomain(host: string): boolean {
   return host === "ru" || host.endsWith(".ru") || host === "xn--p1ai" || host.endsWith(".xn--p1ai");
 }
 
-function isLikelyMultiItemUrl(value: string): boolean {
+export function isLikelyMultiItemUrl(value: string): boolean {
   try {
     const parsed = new URL(/^https?:\/\//i.test(value.trim()) ? value.trim() : `https://${value.trim()}`);
     const host = parsed.hostname.toLowerCase();
@@ -189,13 +292,17 @@ function youtubeThumbnailFromInput(value: string): string | null {
 function App() {
   const maintenanceStarted = useRef(false);
   const probeSequence = useRef(0);
+  const approvedVpnUrls = useRef(new Set<string>());
+  const cancelledDownloadRestore = useRef<{ url: string; playlist: boolean } | null>(null);
   const mainContentRef = useRef<HTMLElement>(null);
   const jobTitleTextRef = useRef<HTMLDivElement>(null);
-  const pendingStorageEstimates = useRef(new Map<string, StorageEstimate>());
+  const pendingDownloadEvents = useRef(new Map<string, DownloadEvent[]>());
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [runtimeBusy, setRuntimeBusy] = useState(false);
   const [runtimeStage, setRuntimeStage] = useState<RuntimeStage>(null);
   const [runtimeError, setRuntimeError] = useState("");
+  const [runtimeFailures, setRuntimeFailures] = useState(new Set<Exclude<RuntimeStage, null>>());
+  const [runtimeInstallProgress, setRuntimeInstallProgress] = useState<RuntimeInstallProgress | null>(null);
   const [url, setUrl] = useState("");
   const [outputDir, setOutputDir] = useState(localStorage.getItem("outputDir") || "");
   const [outputFreeSpace, setOutputFreeSpace] = useState<number | null>(null);
@@ -203,9 +310,11 @@ function App() {
   const [quality, setQuality] = useState("best");
   const [audioFormat, setAudioFormat] = useState("mp3");
   const [subtitles, setSubtitles] = useState(false);
+  const [playlistIntent, setPlaylistIntent] = useState<"single" | "playlist">("single");
   const [job, setJob] = useState<Job | null>(null);
   const [formError, setFormError] = useState("");
-  const [vpnWarning, setVpnWarning] = useState<{ host: string; status: VpnStatus } | null>(null);
+  const [vpnWarning, setVpnWarning] = useState<{ host: string; url: string; status: VpnStatus } | null>(null);
+  const [vpnDecisionVersion, setVpnDecisionVersion] = useState(0);
   const [pendingStart, setPendingStart] = useState(false);
   const [update, setUpdate] = useState<Update | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
@@ -226,6 +335,17 @@ function App() {
   const active = job && ["starting", "downloading", "postprocessing", "converting"].includes(job.status);
   const runtimeReady = Boolean(runtime?.ytDlp.installed && runtime?.ffmpeg.installed && runtime?.deno.installed);
   const quickThumbnail = youtubeThumbnailFromInput(url);
+  const multiItemCandidate = isLikelyMultiItemUrl(url);
+
+  useEffect(() => {
+    const restored = cancelledDownloadRestore.current;
+    if (restored?.url === url) {
+      setPlaylistIntent(restored.playlist ? "playlist" : "single");
+      cancelledDownloadRestore.current = null;
+    } else {
+      setPlaylistIntent("single");
+    }
+  }, [url]);
 
   useEffect(() => {
     if (active) return;
@@ -284,8 +404,10 @@ function App() {
     ];
     const due = schedules.filter(({ key, interval }) => now - Number(localStorage.getItem(key) || 0) >= interval);
     if (!due.length) return;
-    due.forEach(({ key }) => localStorage.setItem(key, String(now)));
-    await Promise.allSettled(due.map(({ command }) => invoke<void>(command)));
+    const results = await Promise.allSettled(due.map(({ command }) => invoke<void>(command)));
+    results.forEach((result, index) => {
+      if (result.status === "fulfilled") localStorage.setItem(due[index].key, String(now));
+    });
     invoke<RuntimeStatus>("runtime_status").then(setRuntime).catch(() => undefined);
   }, []);
 
@@ -316,8 +438,14 @@ function App() {
         setStartupProgress(62 + Math.round((index / missing.length) * 30));
         try {
           await invoke<void>(component.command);
+          setRuntimeFailures((current) => {
+            const next = new Set(current);
+            next.delete(component.stage);
+            return next;
+          });
         } catch (error) {
           issues.push(`${component.label}: ${String(error)}`);
+          setRuntimeFailures((current) => new Set(current).add(component.stage));
         }
       }
       setRuntime(await invoke<RuntimeStatus>("runtime_status"));
@@ -332,6 +460,38 @@ function App() {
       window.setTimeout(() => setStartupBusy(false), 320);
     }
   }, [refreshManagedComponents]);
+
+  async function retryRuntimeComponent(stage: Exclude<RuntimeStage, null>) {
+    const command = runtimeInstallCommand(stage);
+    setRuntimeBusy(true);
+    setRuntimeStage(stage);
+    setRuntimeError("");
+    setRuntimeInstallProgress(null);
+    try {
+      await invoke<void>(command);
+      setRuntime(await invoke<RuntimeStatus>("runtime_status"));
+      setRuntimeFailures((current) => {
+        const next = new Set(current);
+        next.delete(stage);
+        return next;
+      });
+      localStorage.setItem(`runtimeUpdate.${stage}`, String(Date.now()));
+    } catch (error) {
+      setRuntimeError(String(error));
+      setRuntimeFailures((current) => new Set(current).add(stage));
+    } finally {
+      setRuntimeStage(null);
+      setRuntimeBusy(false);
+      setRuntimeInstallProgress(null);
+    }
+  }
+
+  useEffect(() => {
+    const unlisten = listen<RuntimeInstallProgress>("runtime-install-progress", ({ payload }) => {
+      setRuntimeInstallProgress(payload);
+    });
+    return () => { unlisten.then((dispose) => dispose()); };
+  }, []);
 
   useEffect(() => {
     downloadDir().then((directory) => {
@@ -409,7 +569,8 @@ function App() {
       return;
     }
     const parsedHost = hostFromInput(value);
-    if (!parsedHost) {
+    const normalized = normalizeInputUrl(value);
+    if (!parsedHost || !normalized) {
       setProbeState("invalid");
       setProbeError("Це не схоже на посилання");
       return;
@@ -417,89 +578,66 @@ function App() {
     setProbeState("checking");
     let softDeadline = 0;
     const timer = window.setTimeout(async () => {
+      if (isRussianDomain(parsedHost) && !approvedVpnUrls.current.has(normalized)) {
+        try {
+          const vpn = await invoke<VpnStatus>("check_vpn", { host: parsedHost });
+          if (!isCurrentProbe(probeSequence.current, sequence)) return;
+          if (!vpn.detected) {
+            setProbeState("idle");
+            setVpnWarning({ host: parsedHost, url: normalized, status: vpn });
+            return;
+          }
+          approvedVpnUrls.current.add(normalized);
+        } catch {
+          if (!isCurrentProbe(probeSequence.current, sequence)) return;
+          setProbeState("idle");
+          setVpnWarning({
+            host: parsedHost,
+            url: normalized,
+            status: { detected: false, interfaceName: null, confidence: "unknown", detail: "Не вдалося перевірити стан VPN" },
+          });
+          return;
+        }
+      }
       softDeadline = window.setTimeout(() => {
-        if (probeSequence.current !== sequence) return;
-        setProbeError("Швидка перевірка займає більше часу, ніж очікувалось");
+        if (!isCurrentProbe(probeSequence.current, sequence)) return;
+        setProbeError("Не вдалося швидко визначити доступність. Можна спробувати завантажити");
         setProbeState("unverified");
       }, 4_000);
       try {
-        const normalized = /^https?:\/\//i.test(value) ? value : `https://${value}`;
-        const result = await invoke<MediaPreview>("probe_url", { url: normalized });
-        if (probeSequence.current !== sequence) return;
+        const result = await invoke<MediaPreview>("probe_url", { probeId: crypto.randomUUID(), url: normalized, playlist: playlistIntent === "playlist" });
+        if (!isCurrentProbe(probeSequence.current, sequence)) return;
         setPreview(result);
         setProbeState("valid");
       } catch (error) {
-        if (probeSequence.current !== sequence) return;
+        if (!isCurrentProbe(probeSequence.current, sequence)) return;
         setProbeError(String(error));
         setProbeState("unverified");
       } finally {
         window.clearTimeout(softDeadline);
       }
-    }, 140);
+    }, 450);
     return () => {
       window.clearTimeout(timer);
       window.clearTimeout(softDeadline);
     };
-  }, [url, runtime?.ytDlp.installed]);
+  }, [url, runtime?.ytDlp.installed, playlistIntent, vpnDecisionVersion]);
 
   useEffect(() => {
     const unlisten = listen<DownloadEvent>("download-event", ({ payload }) => {
-      if (payload.kind === "storage_estimate" && payload.storage) {
-        pendingStorageEstimates.current.set(payload.id, payload.storage);
-        if (payload.storage.availableSpace !== null) setOutputFreeSpace(payload.storage.availableSpace);
+      if (payload.storage?.availableSpace !== null && payload.storage?.availableSpace !== undefined) {
+        setOutputFreeSpace(payload.storage.availableSpace);
       }
       setJob((current) => {
-        if (!current || current.id !== payload.id) return current;
-        if (payload.kind === "storage_estimate") {
-          pendingStorageEstimates.current.delete(payload.id);
-          return { ...current, storage: payload.storage || current.storage };
+        if (current?.id === payload.id) return applyDownloadEvent(current, payload);
+        const buffered = pendingDownloadEvents.current.get(payload.id) || [];
+        pendingDownloadEvents.current.set(payload.id, [...buffered.slice(-31), payload]);
+        while (pendingDownloadEvents.current.size > 8) {
+          const oldest = pendingDownloadEvents.current.keys().next().value;
+          if (oldest === undefined) break;
+          pendingDownloadEvents.current.delete(oldest);
         }
-        if (payload.kind === "cancelled") return null;
-        if (payload.kind === "retrying") {
-          return {
-            ...current,
-            status: "starting",
-            speed: "—",
-            eta: "—",
-            message: payload.message || "Відновлюємо завантаження…",
-          };
-        }
-        if (payload.kind === "progress") {
-          return {
-            ...current,
-            status: "downloading",
-            percent: payload.percent ?? current.percent,
-            speed: payload.speed ?? current.speed,
-            eta: payload.eta ?? current.eta,
-            title: payload.message || current.title,
-          };
-        }
-        if (payload.kind === "postprocess") {
-          return {
-            ...current,
-            status: "postprocessing",
-            speed: payload.speed || "yt-dlp",
-            eta: "—",
-            message: payload.message || "Об’єднуємо завантажені потоки… Не закривайте застосунок",
-          };
-        }
-        if (payload.kind === "conversion_progress") {
-          return {
-            ...current,
-            status: "converting",
-            percent: payload.percent ?? current.percent,
-            speed: payload.speed || "VideoToolbox",
-            eta: payload.eta || "—",
-            message: payload.message || "Створюємо сумісний MP4… Не закривайте застосунок",
-          };
-        }
-        if (payload.kind === "log") return { ...current, message: payload.message || current.message };
-        return {
-          ...current,
-          status: payload.kind,
-          percent: payload.kind === "completed" ? 100 : current.percent,
-          message: payload.kind === "auth_required" ? "Потрібен вхід через браузер" : payload.message || current.message,
-        };
+        return current;
       });
     });
     return () => { unlisten.then((dispose) => dispose()); };
@@ -522,25 +660,78 @@ function App() {
     }
   }
 
-  async function launchDownload(downloadUrl: string, parsedHost: string, cookiesBrowser?: string) {
-    setPendingStart(true);
+  async function launchDownload(downloadUrl: string, parsedHost: string, preflightResult: PreflightResult, cookiesBrowser?: string, playlist = playlistIntent === "playlist") {
+    const id = crypto.randomUUID();
+    const initialJob: Job = {
+      id,
+      url: downloadUrl,
+      title: parsedHost,
+      status: "starting",
+      percent: 0,
+      speed: "—",
+      eta: "—",
+      message: cookiesBrowser ? `Вхід через ${cookiesBrowser}…` : "Підключення…",
+      storage: preflightResult.requiredSpace === null ? null : {
+        estimatedSize: preflightResult.finalOutputSize || 0,
+        requiredSpace: preflightResult.requiredSpace,
+        availableSpace: preflightResult.availableSpace,
+        sufficient: preflightResult.sufficient,
+      },
+      playlist,
+      outputFormat: mode === "video" ? "MP4" : audioFormat.toUpperCase(),
+    };
+    const buffered = pendingDownloadEvents.current.get(id) || [];
+    pendingDownloadEvents.current.delete(id);
+    setJob(buffered.reduce<Job | null>((current, event) => current ? applyDownloadEvent(current, event) : null, initialJob));
     try {
-      const id = await invoke<string>("start_download", {
+      await invoke<void>("start_download", {
         request: {
+          id,
           url: /^https?:\/\//i.test(downloadUrl.trim()) ? downloadUrl.trim() : `https://${downloadUrl.trim()}`,
           outputDir,
           mode,
           quality,
           audioFormat,
           subtitles,
-          multiItem: isLikelyMultiItemUrl(downloadUrl),
+          multiItem: playlist,
           cookiesBrowser: cookiesBrowser || null,
+          expectedRequiredSpace: preflightResult.requiredSpace,
         },
       });
-      const storage = pendingStorageEstimates.current.get(id) || null;
-      pendingStorageEstimates.current.delete(id);
-      setJob({ id, url: downloadUrl, title: parsedHost, status: "starting", percent: 0, speed: "—", eta: "—", message: cookiesBrowser ? `Вхід через ${cookiesBrowser}…` : "Підключення…", storage });
       setUrl("");
+    } catch (error) {
+      const message = String(error);
+      setJob((current) => current?.id === id ? { ...current, status: "failed", message } : current);
+    }
+  }
+
+  async function runPreflight(downloadUrl: string, parsedHost: string, cookiesBrowser?: string, playlist = playlistIntent === "playlist") {
+    setPendingStart(true);
+    setFormError("");
+    try {
+      const normalized = normalizeInputUrl(downloadUrl);
+      if (!normalized) throw new Error("Вставте коректне посилання");
+      const result = await invoke<PreflightResult>("preflight_download", {
+        request: {
+          url: normalized,
+          outputDir,
+          mode,
+          quality,
+          audioFormat,
+          multiItem: playlist,
+          title: preview?.title || null,
+          duration: preview?.duration || null,
+          itemCount: preview?.itemCount || null,
+        },
+      });
+      setOutputFreeSpace(result.availableSpace);
+      if (!preflightAllowsStart(result)) {
+        setFormError(result.requiredSpace === null
+          ? "Недостатньо вільного місця: перед стартом потрібно залишити щонайменше 500 МіБ резерву."
+          : `Недостатньо вільного місця: потрібно ${formatByteSize(result.requiredSpace)}, доступно ${formatByteSize(result.availableSpace)}.`);
+        return;
+      }
+      await launchDownload(downloadUrl, parsedHost, result, cookiesBrowser, playlist);
     } catch (error) {
       setFormError(String(error));
     } finally {
@@ -548,7 +739,7 @@ function App() {
     }
   }
 
-  async function beginDownload(skipVpnCheck = false) {
+  async function beginDownload() {
     setFormError("");
     const parsedHost = hostFromInput(url);
     if (!parsedHost) {
@@ -568,26 +759,30 @@ function App() {
       return;
     }
 
-    if (!skipVpnCheck && isRussianDomain(parsedHost)) {
-      setPendingStart(true);
-      try {
-        const vpn = await invoke<VpnStatus>("check_vpn", { host: parsedHost });
-        if (!vpn.detected) {
-          setVpnWarning({ host: parsedHost, status: vpn });
-          setPendingStart(false);
-          return;
-        }
-      } catch {
-        setVpnWarning({
-          host: parsedHost,
-          status: { detected: false, interfaceName: null, confidence: "unknown", detail: "Не вдалося перевірити стан VPN" },
-        });
-        setPendingStart(false);
-        return;
-      }
+    const normalized = normalizeInputUrl(url);
+    if (!normalized) {
+      setFormError("Вставте коректне посилання");
+      return;
+    }
+    if (isRussianDomain(parsedHost) && !approvedVpnUrls.current.has(normalized)) {
+      setFormError("Спочатку завершіть перевірку VPN для цього посилання");
+      return;
     }
 
-    await launchDownload(url, parsedHost);
+    await runPreflight(url, parsedHost);
+  }
+
+  function dismissVpnWarning() {
+    setVpnWarning(null);
+    setProbeState("invalid");
+    setProbeError("Перевірку посилання скасовано");
+  }
+
+  function approveVpnWarning() {
+    if (!vpnWarning) return;
+    approvedVpnUrls.current.add(vpnWarning.url);
+    setVpnWarning(null);
+    setVpnDecisionVersion((current) => current + 1);
   }
 
   async function retryWithCookies() {
@@ -595,16 +790,20 @@ function App() {
     const parsedHost = hostFromInput(job.url);
     if (!parsedHost) return;
     localStorage.setItem("cookieBrowser", cookieBrowser);
-    await launchDownload(job.url, parsedHost, cookieBrowser);
+    await runPreflight(job.url, parsedHost, cookieBrowser, job.playlist);
   }
 
   async function cancelJob() {
     if (!job) return;
     const jobId = job.id;
+    const cancelledUrl = job.url;
+    const cancelledPlaylist = job.playlist;
     setCancelBusy(true);
     setCancelError("");
     try {
       await invoke("cancel_download", { id: jobId });
+      cancelledDownloadRestore.current = { url: cancelledUrl, playlist: cancelledPlaylist };
+      setUrl(cancelledUrl);
       setCancelConfirmOpen(false);
       setJob((current) => current?.id === jobId ? null : current);
     } catch (error) {
@@ -649,9 +848,9 @@ function App() {
         </nav>
         <div className="runtime-panel">
           <div className="runtime-heading"><span>Компоненти</span><small>{runtimeBusy ? "перевірка" : runtimeReady ? "готові" : "очікуємо"}</small></div>
-          <RuntimeRow label="yt-dlp" component={runtime?.ytDlp} loading={runtimeStage === "ytDlp"} />
-          <RuntimeRow label="ffmpeg" component={runtime?.ffmpeg} loading={runtimeStage === "ffmpeg"} />
-          <RuntimeRow label="Deno" component={runtime?.deno} loading={runtimeStage === "deno"} />
+          <RuntimeRow label="yt-dlp" component={runtime?.ytDlp} loading={runtimeStage === "ytDlp"} retry={runtimeFailures.has("ytDlp") || runtime?.ytDlp.installed === false ? () => retryRuntimeComponent("ytDlp") : undefined} />
+          <RuntimeRow label="ffmpeg" component={runtime?.ffmpeg} loading={runtimeStage === "ffmpeg"} retry={runtimeFailures.has("ffmpeg") || runtime?.ffmpeg.installed === false ? () => retryRuntimeComponent("ffmpeg") : undefined} />
+          <RuntimeRow label="Deno" component={runtime?.deno} loading={runtimeStage === "deno"} retry={runtimeFailures.has("deno") || runtime?.deno.installed === false ? () => retryRuntimeComponent("deno") : undefined} />
           {runtimeError && <p className="runtime-error">{runtimeError}</p>}
         </div>
         <div className="support-card">
@@ -668,7 +867,7 @@ function App() {
         </header>
 
         <section className="download-card" aria-busy={runtimeBusy}>
-          {runtimeBusy && <RuntimePreparationOverlay stage={runtimeStage} runtime={runtime} />}
+          {runtimeBusy && <RuntimePreparationOverlay stage={runtimeStage} runtime={runtime} progress={runtimeInstallProgress} />}
           <div className="download-card-content" inert={runtimeBusy ? true : undefined}>
           <label className="field-label" htmlFor="media-url">Посилання</label>
           <div className={`url-field ${probeState}`}>
@@ -685,10 +884,19 @@ function App() {
           </div>}
           {preview && probeState === "valid" && <div className="media-preview">
             {preview.thumbnail ? <img src={preview.thumbnail} alt="" /> : <div className="media-preview-placeholder"><Icon name="check"/></div>}
-            <div><strong>{preview.title}</strong><p>{[preview.uploader, formatDuration(preview.duration), preview.extractor].filter(Boolean).join(" · ")}</p><small><Icon name="check" size={13}/>yt-dlp підтвердив, що відео можна завантажити</small></div>
+            <div><strong>{preview.title}</strong><p>{[preview.uploader, formatDuration(preview.duration), preview.itemCount && preview.itemCount > 1 ? `${preview.itemCount} елементів` : null, preview.extractor].filter(Boolean).join(" · ")}</p><small><Icon name="check" size={13}/>Посилання доступне; формати перевіримо перед стартом</small></div>
           </div>}
           {probeState === "unverified" && <div className="url-warning" title={probeError}><span aria-hidden="true">!</span><span>Не вдалося швидко підтвердити посилання. yt-dlp все одно може спробувати його завантажити.</span></div>}
           {probeState === "invalid" && <div className="url-error"><Icon name="x" size={14}/><span>{probeError || "yt-dlp не може завантажити це посилання"}</span></div>}
+
+          {multiItemCandidate && <div className="collection-intent">
+            <span className="field-label">Що взяти з добірки</span>
+            <div className="segmented">
+              <button type="button" className={playlistIntent === "single" ? "selected" : ""} onClick={() => setPlaylistIntent("single")}>Лише це відео</button>
+              <button type="button" className={playlistIntent === "playlist" ? "selected" : ""} onClick={() => setPlaylistIntent("playlist")}>Уся добірка</button>
+            </div>
+            <small>{playlistIntent === "single" ? "За замовчуванням завантажиться лише поточний ролик." : "Завантажаться всі доступні елементи з безпечними паузами між ними."}</small>
+          </div>}
 
           <div className="choice-grid">
             <div>
@@ -716,7 +924,7 @@ function App() {
           </div>
 
           {formError && <div className="inline-error">{formError}</div>}
-          <button className="primary-button" disabled={(probeState !== "valid" && probeState !== "unverified") || !!active || pendingStart || runtimeBusy || !runtimeReady} onClick={() => beginDownload()}><Icon name="download" />{runtimeBusy ? "Встановлюємо компоненти…" : probeState === "checking" ? "Перевіряємо посилання…" : pendingStart ? "Перевіряємо…" : active ? "Завантаження триває" : probeState === "unverified" ? "Спробувати завантажити" : "Завантажити"}</button>
+          <button className="primary-button" disabled={(probeState !== "valid" && probeState !== "unverified") || !!active || pendingStart || runtimeBusy || !runtimeReady} onClick={() => beginDownload()}><Icon name="download" />{runtimeBusy ? "Встановлюємо компоненти…" : probeState === "checking" ? "Перевіряємо посилання…" : pendingStart ? "Починаємо…" : active ? "Завантаження триває" : "Завантажити"}</button>
           <p className="legal-note">Завантажуйте лише матеріали, на які маєте відповідні права.</p>
           </div>
         </section>
@@ -733,7 +941,7 @@ function App() {
             <div className="job-icon" aria-label={`Етап ${jobStageNumber(job.status)}`}><span className="job-stage"><small>ЕТАП</small><strong>{jobStageNumber(job.status)}</strong></span></div>
           )}
           <div className="job-body">
-            <div className="job-title"><div ref={jobTitleTextRef}><strong id="download-progress-title">{job.title}</strong><small>{job.status === "completed" ? "Готово" : job.status === "failed" ? job.message || "Помилка завантаження" : job.status === "cancelled" ? "Скасовано" : job.message}</small></div><span style={{ fontSize: `${jobValueFontSize}px` }}>{job.status === "postprocessing" || job.status === "converting" ? "MP4" : `${Math.round(job.percent)}%`}</span></div>
+            <div className="job-title"><div ref={jobTitleTextRef}><strong id="download-progress-title">{job.title}</strong><small>{job.status === "completed" ? "Готово" : job.status === "failed" ? job.message || "Помилка завантаження" : job.status === "cancelled" ? "Скасовано" : job.message}</small></div><span style={{ fontSize: `${jobValueFontSize}px` }}>{job.status === "postprocessing" || job.status === "converting" ? job.outputFormat : `${Math.round(job.percent)}%`}</span></div>
             <div className="job-source" title={job.url}><Icon name="link" size={12}/><span>{job.url}</span></div>
             {job.storage && <div className={`storage-estimate ${job.storage.sufficient === false ? "warning" : job.storage.sufficient === true ? "ready" : "unknown"}`}>
               {job.storage.sufficient === false ? <Icon name="shield" size={15}/> : <span className="storage-estimate-dot"/>}
@@ -767,7 +975,7 @@ function App() {
           <h2 id="vpn-title">VPN не виявлено</h2>
           <p>Ви збираєтесь завантажити матеріал із <strong>{vpnWarning.host}</strong>. Не вдалося підтвердити, що VPN увімкнений.</p>
           <div className="modal-detail">{vpnWarning.status.detail}</div>
-          <div className="modal-actions"><button className="secondary-button" onClick={() => setVpnWarning(null)}>Скасувати</button><button className="warning-button" onClick={() => { setVpnWarning(null); beginDownload(true); }}>Завантажити все одно</button></div>
+          <div className="modal-actions"><button className="secondary-button" onClick={dismissVpnWarning}>Скасувати</button><button className="warning-button" onClick={approveVpnWarning}>Продовжити без VPN</button></div>
         </div>
       </div>}
 
@@ -786,9 +994,9 @@ function App() {
   );
 }
 
-function RuntimeRow({ label, component, loading = false }: { label: string; component?: ComponentStatus; loading?: boolean }) {
+function RuntimeRow({ label, component, loading = false, retry }: { label: string; component?: ComponentStatus; loading?: boolean; retry?: () => void }) {
   const ready = component?.installed;
-  return <div className="runtime-row"><span className={`component-dot ${loading ? "loading" : ready ? "ready" : "missing"}`}/><div><strong>{label}</strong><small>{loading ? "Перевіряємо й оновлюємо…" : ready ? shortVersion(component.version) : "Готуємо автоматично"}</small></div>{ready && !loading && <Icon name="check" size={15}/>}</div>;
+  return <div className="runtime-row"><span className={`component-dot ${loading ? "loading" : ready ? "ready" : "missing"}`}/><div><strong>{label}</strong><small>{loading ? "Завантажуємо й перевіряємо…" : ready ? shortVersion(component.version) : "Компонент недоступний"}</small></div>{ready && !loading ? <Icon name="check" size={15}/> : retry && !loading ? <button type="button" className="runtime-retry" aria-label={`Повторити встановлення ${label}`} onClick={retry}><Icon name="refresh" size={14}/></button> : null}</div>;
 }
 
 function StartupOverlay({ progress, message }: { progress: number; message: string }) {
@@ -808,7 +1016,7 @@ function StartupOverlay({ progress, message }: { progress: number; message: stri
   </div>;
 }
 
-function RuntimePreparationOverlay({ stage, runtime }: { stage: RuntimeStage; runtime: RuntimeStatus | null }) {
+function RuntimePreparationOverlay({ stage, runtime, progress }: { stage: RuntimeStage; runtime: RuntimeStatus | null; progress: RuntimeInstallProgress | null }) {
   const components = [
     { key: "ytDlp", label: "yt-dlp", component: runtime?.ytDlp },
     { key: "ffmpeg", label: "ffmpeg", component: runtime?.ffmpeg },
@@ -828,7 +1036,7 @@ function RuntimePreparationOverlay({ stage, runtime }: { stage: RuntimeStage; ru
           return <div className={activeStage ? "active" : ready ? "ready" : "waiting"} key={key}>
             <span className="runtime-preparation-status">{ready ? <Icon name="check" size={14}/> : <i/>}</span>
             <strong>{label}</strong>
-            <small>{activeStage ? "Встановлюємо…" : ready ? "Готово" : "Очікує"}</small>
+            <small>{activeStage ? progress?.component === key && progress.total ? `${Math.min(100, Math.round((progress.downloaded / progress.total) * 100))}%` : "Встановлюємо…" : ready ? "Готово" : "Очікує"}</small>
           </div>;
         })}
       </div>

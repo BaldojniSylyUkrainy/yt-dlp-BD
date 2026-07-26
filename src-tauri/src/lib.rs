@@ -4,13 +4,13 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
     fs,
-    io::{BufRead, BufReader, Cursor, Read},
+    io::{BufRead, BufReader, Read},
     net::ToSocketAddrs,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use url::Url;
@@ -20,6 +20,8 @@ use uuid::Uuid;
 use std::os::unix::process::CommandExt;
 
 const YTDLP_RELEASE_BASE: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download";
+const MIN_FREE_SPACE_RESERVE: u64 = 500 * 1024 * 1024;
+const DISK_GUARD_TRIGGER: u64 = MIN_FREE_SPACE_RESERVE + 128 * 1024 * 1024;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -37,6 +39,14 @@ struct RuntimeStatus {
     ffmpeg: ComponentStatus,
     deno: ComponentStatus,
     runtime_dir: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeInstallProgress {
+    component: String,
+    downloaded: u64,
+    total: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -57,11 +67,41 @@ struct MediaPreview {
     uploader: Option<String>,
     extractor: Option<String>,
     webpage_url: Option<String>,
+    item_count: Option<u64>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PreflightRequest {
+    url: String,
+    output_dir: String,
+    mode: String,
+    quality: String,
+    audio_format: String,
+    multi_item: bool,
+    title: Option<String>,
+    duration: Option<f64>,
+    item_count: Option<u64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PreflightResult {
+    title: String,
+    item_count: u64,
+    intermediate_size: Option<u64>,
+    final_output_size: Option<u64>,
+    protected_reserve: u64,
+    required_space: Option<u64>,
+    available_space: u64,
+    confidence: String,
+    sufficient: bool,
 }
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DownloadRequest {
+    id: String,
     url: String,
     output_dir: String,
     mode: String,
@@ -70,6 +110,7 @@ struct DownloadRequest {
     subtitles: bool,
     multi_item: bool,
     cookies_browser: Option<String>,
+    expected_required_space: Option<u64>,
 }
 
 #[derive(Clone, Serialize)]
@@ -121,6 +162,11 @@ struct DownloadManager {
     jobs: Arc<Mutex<HashMap<String, Arc<Mutex<Child>>>>>,
     cancelled: Arc<Mutex<HashSet<String>>>,
     auth_required: Arc<Mutex<HashSet<String>>>,
+}
+
+#[derive(Clone, Default)]
+struct ProbeManager {
+    active: Arc<Mutex<Option<(String, tokio::task::AbortHandle)>>>,
 }
 
 fn runtime_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -253,9 +299,80 @@ fn download_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(10))
         .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(20))
         .build()
         .map_err(|error| format!("Не вдалося підготувати завантаження: {error}"))
+}
+
+async fn fetch_to_file(
+    app: &AppHandle,
+    client: &reqwest::Client,
+    url: &str,
+    destination: &Path,
+    component: &str,
+) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut response = client
+        .get(url)
+        .header("User-Agent", "yt-dlp-desktop")
+        .send()
+        .await
+        .map_err(|error| format!("Помилка мережі: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Сервер повернув помилку: {error}"))?;
+    let total = response.content_length();
+    let mut file = tokio::fs::File::create(destination)
+        .await
+        .map_err(|error| format!("Не вдалося створити тимчасовий файл: {error}"))?;
+    let mut downloaded = 0_u64;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("Не вдалося прочитати завантаження: {error}"))?
+    {
+        file.write_all(&chunk)
+            .await
+            .map_err(|error| format!("Не вдалося записати завантаження: {error}"))?;
+        downloaded = downloaded.saturating_add(chunk.len() as u64);
+        let _ = app.emit(
+            "runtime-install-progress",
+            RuntimeInstallProgress {
+                component: component.into(),
+                downloaded,
+                total,
+            },
+        );
+    }
+    file.flush()
+        .await
+        .map_err(|error| format!("Не вдалося завершити запис завантаження: {error}"))
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let file = fs::File::open(path)
+        .map_err(|error| format!("Не вдалося відкрити файл для перевірки: {error}"))?;
+    let mut reader = BufReader::new(file);
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| format!("Не вдалося перевірити завантажений файл: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn verify_sha256_file(path: &Path, checksum_file: &[u8], label: &str) -> Result<(), String> {
+    let expected = checksum_value(checksum_file, label)?;
+    let actual = sha256_file(path)?;
+    if actual != expected {
+        return Err(format!("Контрольна сума {label} не збігається"));
+    }
+    Ok(())
 }
 
 fn ffmpeg_release_asset(page: &str, filename: &str) -> Result<String, String> {
@@ -290,22 +407,14 @@ fn checksum_value(checksum_file: &[u8], label: &str) -> Result<String, String> {
     Ok(expected)
 }
 
-fn verify_sha256(bytes: &[u8], checksum_file: &[u8], label: &str) -> Result<(), String> {
-    let expected = checksum_value(checksum_file, label)?;
-    let actual = format!("{:x}", Sha256::digest(bytes));
-    if actual != expected {
-        return Err(format!("Контрольна сума {label} не збігається"));
-    }
-    Ok(())
-}
-
-fn extract_binary(
-    archive_bytes: &[u8],
+fn extract_binary_from_file(
+    archive_path: &Path,
     binary_name: &str,
     destination: &Path,
 ) -> Result<(), String> {
-    let reader = Cursor::new(archive_bytes);
-    let mut archive = zip::ZipArchive::new(reader)
+    let archive_file = fs::File::open(archive_path)
+        .map_err(|error| format!("Не вдалося відкрити архів {binary_name}: {error}"))?;
+    let mut archive = zip::ZipArchive::new(archive_file)
         .map_err(|error| format!("Не вдалося відкрити архів {binary_name}: {error}"))?;
     let index = (0..archive.len())
         .find(|index| {
@@ -320,13 +429,13 @@ fn extract_binary(
                 .unwrap_or(false)
         })
         .ok_or_else(|| format!("В архіві не знайдено {binary_name}"))?;
-    let mut file = archive
+    let mut archived_binary = archive
         .by_index(index)
         .map_err(|error| format!("Не вдалося прочитати {binary_name}: {error}"))?;
     let temporary = destination.with_extension("download");
     let mut output = fs::File::create(&temporary)
         .map_err(|error| format!("Не вдалося створити {binary_name}: {error}"))?;
-    std::io::copy(&mut file, &mut output)
+    std::io::copy(&mut archived_binary, &mut output)
         .map_err(|error| format!("Не вдалося розпакувати {binary_name}: {error}"))?;
 
     #[cfg(unix)]
@@ -385,14 +494,26 @@ async fn install_ffmpeg(app: AppHandle) -> Result<(), String> {
         }
 
         eprintln!("Завантажуємо керовані ffmpeg та ffprobe");
-        let (ffmpeg_zip, ffprobe_zip) = tokio::try_join!(
-            fetch_bytes(&client, &ffmpeg_url),
-            fetch_bytes(&client, &ffprobe_url)
-        )?;
-        verify_sha256(&ffmpeg_zip, &ffmpeg_checksum, "ffmpeg")?;
-        verify_sha256(&ffprobe_zip, &ffprobe_checksum, "ffprobe")?;
-        extract_binary(&ffmpeg_zip, "ffmpeg", &ffmpeg_path)?;
-        extract_binary(&ffprobe_zip, "ffprobe", &ffprobe_path)?;
+        let ffmpeg_archive = directory.join(".ffmpeg.zip.download");
+        let ffprobe_archive = directory.join(".ffprobe.zip.download");
+        let download_result = tokio::try_join!(
+            fetch_to_file(&app, &client, &ffmpeg_url, &ffmpeg_archive, "ffmpeg"),
+            fetch_to_file(&app, &client, &ffprobe_url, &ffprobe_archive, "ffmpeg")
+        );
+        if let Err(error) = download_result {
+            let _ = fs::remove_file(&ffmpeg_archive);
+            let _ = fs::remove_file(&ffprobe_archive);
+            return Err(error);
+        }
+        let install_result = (|| {
+            verify_sha256_file(&ffmpeg_archive, &ffmpeg_checksum, "ffmpeg")?;
+            verify_sha256_file(&ffprobe_archive, &ffprobe_checksum, "ffprobe")?;
+            extract_binary_from_file(&ffmpeg_archive, "ffmpeg", &ffmpeg_path)?;
+            extract_binary_from_file(&ffprobe_archive, "ffprobe", &ffprobe_path)
+        })();
+        let _ = fs::remove_file(&ffmpeg_archive);
+        let _ = fs::remove_file(&ffprobe_archive);
+        install_result?;
         fs::write(ffmpeg_stamp, ffmpeg_expected)
             .map_err(|error| format!("Не вдалося зберегти версію ffmpeg: {error}"))?;
         fs::write(ffprobe_stamp, ffprobe_expected)
@@ -439,9 +560,17 @@ async fn install_deno(app: AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
-    let archive = fetch_bytes(&client, &archive_url).await?;
-    verify_sha256(&archive, &checksum, "Deno")?;
-    extract_binary(&archive, filename, &destination)?;
+    let archive = directory.join(".deno.zip.download");
+    if let Err(error) = fetch_to_file(&app, &client, &archive_url, &archive, "deno").await {
+        let _ = fs::remove_file(&archive);
+        return Err(error);
+    }
+    let install_result = (|| {
+        verify_sha256_file(&archive, &checksum, "Deno")?;
+        extract_binary_from_file(&archive, filename, &destination)
+    })();
+    let _ = fs::remove_file(&archive);
+    install_result?;
     fs::write(stamp, expected)
         .map_err(|error| format!("Не вдалося зберегти версію Deno: {error}"))?;
     Ok(())
@@ -486,15 +615,16 @@ async fn install_ytdlp(app: AppHandle) -> Result<(), String> {
     }
 
     eprintln!("Завантажуємо стабільний yt-dlp");
-    let binary = fetch_bytes(&client, &binary_url).await?;
-    let actual = format!("{:x}", Sha256::digest(&binary));
+    let temporary = destination.with_extension("download");
+    if let Err(error) = fetch_to_file(&app, &client, &binary_url, &temporary, "ytDlp").await {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    let actual = sha256_file(&temporary)?;
     if actual != expected {
+        let _ = fs::remove_file(&temporary);
         return Err("Контрольна сума yt-dlp не збігається. Файл не встановлено".into());
     }
-
-    let temporary = destination.with_extension("download");
-    fs::write(&temporary, &binary)
-        .map_err(|error| format!("Не вдалося записати yt-dlp: {error}"))?;
 
     #[cfg(unix)]
     {
@@ -538,7 +668,10 @@ fn clean_probe_error(stderr: &[u8]) -> String {
 
 fn friendly_download_error(message: &str) -> String {
     let value = message.to_ascii_lowercase();
-    if ["truncated_id", "incomplete youtube id", "looks truncated"]
+    if value.contains("недостатньо вільного місця") || value.contains("no space left")
+    {
+        "Недостатньо вільного місця. Процес зупинено, щоб захистити диск.".into()
+    } else if ["truncated_id", "incomplete youtube id", "looks truncated"]
         .iter()
         .any(|pattern| value.contains(pattern))
     {
@@ -599,6 +732,64 @@ fn host_matches(host: &str, domain: &str) -> bool {
     host == domain || host.ends_with(&format!(".{domain}"))
 }
 
+fn format_selector(mode: &str, quality: &str) -> &'static str {
+    if mode == "audio" {
+        return "bestaudio/best";
+    }
+    match quality {
+        "2160" => "bestvideo[height<=2160]+bestaudio/best[height<=2160]",
+        "1080" => "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+        "720" => "bestvideo[height<=720]+bestaudio/best[height<=720]",
+        "480" => "bestvideo[height<=480]+bestaudio/best[height<=480]",
+        _ => "bestvideo+bestaudio/best",
+    }
+}
+
+fn playlist_flag(multi_item: bool) -> &'static str {
+    if multi_item {
+        "--yes-playlist"
+    } else {
+        "--no-playlist"
+    }
+}
+
+fn extraction_args(
+    app: &AppHandle,
+    mode: &str,
+    quality: &str,
+    multi_item: bool,
+    cookies_browser: Option<&str>,
+) -> Result<Vec<OsString>, String> {
+    let mut args = vec![
+        OsString::from(playlist_flag(multi_item)),
+        OsString::from("-f"),
+        OsString::from(format_selector(mode, quality)),
+    ];
+    if let Some(browser) = cookies_browser {
+        let supported = [
+            "brave", "chrome", "chromium", "edge", "firefox", "opera", "safari", "vivaldi",
+        ];
+        if !supported.contains(&browser) {
+            return Err("Непідтримуваний браузер для cookies".into());
+        }
+        args.extend([
+            OsString::from("--cookies-from-browser"),
+            OsString::from(browser),
+        ]);
+    }
+    if let Some(path) = find_deno(app)?.path {
+        args.extend([
+            OsString::from("--js-runtimes"),
+            OsString::from(if path == "deno" {
+                "deno".to_string()
+            } else {
+                format!("deno:{path}")
+            }),
+        ]);
+    }
+    Ok(args)
+}
+
 async fn probe_oembed(url: &str, endpoint: &str, extractor: &str) -> Result<MediaPreview, String> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(2))
@@ -639,20 +830,24 @@ async fn probe_oembed(url: &str, endpoint: &str, extractor: &str) -> Result<Medi
             .map(str::to_string),
         extractor: Some(extractor.to_string()),
         webpage_url: Some(url.to_string()),
+        item_count: Some(1),
     })
 }
 
-#[tauri::command]
-async fn probe_url(app: AppHandle, url: String) -> Result<MediaPreview, String> {
+async fn probe_url_inner(
+    app: AppHandle,
+    url: String,
+    playlist: bool,
+) -> Result<MediaPreview, String> {
     let parsed = Url::parse(&url).map_err(|_| "Вставте повне посилання".to_string())?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
         return Err("Підтримуються лише HTTP та HTTPS посилання".into());
     }
     let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
-    if host_matches(&host, "youtube.com") || host_matches(&host, "youtu.be") {
+    if !playlist && (host_matches(&host, "youtube.com") || host_matches(&host, "youtu.be")) {
         return probe_oembed(&url, "https://www.youtube.com/oembed", "YouTube").await;
     }
-    if host_matches(&host, "vimeo.com") {
+    if !playlist && host_matches(&host, "vimeo.com") {
         return probe_oembed(&url, "https://vimeo.com/api/oembed.json", "Vimeo").await;
     }
 
@@ -666,15 +861,21 @@ async fn probe_url(app: AppHandle, url: String) -> Result<MediaPreview, String> 
         "--ignore-config",
         "--simulate",
         "--no-warnings",
-        "--no-playlist",
         "--no-ignore-no-formats-error",
         "--socket-timeout",
         "6",
         "--extractor-retries",
         "1",
-        "--print",
-        "%(.{title,thumbnail,duration,uploader,channel,extractor,extractor_key,webpage_url})#j",
     ]);
+    if playlist {
+        command.args(["--yes-playlist", "--flat-playlist", "--dump-single-json"]);
+    } else {
+        command.args([
+            "--no-playlist",
+            "--print",
+            "%(.{title,thumbnail,duration,uploader,channel,extractor,extractor_key,webpage_url})#j",
+        ]);
+    }
     if let Some(path) = find_deno(&app)?.path {
         if path == "deno" {
             command.args(["--js-runtimes", "deno"]);
@@ -706,14 +907,81 @@ async fn probe_url(app: AppHandle, url: String) -> Result<MediaPreview, String> 
             .filter(|value| !value.trim().is_empty())
             .map(str::to_string)
     };
+    let entries = metadata.get("entries").and_then(|value| value.as_array());
+    let first_entry = entries.and_then(|entries| entries.first());
+    let playlist_string = |name: &str| {
+        string_field(name).or_else(|| {
+            first_entry
+                .and_then(|entry| entry.get(name))
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+        })
+    };
+    let duration = if playlist {
+        entries.and_then(|entries| {
+            entries
+                .iter()
+                .map(|entry| json_number(entry.get("duration")))
+                .collect::<Option<Vec<_>>>()
+                .map(|durations| durations.into_iter().sum())
+        })
+    } else {
+        json_number(metadata.get("duration"))
+    };
     Ok(MediaPreview {
         title: title.to_string(),
-        thumbnail: string_field("thumbnail"),
-        duration: metadata.get("duration").and_then(|value| value.as_f64()),
-        uploader: string_field("uploader").or_else(|| string_field("channel")),
-        extractor: string_field("extractor_key").or_else(|| string_field("extractor")),
+        thumbnail: playlist_string("thumbnail"),
+        duration,
+        uploader: playlist_string("uploader").or_else(|| playlist_string("channel")),
+        extractor: playlist_string("extractor_key").or_else(|| playlist_string("extractor")),
         webpage_url: string_field("webpage_url"),
+        item_count: if playlist {
+            json_number(metadata.get("playlist_count"))
+                .map(|value| value.round() as u64)
+                .or_else(|| entries.map(|entries| entries.len() as u64))
+        } else {
+            Some(1)
+        },
     })
+}
+
+#[tauri::command]
+async fn probe_url(
+    app: AppHandle,
+    manager: State<'_, ProbeManager>,
+    probe_id: String,
+    url: String,
+    playlist: bool,
+) -> Result<MediaPreview, String> {
+    let task = tokio::spawn(probe_url_inner(app, url, playlist));
+    let abort_handle = task.abort_handle();
+    {
+        let mut active = manager
+            .active
+            .lock()
+            .map_err(|_| "Внутрішня помилка перевірки".to_string())?;
+        if let Some((_, previous)) = active.replace((probe_id.clone(), abort_handle)) {
+            previous.abort();
+        }
+    }
+    let result = task.await.map_err(|error| {
+        if error.is_cancelled() {
+            "Перевірку скасовано через нове посилання".to_string()
+        } else {
+            format!("Не вдалося завершити перевірку: {error}")
+        }
+    })?;
+    if let Ok(mut active) = manager.active.lock() {
+        if active
+            .as_ref()
+            .map(|(active_id, _)| active_id == &probe_id)
+            .unwrap_or(false)
+        {
+            *active = None;
+        }
+    }
+    result
 }
 
 fn is_tunnel_interface(interface_name: &str) -> bool {
@@ -764,12 +1032,12 @@ fn check_vpn(host: String) -> Result<VpnStatus, String> {
         } else {
             "Маршрут до цього ресурсу не проходить через VPN-тунель"
         };
-        return Ok(VpnStatus {
+        Ok(VpnStatus {
             detected,
             interface_name,
             confidence: "high".into(),
             detail: detail.into(),
-        });
+        })
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -943,21 +1211,22 @@ fn target_video_bitrate(height: Option<u64>, fps: Option<f64>, fallback_kbps: Op
     }
 }
 
-fn estimated_final_size(estimate: &SelectedMediaEstimate, tracker: &StorageTracker) -> u64 {
-    let Some(duration) = estimate
+fn estimated_output_size(
+    estimate: &SelectedMediaEstimate,
+    video: bool,
+    audio_format: &str,
+) -> Option<u64> {
+    let duration = estimate
         .duration
-        .filter(|value| value.is_finite() && *value > 0.0)
-    else {
-        return estimate.source_size;
-    };
-    let bitrate = if tracker.video {
+        .filter(|value| value.is_finite() && *value > 0.0)?;
+    let bitrate = if video {
         let video_maxrate =
             target_video_bitrate(estimate.height, estimate.fps, estimate.total_bitrate_kbps)
                 .saturating_mul(11)
                 / 10;
         video_maxrate.saturating_add(192_000)
     } else {
-        match tracker.audio_format.as_str() {
+        match audio_format {
             "wav" => 1_536_000,
             "opus" => 160_000,
             _ => 192_000,
@@ -965,10 +1234,109 @@ fn estimated_final_size(estimate: &SelectedMediaEstimate, tracker: &StorageTrack
     };
     let bytes = duration * bitrate as f64 / 8.0 * 1.02;
     if bytes.is_finite() && bytes > 0.0 && bytes <= u64::MAX as f64 {
-        bytes.ceil() as u64
+        Some(bytes.ceil() as u64)
     } else {
-        estimate.source_size
+        None
     }
+}
+
+fn estimated_final_size(estimate: &SelectedMediaEstimate, tracker: &StorageTracker) -> u64 {
+    estimated_output_size(estimate, tracker.video, &tracker.audio_format)
+        .unwrap_or(estimate.source_size)
+}
+
+fn required_space_with_reserve(intermediate: u64, output: u64) -> Option<u64> {
+    intermediate
+        .checked_add(output)
+        .and_then(|total| total.checked_add(MIN_FREE_SPACE_RESERVE))
+}
+
+fn low_disk_guard_triggered(available: u64) -> bool {
+    available <= DISK_GUARD_TRIGGER
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SizeConfidence {
+    #[cfg(test)]
+    Exact,
+    Approximate,
+    Unknown,
+}
+
+#[cfg(test)]
+fn selected_media_from_value(
+    metadata: &serde_json::Value,
+) -> (Option<SelectedMediaEstimate>, SizeConfidence) {
+    let media_id = metadata
+        .get("id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let duration = json_number(metadata.get("duration"));
+    let requested = metadata
+        .get("requested_formats")
+        .and_then(|value| value.as_array())
+        .filter(|formats| !formats.is_empty())
+        .or_else(|| {
+            metadata
+                .get("requested_downloads")
+                .and_then(|value| value.as_array())
+                .filter(|formats| !formats.is_empty())
+        });
+    let formats: Vec<&serde_json::Value> = requested
+        .map(|formats| formats.iter().collect())
+        .unwrap_or_else(|| vec![metadata]);
+    let mut source_size = 0_u64;
+    let mut confidence = SizeConfidence::Exact;
+    let mut height = json_number(metadata.get("height")).map(|value| value.round() as u64);
+    let mut fps = json_number(metadata.get("fps"));
+    let mut total_bitrate_kbps = json_number(metadata.get("tbr"));
+    for format in formats {
+        height =
+            height.or_else(|| json_number(format.get("height")).map(|value| value.round() as u64));
+        fps = fps.or_else(|| json_number(format.get("fps")));
+        let bitrate = json_number(format.get("tbr"))
+            .or_else(|| json_number(format.get("vbr")))
+            .or_else(|| json_number(format.get("abr")));
+        total_bitrate_kbps = total_bitrate_kbps.or(bitrate);
+        let (size, format_confidence) = if let Some(size) = json_number(format.get("filesize")) {
+            (Some(size), SizeConfidence::Exact)
+        } else if let Some(size) = json_number(format.get("filesize_approx")) {
+            (Some(size), SizeConfidence::Approximate)
+        } else if let (Some(duration), Some(bitrate)) = (duration, bitrate) {
+            (
+                Some(duration * bitrate * 1_000.0 / 8.0),
+                SizeConfidence::Approximate,
+            )
+        } else {
+            (None, SizeConfidence::Unknown)
+        };
+        let Some(size) = size.filter(|size| size.is_finite() && *size > 0.0) else {
+            return (None, SizeConfidence::Unknown);
+        };
+        if format_confidence == SizeConfidence::Approximate {
+            confidence = SizeConfidence::Approximate;
+        }
+        let Some(size) = (size <= u64::MAX as f64).then_some(size.ceil() as u64) else {
+            return (None, SizeConfidence::Unknown);
+        };
+        let Some(total) = source_size.checked_add(size) else {
+            return (None, SizeConfidence::Unknown);
+        };
+        source_size = total;
+    }
+    (
+        Some(SelectedMediaEstimate {
+            media_id,
+            source_size,
+            duration,
+            height,
+            fps,
+            total_bitrate_kbps,
+        }),
+        confidence,
+    )
 }
 
 #[cfg(unix)]
@@ -984,9 +1352,9 @@ fn available_disk_space(path: &Path) -> Option<u64> {
     }
     let stats = unsafe { stats.assume_init() };
     let block_size = if stats.f_frsize > 0 {
-        stats.f_frsize as u64
+        stats.f_frsize
     } else {
-        stats.f_bsize as u64
+        stats.f_bsize
     };
     (stats.f_bavail as u64).checked_mul(block_size)
 }
@@ -1004,6 +1372,82 @@ fn folder_free_space(path: String) -> Result<u64, String> {
     }
     available_disk_space(&path)
         .ok_or_else(|| "Не вдалося визначити вільне місце в обраній папці".into())
+}
+
+#[tauri::command]
+fn preflight_download(request: PreflightRequest) -> Result<PreflightResult, String> {
+    let parsed = Url::parse(&request.url).map_err(|_| "Вставте повне посилання".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err("Підтримуються лише HTTP та HTTPS посилання".into());
+    }
+    let output_dir = PathBuf::from(&request.output_dir);
+    if !output_dir.is_dir() {
+        return Err("Обрана папка для завантаження недоступна".into());
+    }
+    let available_space = available_disk_space(&output_dir)
+        .ok_or_else(|| "Не вдалося визначити вільне місце в обраній папці".to_string())?;
+    let title = request
+        .title
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "Медіафайл".into());
+    let item_count = if request.multi_item {
+        request.item_count.unwrap_or(1).max(1)
+    } else {
+        1
+    };
+    let duration = request
+        .duration
+        .filter(|value| value.is_finite() && *value > 0.0);
+    let height = match request.quality.as_str() {
+        "2160" => Some(2160),
+        "1080" => Some(1080),
+        "720" => Some(720),
+        "480" => Some(480),
+        _ => None,
+    };
+    let estimate = duration.map(|duration| SelectedMediaEstimate {
+        media_id: "quick-preflight".into(),
+        source_size: 0,
+        duration: Some(duration),
+        height,
+        fps: Some(30.0),
+        total_bitrate_kbps: None,
+    });
+    let final_total = estimate.as_ref().and_then(|estimate| {
+        estimated_output_size(estimate, request.mode != "audio", &request.audio_format)
+    });
+    // A fast preflight intentionally reuses already-fetched preview metadata instead of
+    // asking yt-dlp to resolve every selected format again. At peak disk usage the source
+    // and converted output coexist, so using the output estimate for both is conservative.
+    let intermediate_total = final_total;
+    let confidence = if final_total.is_some() {
+        SizeConfidence::Approximate
+    } else {
+        SizeConfidence::Unknown
+    };
+    let required_space = intermediate_total
+        .zip(final_total)
+        .and_then(|(intermediate, output)| required_space_with_reserve(intermediate, output));
+    let sufficient = required_space
+        .map(|required| available_space >= required)
+        .unwrap_or(available_space > DISK_GUARD_TRIGGER);
+    Ok(PreflightResult {
+        title,
+        item_count,
+        intermediate_size: intermediate_total,
+        final_output_size: final_total,
+        protected_reserve: MIN_FREE_SPACE_RESERVE,
+        required_space,
+        available_space,
+        confidence: match confidence {
+            SizeConfidence::Approximate => "approximate",
+            SizeConfidence::Unknown => "unknown",
+            #[cfg(test)]
+            SizeConfidence::Exact => "exact",
+        }
+        .into(),
+        sufficient,
+    })
 }
 
 fn emit_storage_estimate(
@@ -1031,6 +1475,7 @@ fn emit_storage_estimate(
             )
         })
         .unwrap_or((final_size, source_size.saturating_add(final_size)));
+    let required_space = required_space.saturating_add(MIN_FREE_SPACE_RESERVE);
     let available_space = available_disk_space(&tracker.output_dir);
     let _ = app.emit(
         "download-event",
@@ -1108,6 +1553,32 @@ fn download_was_cancelled(manager: &DownloadManager, id: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn stop_child_process_group(child: &Arc<Mutex<Child>>) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let process_group = child
+            .lock()
+            .map_err(|_| "Не вдалося зупинити процес".to_string())?
+            .id() as i32;
+        let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        Err(format!("Не вдалося зупинити процес: {error}"))
+    }
+
+    #[cfg(not(unix))]
+    child
+        .lock()
+        .map_err(|_| "Не вдалося зупинити процес".to_string())?
+        .kill()
+        .map_err(|error| format!("Не вдалося зупинити процес: {error}"))
+}
+
 fn ffprobe_path(ffmpeg_path: &Path) -> PathBuf {
     if ffmpeg_path.components().count() > 1 {
         ffmpeg_path.with_file_name(if cfg!(target_os = "windows") {
@@ -1175,8 +1646,32 @@ fn media_info(ffmpeg_path: &Path, input: &Path) -> Result<MediaInfo, String> {
     })
 }
 
-fn available_output_path(input: &Path) -> PathBuf {
-    let preferred = input.with_extension("mp4");
+fn media_duration(ffmpeg_path: &Path, input: &Path) -> Result<f64, String> {
+    let output = Command::new(ffprobe_path(ffmpeg_path))
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(input)
+        .output()
+        .map_err(|error| format!("Не вдалося запустити ffprobe: {error}"))?;
+    if !output.status.success() {
+        return Err("ffprobe не зміг визначити тривалість медіафайла".into());
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|duration| duration.is_finite() && *duration > 0.0)
+        .ok_or_else(|| "ffprobe повернув некоректну тривалість медіафайла".into())
+}
+
+fn available_output_path(input: &Path, extension: &str) -> PathBuf {
+    let preferred = input.with_extension(extension);
     if !preferred.exists() {
         return preferred;
     }
@@ -1186,12 +1681,12 @@ fn available_output_path(input: &Path) -> PathBuf {
         .and_then(|value| value.to_str())
         .unwrap_or("video");
     for index in 1..10_000 {
-        let candidate = parent.join(format!("{stem} ({index}).mp4"));
+        let candidate = parent.join(format!("{stem} ({index}).{extension}"));
         if !candidate.exists() {
             return candidate;
         }
     }
-    parent.join(format!("{stem}-{}.mp4", Uuid::new_v4()))
+    parent.join(format!("{stem}-{}.{extension}", Uuid::new_v4()))
 }
 
 fn format_eta(seconds: f64) -> String {
@@ -1209,35 +1704,85 @@ fn format_eta(seconds: f64) -> String {
     }
 }
 
-fn convert_to_compatible_mp4(
+fn conversion_percent(elapsed: f64, duration: f64, file_index: usize, file_count: usize) -> f32 {
+    let file_percent = (elapsed / duration * 100.0).clamp(0.0, 100.0);
+    ((file_index as f64 + file_percent / 100.0) / file_count.max(1) as f64 * 100.0)
+        .clamp(0.0, 100.0) as f32
+}
+
+fn videotoolbox_encoder_available(ffmpeg_path: &Path) -> bool {
+    Command::new(ffmpeg_path)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=size=64x64:rate=1",
+            "-frames:v",
+            "1",
+            "-an",
+            "-c:v",
+            "h264_videotoolbox",
+            "-f",
+            "null",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn convert_downloaded_media(
     app: &AppHandle,
     manager: &DownloadManager,
     id: &str,
     ffmpeg_path: &Path,
     input: &Path,
-    file_index: usize,
-    file_count: usize,
+    file_position: (usize, usize),
+    output_format: &str,
 ) -> Result<(), String> {
+    let (file_index, file_count) = file_position;
     if download_was_cancelled(manager, id) {
         return Err("Завантаження скасовано".into());
     }
 
-    let media = media_info(ffmpeg_path, input)?;
-    let duration = media.duration;
-    let bitrate = target_video_bitrate(Some(media.height), Some(media.fps), None);
-    let maxrate = bitrate.saturating_mul(11) / 10;
-    let bufsize = bitrate.saturating_mul(2);
-    let bitrate = bitrate.to_string();
-    let maxrate = maxrate.to_string();
-    let bufsize = bufsize.to_string();
-    let output = available_output_path(input);
+    let is_video = output_format == "mp4";
+    let use_videotoolbox = is_video && videotoolbox_encoder_available(ffmpeg_path);
+    let media = is_video
+        .then(|| media_info(ffmpeg_path, input))
+        .transpose()?;
+    let duration = if let Some(media) = media.as_ref() {
+        media.duration
+    } else {
+        media_duration(ffmpeg_path, input)?
+    };
+    let output = available_output_path(input, output_format);
+    let output_dir = output
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    if available_disk_space(&output_dir)
+        .map(low_disk_guard_triggered)
+        .unwrap_or(true)
+    {
+        return Err(
+            "Недостатньо вільного місця. Конвертацію не розпочато, щоб захистити диск.".into(),
+        );
+    }
     let temporary = output.with_file_name(format!(
-        ".{}.{}.part.mp4",
+        ".{}.{}.part.{}",
         output
             .file_stem()
             .and_then(|value| value.to_str())
             .unwrap_or("video"),
-        Uuid::new_v4()
+        Uuid::new_v4(),
+        output_format
     ));
     let mut command = Command::new(ffmpeg_path);
     command
@@ -1253,8 +1798,12 @@ fn convert_to_compatible_mp4(
             "pipe:1",
             "-i",
         ])
-        .arg(input)
-        .args([
+        .arg(input);
+    if let Some(media) = media.as_ref() {
+        let bitrate = target_video_bitrate(Some(media.height), Some(media.fps), None);
+        let maxrate = bitrate.saturating_mul(11) / 10;
+        let bufsize = bitrate.saturating_mul(2);
+        command.args([
             "-map",
             "0:v:0",
             "-map",
@@ -1262,13 +1811,17 @@ fn convert_to_compatible_mp4(
             "-map_metadata",
             "0",
             "-c:v",
-            "h264_videotoolbox",
+            if use_videotoolbox {
+                "h264_videotoolbox"
+            } else {
+                "libx264"
+            },
             "-b:v",
-            &bitrate,
+            &bitrate.to_string(),
             "-maxrate",
-            &maxrate,
+            &maxrate.to_string(),
             "-bufsize",
-            &bufsize,
+            &bufsize.to_string(),
             "-c:a",
             "aac",
             "-b:a",
@@ -1277,7 +1830,25 @@ fn convert_to_compatible_mp4(
             "avc1",
             "-movflags",
             "+faststart",
-        ])
+        ]);
+    } else {
+        command.args(["-map", "0:a:0", "-vn", "-map_metadata", "0"]);
+        match output_format {
+            "m4a" => {
+                command.args(["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]);
+            }
+            "opus" => {
+                command.args(["-c:a", "libopus", "-b:a", "160k"]);
+            }
+            "wav" => {
+                command.args(["-c:a", "pcm_s16le", "-ar", "48000"]);
+            }
+            _ => {
+                command.args(["-c:a", "libmp3lame", "-b:a", "192k"]);
+            }
+        }
+    }
+    command
         .arg(&temporary)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1311,7 +1882,16 @@ fn convert_to_compatible_mp4(
 
     let mut out_time_us = 0.0;
     let mut speed_value = 0.0;
-    let mut speed_label = "VideoToolbox".to_string();
+    let format_label = output_format.to_ascii_uppercase();
+    let encoder_label = if use_videotoolbox {
+        "VideoToolbox"
+    } else if is_video {
+        "H.264"
+    } else {
+        "FFmpeg"
+    };
+    let mut speed_label = encoder_label.to_string();
+    let mut low_disk = false;
     if let Some(stdout) = stdout {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             if let Some(value) = line.strip_prefix("out_time_us=") {
@@ -1319,7 +1899,7 @@ fn convert_to_compatible_mp4(
             } else if let Some(value) = line.strip_prefix("speed=") {
                 let value = value.trim();
                 speed_label = if value.is_empty() || value == "N/A" {
-                    "VideoToolbox".into()
+                    encoder_label.into()
                 } else {
                     format!("Кодування {value}")
                 };
@@ -1328,11 +1908,16 @@ fn convert_to_compatible_mp4(
                     .parse::<f64>()
                     .unwrap_or(speed_value);
             } else if line.starts_with("progress=") {
+                if available_disk_space(&output_dir)
+                    .map(low_disk_guard_triggered)
+                    .unwrap_or(true)
+                {
+                    low_disk = true;
+                    let _ = stop_child_process_group(&child);
+                    break;
+                }
                 let elapsed = out_time_us / 1_000_000.0;
-                let file_percent = (elapsed / duration * 100.0).clamp(0.0, 100.0);
-                let overall_percent = ((file_index as f64 + file_percent / 100.0)
-                    / file_count.max(1) as f64
-                    * 100.0) as f32;
+                let overall_percent = conversion_percent(elapsed, duration, file_index, file_count);
                 let remaining = if speed_value > 0.0 {
                     format_eta((duration - elapsed).max(0.0) / speed_value)
                 } else {
@@ -1348,12 +1933,13 @@ fn convert_to_compatible_mp4(
                         eta: Some(remaining),
                         message: Some(if file_count > 1 {
                             format!(
-                                "Створюємо сумісний MP4 — файл {} із {}… Не закривайте застосунок",
+                                "Створюємо {} — файл {} із {}… Не закривайте застосунок",
+                                format_label,
                                 file_index + 1,
                                 file_count
                             )
                         } else {
-                            "Створюємо сумісний MP4… Не закривайте застосунок".into()
+                            format!("Створюємо {format_label}… Не закривайте застосунок")
                         }),
                         storage: None,
                     },
@@ -1381,6 +1967,10 @@ fn convert_to_compatible_mp4(
         let _ = fs::remove_file(&temporary);
         return Err("Завантаження скасовано".into());
     }
+    if low_disk {
+        let _ = fs::remove_file(&temporary);
+        return Err("Недостатньо вільного місця. Конвертацію зупинено, щоб захистити диск.".into());
+    }
     if !status.success() {
         let _ = fs::remove_file(&temporary);
         let detail = errors
@@ -1389,11 +1979,11 @@ fn convert_to_compatible_mp4(
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "ffmpeg завершився з помилкою".into());
-        return Err(format!("Не вдалося створити сумісний MP4: {detail}"));
+        return Err(format!("Не вдалося створити {format_label}: {detail}"));
     }
 
     fs::rename(&temporary, &output)
-        .map_err(|error| format!("Не вдалося зберегти готовий MP4: {error}"))?;
+        .map_err(|error| format!("Не вдалося зберегти готовий {format_label}: {error}"))?;
     let _ = fs::remove_file(input);
     Ok(())
 }
@@ -1403,7 +1993,18 @@ fn start_download(
     app: AppHandle,
     manager: State<'_, DownloadManager>,
     request: DownloadRequest,
-) -> Result<String, String> {
+) -> Result<(), String> {
+    let id = Uuid::parse_str(&request.id)
+        .map_err(|_| "Некоректний ідентифікатор завантаження".to_string())?
+        .to_string();
+    if manager
+        .jobs
+        .lock()
+        .map_err(|_| "Внутрішня помилка черги".to_string())?
+        .contains_key(&id)
+    {
+        return Err("Це завантаження вже запущено".into());
+    }
     let parsed = Url::parse(&request.url).map_err(|_| "Вставте повне посилання".to_string())?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
         return Err("Підтримуються лише HTTP та HTTPS посилання".into());
@@ -1418,6 +2019,15 @@ fn start_download(
     let output_dir = PathBuf::from(&request.output_dir);
     fs::create_dir_all(&output_dir)
         .map_err(|error| format!("Не вдалося відкрити папку завантажень: {error}"))?;
+    let available_space = available_disk_space(&output_dir)
+        .ok_or_else(|| "Не вдалося визначити вільне місце в обраній папці".to_string())?;
+    let enough_space = request
+        .expected_required_space
+        .map(|required| available_space >= required)
+        .unwrap_or(available_space > DISK_GUARD_TRIGGER);
+    if !enough_space {
+        return Err("Недостатньо вільного місця для безпечного завантаження".into());
+    }
 
     let yt_dlp = yt_dlp_path(&app)?;
     if !yt_dlp.is_file() {
@@ -1442,6 +2052,13 @@ fn start_download(
         "-P",
         &request.output_dir,
     ]);
+    command.args(extraction_args(
+        &app,
+        &request.mode,
+        &request.quality,
+        request.multi_item,
+        request.cookies_browser.as_deref(),
+    )?);
     if request.multi_item {
         command.args([
             "--sleep-requests",
@@ -1467,46 +2084,12 @@ fn start_download(
         ]);
     }
 
-    if request.mode == "audio" {
-        command.args(["-x", "--audio-format", &request.audio_format]);
-    } else {
-        let selector = match request.quality.as_str() {
-            "2160" => "bestvideo[height<=2160]+bestaudio/best[height<=2160]",
-            "1080" => "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-            "720" => "bestvideo[height<=720]+bestaudio/best[height<=720]",
-            "480" => "bestvideo[height<=480]+bestaudio/best[height<=480]",
-            _ => "bestvideo+bestaudio/best",
-        };
-        command.args([
-            "-f",
-            selector,
-            "--merge-output-format",
-            "mkv",
-            "--remux-video",
-            "mkv",
-            "--print",
-            "after_move:__YTDLP_FILE__%(filepath)s",
-        ]);
+    command.args(["--print", "after_move:__YTDLP_FILE__%(filepath)s"]);
+    if request.mode != "audio" {
+        command.args(["--merge-output-format", "mkv", "--remux-video", "mkv"]);
     }
     if request.subtitles {
         command.args(["--write-subs", "--write-auto-subs", "--sub-langs", "uk,en"]);
-    }
-    if let Some(browser) = request.cookies_browser.as_deref() {
-        let supported = [
-            "brave", "chrome", "chromium", "edge", "firefox", "opera", "safari", "vivaldi",
-        ];
-        if !supported.contains(&browser) {
-            return Err("Непідтримуваний браузер для cookies".into());
-        }
-        command.args(["--cookies-from-browser", browser]);
-    }
-    let deno = find_deno(&app)?;
-    if let Some(path) = deno.path {
-        if path == "deno" {
-            command.args(["--js-runtimes", "deno"]);
-        } else {
-            command.args(["--js-runtimes", &format!("deno:{path}")]);
-        }
     }
     command
         .arg(&request.url)
@@ -1523,7 +2106,6 @@ fn start_download(
         .map_err(|error| format!("Не вдалося запустити yt-dlp: {error}"))?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let id = Uuid::new_v4().to_string();
     let child = Arc::new(Mutex::new(child));
     let downloaded_files = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
     let storage_tracker = StorageTracker {
@@ -1565,7 +2147,12 @@ fn start_download(
     let manager = manager.inner().clone();
     let monitor_app = app.clone();
     let monitor_id = id.clone();
-    let convert_video = request.mode != "audio";
+    let monitored_output_dir = storage_tracker.output_dir.clone();
+    let output_format = if request.mode == "audio" {
+        request.audio_format.clone()
+    } else {
+        "mp4".into()
+    };
     let ffmpeg_path = ffmpeg
         .path
         .map(PathBuf::from)
@@ -1575,7 +2162,22 @@ fn start_download(
         let mut stdout_reader = stdout_reader;
         let mut stderr_reader = stderr_reader;
         let mut retry_attempt = 0_u8;
+        let mut last_disk_check = Instant::now();
+        let mut low_disk = false;
         loop {
+            if !low_disk && last_disk_check.elapsed() >= Duration::from_secs(1) {
+                last_disk_check = Instant::now();
+                if available_disk_space(&monitored_output_dir)
+                    .map(low_disk_guard_triggered)
+                    .unwrap_or(true)
+                {
+                    low_disk = true;
+                    if let Ok(mut error) = last_error.lock() {
+                        *error = Some("Недостатньо вільного місця. Процес зупинено, щоб зберегти резерв 500 МіБ.".into());
+                    }
+                    let _ = stop_child_process_group(&active_child);
+                }
+            }
             let result = active_child
                 .lock()
                 .ok()
@@ -1592,6 +2194,7 @@ fn start_download(
                 let failure_message = last_error.lock().ok().and_then(|error| error.clone());
                 let youtube_403 = is_youtube
                     && !status.success()
+                    && !low_disk
                     && failure_message
                         .as_deref()
                         .map(|message| message.contains("403"))
@@ -1679,7 +2282,7 @@ fn start_download(
                     .map(|mut jobs| jobs.remove(&monitor_id))
                     .unwrap_or(false);
                 let mut conversion_error = None;
-                if status.success() && !cancelled && convert_video {
+                if status.success() && !cancelled {
                     let files = downloaded_files
                         .lock()
                         .ok()
@@ -1687,19 +2290,19 @@ fn start_download(
                         .unwrap_or_default();
                     if files.is_empty() {
                         conversion_error = Some(
-                            "yt-dlp завершився, але не повідомив шлях до завантаженого відео"
+                            "yt-dlp завершився, але не повідомив шлях до завантаженого файла"
                                 .into(),
                         );
                     } else {
                         for (index, file) in files.iter().enumerate() {
-                            if let Err(error) = convert_to_compatible_mp4(
+                            if let Err(error) = convert_downloaded_media(
                                 &monitor_app,
                                 &manager,
                                 &monitor_id,
                                 &ffmpeg_path,
                                 file,
-                                index,
-                                files.len(),
+                                (index, files.len()),
+                                &output_format,
                             ) {
                                 conversion_error = Some(error);
                                 break;
@@ -1736,6 +2339,9 @@ fn start_download(
                         speed: None,
                         eta: None,
                         message: conversion_error.or_else(|| {
+                            if low_disk {
+                                return Some("Недостатньо вільного місця. Процес зупинено, щоб захистити диск.".into());
+                            }
                             (!status.success())
                                 .then(|| last_error.lock().ok().and_then(|error| error.clone()))
                                 .flatten()
@@ -1750,7 +2356,7 @@ fn start_download(
         }
     });
 
-    Ok(id)
+    Ok(())
 }
 
 #[tauri::command]
@@ -1767,35 +2373,14 @@ fn cancel_download(manager: State<'_, DownloadManager>, id: String) -> Result<()
         .lock()
         .map_err(|_| "Внутрішня помилка черги".to_string())?
         .insert(id);
-    #[cfg(unix)]
-    {
-        let process_group = child
-            .lock()
-            .map_err(|_| "Не вдалося зупинити процес".to_string())?
-            .id() as i32;
-        let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
-        if result == 0 {
-            return Ok(());
-        }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(());
-        }
-        Err(format!("Не вдалося зупинити завантаження: {error}"))
-    }
-
-    #[cfg(not(unix))]
-    child
-        .lock()
-        .map_err(|_| "Не вдалося зупинити процес".to_string())?
-        .kill()
-        .map_err(|error| format!("Не вдалося зупинити завантаження: {error}"))
+    stop_child_process_group(&child)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(DownloadManager::default())
+        .manage(ProbeManager::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
@@ -1809,9 +2394,118 @@ pub fn run() {
             probe_url,
             check_vpn,
             folder_free_space,
+            preflight_download,
             start_download,
             cancel_download
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_exact_selected_format_size() {
+        let metadata = serde_json::json!({
+            "id": "video",
+            "duration": 100.0,
+            "height": 1080,
+            "fps": 30,
+            "requested_formats": [
+                {"filesize": 1_000_000, "height": 1080, "fps": 30},
+                {"filesize": 200_000, "abr": 128}
+            ]
+        });
+        let (estimate, confidence) = selected_media_from_value(&metadata);
+        assert_eq!(confidence, SizeConfidence::Exact);
+        assert_eq!(estimate.unwrap().source_size, 1_200_000);
+    }
+
+    #[test]
+    fn marks_approximate_and_unknown_sizes() {
+        let approximate = serde_json::json!({
+            "id": "approx",
+            "duration": 10.0,
+            "requested_formats": [{"filesize_approx": 500_000}]
+        });
+        let unknown = serde_json::json!({
+            "id": "unknown",
+            "duration": 10.0,
+            "requested_formats": [{"format_id": "mystery"}]
+        });
+        assert_eq!(
+            selected_media_from_value(&approximate).1,
+            SizeConfidence::Approximate
+        );
+        assert_eq!(
+            selected_media_from_value(&unknown).1,
+            SizeConfidence::Unknown
+        );
+        assert!(selected_media_from_value(&unknown).0.is_none());
+    }
+
+    #[test]
+    fn required_space_includes_protected_reserve_and_handles_overflow() {
+        assert_eq!(
+            required_space_with_reserve(2_000, 13_000),
+            Some(15_000 + MIN_FREE_SPACE_RESERVE)
+        );
+        assert_eq!(required_space_with_reserve(u64::MAX, 1), None);
+    }
+
+    #[test]
+    fn runtime_disk_guard_triggers_before_protected_reserve() {
+        assert!(low_disk_guard_triggered(DISK_GUARD_TRIGGER));
+        assert!(low_disk_guard_triggered(MIN_FREE_SPACE_RESERVE));
+        assert!(!low_disk_guard_triggered(DISK_GUARD_TRIGGER + 1));
+    }
+
+    #[test]
+    fn conversion_progress_and_eta_are_clamped() {
+        assert_eq!(conversion_percent(-5.0, 100.0, 0, 1), 0.0);
+        assert_eq!(conversion_percent(150.0, 100.0, 0, 1), 100.0);
+        assert_eq!(conversion_percent(50.0, 100.0, 1, 2), 75.0);
+        assert_eq!(format_eta(65.0), "01:05");
+        assert_eq!(format_eta(f64::NAN), "—");
+    }
+
+    #[test]
+    fn selector_and_playlist_intent_are_explicit() {
+        assert_eq!(
+            format_selector("video", "1080"),
+            "bestvideo[height<=1080]+bestaudio/best[height<=1080]"
+        );
+        assert_eq!(format_selector("audio", "best"), "bestaudio/best");
+        assert_eq!(playlist_flag(false), "--no-playlist");
+        assert_eq!(playlist_flag(true), "--yes-playlist");
+    }
+
+    #[test]
+    fn friendly_errors_hide_raw_extractor_diagnostics() {
+        assert!(
+            friendly_download_error("[youtube:truncated_id] incomplete youtube id")
+                .contains("неповне")
+        );
+        assert!(friendly_download_error("HTTP Error 403: Forbidden").contains("відхилив"));
+        assert!(friendly_download_error("No space left on device").contains("вільного місця"));
+    }
+
+    #[test]
+    fn output_collision_uses_numbered_filename() {
+        let directory = std::env::temp_dir().join(format!("yt-dlp-bd-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let input = directory.join("clip.webm");
+        let existing = directory.join("clip.mp4");
+        fs::write(&input, b"source").unwrap();
+        fs::write(&existing, b"existing").unwrap();
+        assert_eq!(
+            available_output_path(&input, "mp4"),
+            directory.join("clip (1).mp4")
+        );
+        fs::remove_file(input).unwrap();
+        fs::remove_file(existing).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
 }

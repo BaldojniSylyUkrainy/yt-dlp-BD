@@ -17,12 +17,20 @@
 
 - `APPLE_CERTIFICATE` — `.p12`, закодований у base64 перед додаванням у Secret;
 - `APPLE_CERTIFICATE_PASSWORD`;
-- `APPLE_API_KEY` — вміст App Store Connect `.p8`;
-- `APPLE_API_KEY_ID`;
+- `APPLE_API_KEY` — Key ID з App Store Connect;
 - `APPLE_API_ISSUER`;
+- `APPLE_API_KEY_CONTENT` — вміст App Store Connect `.p8`, який workflow записує у тимчасовий файл;
 - `TAURI_SIGNING_PRIVATE_KEY`;
 - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
 
 Base64 не є шифруванням. Результат base64 також не можна вставляти в код або надсилати у звичайному чаті — лише безпосередньо в поле GitHub Secret.
+
+Під час notarization workflow має створити тимчасовий файл `.p8` з `APPLE_API_KEY_CONTENT`, встановити для нього права `600`, передати його локальний шлях через `APPLE_API_KEY_PATH` і гарантовано видалити файл у cleanup step. Tauri/notarytool очікують таку трійку:
+
+- `APPLE_API_ISSUER` — Issuer ID;
+- `APPLE_API_KEY` — Key ID;
+- `APPLE_API_KEY_PATH` — шлях до тимчасово materialized `.p8`.
+
+Не друкуйте в лог значення секрету, base64-вміст, повний environment dump або шлях до тимчасового ключа.
 
 GitHub не показує збережене значення Secret назад. Workflow отримує лише ті секрети, які явно передані конкретному job. Не друкуйте секрети в лог і не запускайте release-job для неперевіреного коду.
