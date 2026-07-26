@@ -1341,3 +1341,27 @@ Decision:
 Next step:
 
 - Complete GitHub re-authentication, identify the exact obsolete repository, publish the current repository, update its GitHub description, and then remove only the confirmed obsolete repository.
+
+### 2026-07-26 — Current Repository Published to GitHub
+
+Purpose: publish the complete current application and replace the outdated public-facing repository state.
+
+Published:
+
+- Pushed commit `5f590df` (`Publish current Baldojnyi Downloader app`) to the `main` branch of `BaldojniSylyUkrainy/yt-dlp-BD`.
+- Updated the GitHub description to: `Нативний macOS-завантажувач відео й аудіо з українським інтерфейсом на базі yt-dlp.`
+- Added the public topics `macos`, `tauri`, `ukrainian`, and `yt-dlp`.
+
+Verification:
+
+- Confirmed the repository is public at `https://github.com/BaldojniSylyUkrainy/yt-dlp-BD`.
+- Confirmed local `main` and GitHub `main` both point to commit `5f590dff4bc4a865691df498efd599ff29689529`.
+- Confirmed the updated `README.md` is available on GitHub and does not advertise the internal `.ru`/`.рф` VPN warning.
+
+Decision:
+
+- The GitHub account contains only one repository, and that repository is also this project's configured remote. It was updated in place instead of deleting the repository entity, preserving its URL and update infrastructure while replacing the outdated default-branch contents.
+
+Next step:
+
+- If explicitly required, replace the Git history with a fresh single-snapshot history; this is separate from the now-completed publication and would remove rollback history.
