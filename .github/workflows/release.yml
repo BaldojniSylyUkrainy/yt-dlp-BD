@@ -29,9 +29,9 @@ jobs:
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -103,9 +103,9 @@ jobs:
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -144,7 +144,11 @@ jobs:
           API_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
           KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
 
-          printf '%s' "$APPLE_CERTIFICATE" | openssl base64 -d -A -out "$CERTIFICATE_PATH"
+          printf '%s' "$APPLE_CERTIFICATE" | tr -d '\r\n\t ' | openssl base64 -d -A -out "$CERTIFICATE_PATH"
+          openssl pkcs12 -in "$CERTIFICATE_PATH" -passin env:APPLE_CERTIFICATE_PASSWORD -noout || {
+            echo "APPLE_CERTIFICATE is not a valid Base64-encoded .p12, or APPLE_CERTIFICATE_PASSWORD is incorrect"
+            exit 1
+          }
           printf '%s' "$APPLE_API_KEY_CONTENT" > "$API_KEY_PATH"
           chmod 600 "$CERTIFICATE_PATH" "$API_KEY_PATH"
 
@@ -204,9 +208,9 @@ jobs:
     needs: [windows, macos]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
 
