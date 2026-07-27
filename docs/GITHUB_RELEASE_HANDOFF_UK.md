@@ -25,7 +25,7 @@ Workflow запускається тільки через `workflow_dispatch`. �
 3. Відкрийте **Actions → Manual signed release → Run workflow**.
 4. Branch: `main`.
 5. `tag`: чотирикомпонентний public tag із `package.json`, наприклад
-   `v0.3.0.0`.
+   `v0.3.2.0`.
 6. Натисніть **Run workflow** і вручну approve jobs для environment `release`.
 
 Workflow зупиниться, якщо tag не дорівнює `v${releaseVersion}`, бракує ключа,
