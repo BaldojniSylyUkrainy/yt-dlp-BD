@@ -832,10 +832,18 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!maintenanceStarted.current) {
-      maintenanceStarted.current = true;
-      maintainRuntime();
-    }
+    let timer = 0;
+    const frame = window.requestAnimationFrame(() => {
+      timer = window.setTimeout(() => {
+        if (maintenanceStarted.current) return;
+        maintenanceStarted.current = true;
+        void maintainRuntime();
+      }, 0);
+    });
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(timer);
+    };
   }, [maintainRuntime]);
 
   useEffect(() => {
