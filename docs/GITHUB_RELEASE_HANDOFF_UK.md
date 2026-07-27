@@ -108,7 +108,7 @@ Apple-значення описані покроково в
 2. Відкрийте **Actions → Manual signed release → Run workflow**.
 3. Branch: `main`.
 4. `tag`: чотирикомпонентний public tag із `package.json`, наприклад
-   `v0.2.0.1`.
+   `v0.3.0.0`.
 5. `notes`: короткий текст для updater-вікна.
 6. Натисніть **Run workflow** і вручну approve jobs для environment `release`.
 
@@ -150,6 +150,6 @@ base64 -i "$P12_FILE" | pbcopy
 ```
 
 Вставте clipboard як нове значення `APPLE_CERTIFICATE`, а потім запустіть
-workflow з tag `v0.2.0.1`. CI використовує системні macOS `base64` і
+workflow з tag `v0.3.0.0`. CI використовує системні macOS `base64` і
 `security import`, тому валідний старий Keychain PKCS#12 із `RC2-40-CBC` більше
 не відхиляється OpenSSL 3.

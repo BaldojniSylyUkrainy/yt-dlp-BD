@@ -145,8 +145,8 @@ TAURI_SIGNING_PRIVATE_KEY
 ## 4. Безпечна перевірка
 
 Після додавання secrets GitHub не покаже їх назад. Перевірка робиться лише
-ручним запуском `Manual signed release` з `main`. Для поточного hotfix у полі
-`tag` введіть `v0.2.0.1`.
+ручним запуском `Manual signed release` з `main`. Для поточного релізу у полі
+`tag` введіть `v0.3.0.0`.
 
 Безпечний workflow:
 
