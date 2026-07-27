@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   buildReleaseManifest,
   expectedAssetNames,
+  validateReleaseNotes,
 } from "./generate-release-json.mjs";
 
 const releaseVersion = "0.2.0.0";
@@ -59,5 +60,15 @@ test("fails closed when a required updater signature is missing", () => {
         requireAll: true,
       }),
     /Missing or empty updater signature/,
+  );
+});
+
+test("requires meaningful versioned release notes", () => {
+  const notes = `# yt-dlp BD ${releaseVersion}\n\n## Що нового\n\n- Додано зрозумілий опис важливих змін для користувачів застосунку.`;
+  assert.equal(validateReleaseNotes(notes, releaseVersion), notes);
+  assert.throws(() => validateReleaseNotes("TODO", releaseVersion), /meaningful/);
+  assert.throws(
+    () => validateReleaseNotes(notes.replace(releaseVersion, "9.9.9.9"), releaseVersion),
+    /must mention release version/,
   );
 });

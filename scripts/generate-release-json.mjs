@@ -18,6 +18,20 @@ export function expectedAssetNames(releaseVersion) {
   };
 }
 
+export function validateReleaseNotes(notes, releaseVersion) {
+  const normalized = notes.trim();
+  if (normalized.length < 80) {
+    throw new Error("RELEASE_NOTES.md must contain a meaningful description of the release");
+  }
+  if (!normalized.includes(releaseVersion)) {
+    throw new Error(`RELEASE_NOTES.md must mention release version ${releaseVersion}`);
+  }
+  if (/\b(?:TODO|TBD|CHANGE ME)\b/i.test(normalized)) {
+    throw new Error("RELEASE_NOTES.md still contains placeholder text");
+  }
+  return normalized;
+}
+
 export function buildReleaseManifest({
   assetNames,
   signatures,
@@ -100,6 +114,14 @@ async function main() {
   const repository = process.env.GITHUB_REPOSITORY || releaseConfig.githubRepository;
   const updaterVersion = tauriConfig.version;
   const releaseVersion = packageJson.releaseVersion || updaterVersion;
+  const notes = validateReleaseNotes(
+    await readFile(path.join(projectDir, "RELEASE_NOTES.md"), "utf8"),
+    releaseVersion,
+  );
+  if (process.argv.includes("--validate-notes")) {
+    console.log(`Release notes validated for ${releaseVersion}`);
+    return;
+  }
   const explicitAssetsDir = argumentValue("--assets-dir");
   const releaseDir = explicitAssetsDir
     ? path.resolve(explicitAssetsDir)
@@ -123,7 +145,7 @@ async function main() {
     repository,
     releaseVersion,
     updaterVersion,
-    notes: process.env.RELEASE_NOTES || `Оновлення yt-dlp BD ${releaseVersion}`,
+    notes,
     pubDate: new Date().toISOString(),
     requireAll: process.argv.includes("--require-all"),
   });

@@ -16,6 +16,8 @@ import "./App.css";
 const APP_RELEASE_VERSION = packageMetadata.releaseVersion;
 const HISTORY_STORAGE_KEY = "downloadHistory.v1";
 const HISTORY_LIMIT = 500;
+export const UPDATE_CHECK_DELAYS = [0, 5_000, 30_000] as const;
+const UPDATE_CHECK_INTERVAL = 6 * 60 * 60 * 1_000;
 
 type ComponentStatus = {
   installed: boolean;
@@ -435,7 +437,11 @@ export function parseHistoryStorage(raw: string | null): HistoryEntry[] {
 }
 
 function loadHistory(): HistoryEntry[] {
-  return parseHistoryStorage(localStorage.getItem(HISTORY_STORAGE_KEY));
+  try {
+    return parseHistoryStorage(localStorage.getItem(HISTORY_STORAGE_KEY));
+  } catch {
+    return [];
+  }
 }
 
 export function historyPaths(entries: HistoryEntry[]): string[] {
@@ -519,10 +525,11 @@ function App() {
   const [url, setUrl] = useState("");
   const urlInputRef = useRef<HTMLInputElement>(null);
   const [activeView, setActiveView] = useState<"download" | "history">("download");
-  const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>(loadHistory);
+  const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>([]);
   const historyEntriesRef = useRef(historyEntries);
+  const [historyHydrated, setHistoryHydrated] = useState(false);
   const [historyRetryPending, setHistoryRetryPending] = useState<string | null>(null);
-  const [outputDir, setOutputDir] = useState(localStorage.getItem("outputDir") || "");
+  const [outputDir, setOutputDir] = useState("");
   const [outputFreeSpace, setOutputFreeSpace] = useState<number | null>(null);
   const [mode, setMode] = useState<"video" | "audio">("video");
   const [quality, setQuality] = useState("best");
@@ -535,12 +542,16 @@ function App() {
   const [vpnDecisionVersion, setVpnDecisionVersion] = useState(0);
   const [pendingStart, setPendingStart] = useState(false);
   const [update, setUpdate] = useState<Update | null>(null);
+  const updateAvailableRef = useRef(false);
+  const updateCheckInFlight = useRef<Promise<"found" | "none" | "error"> | null>(null);
+  const [updatePromptOpen, setUpdatePromptOpen] = useState(false);
+  const [updateChecking, setUpdateChecking] = useState(false);
+  const [updateCheckError, setUpdateCheckError] = useState("");
+  const [updateInstallError, setUpdateInstallError] = useState("");
   const [updateBusy, setUpdateBusy] = useState(false);
   const [updateProgress, setUpdateProgress] = useState(0);
   const initialPlatform = navigator.userAgent.includes("Windows") ? "windows" : "macos";
-  const [cookieBrowser, setCookieBrowser] = useState(
-    defaultCookieBrowser(initialPlatform, localStorage.getItem("cookieBrowser")),
-  );
+  const [cookieBrowser, setCookieBrowser] = useState(defaultCookieBrowser(initialPlatform, null));
   const [probeState, setProbeState] = useState<ProbeState>("idle");
   const [preview, setPreview] = useState<MediaPreview | null>(null);
   const [probeError, setProbeError] = useState("");
@@ -558,6 +569,36 @@ function App() {
   const isWindows = runtime?.platform === "windows";
   const quickThumbnail = youtubeThumbnailFromInput(url);
   const multiItemCandidate = isLikelyMultiItemUrl(url);
+
+  useEffect(() => {
+    let timer = 0;
+    const frame = window.requestAnimationFrame(() => {
+      timer = window.setTimeout(() => {
+        const loadedHistory = loadHistory();
+        historyEntriesRef.current = loadedHistory;
+        setHistoryEntries(loadedHistory);
+        setHistoryHydrated(true);
+        try {
+          const savedOutputDir = localStorage.getItem("outputDir");
+          if (savedOutputDir) {
+            setOutputDir(savedOutputDir);
+          } else {
+            void downloadDir().then((directory) => {
+              setOutputDir(directory);
+              localStorage.setItem("outputDir", directory);
+            }).catch(() => undefined);
+          }
+          setCookieBrowser(defaultCookieBrowser(initialPlatform, localStorage.getItem("cookieBrowser")));
+        } catch {
+          void downloadDir().then(setOutputDir).catch(() => undefined);
+        }
+      }, 0);
+    });
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(timer);
+    };
+  }, [initialPlatform]);
 
   useEffect(() => {
     if (!isWindows || cookieBrowser !== "safari") return;
@@ -625,12 +666,13 @@ function App() {
 
   useEffect(() => {
     historyEntriesRef.current = historyEntries;
+    if (!historyHydrated) return;
     try {
       localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(historyEntries.slice(0, HISTORY_LIMIT)));
     } catch {
       // History is helpful but must never interrupt downloading when storage is unavailable.
     }
-  }, [historyEntries]);
+  }, [historyEntries, historyHydrated]);
 
   useEffect(() => {
     if (activeView !== "history" || historyEntries.length === 0) return;
@@ -757,20 +799,63 @@ function App() {
     return () => { unlisten.then((dispose) => dispose()); };
   }, []);
 
+  const checkForAppUpdate = useCallback((surfaceError = false) => {
+    if (updateAvailableRef.current) return Promise.resolve<"found">("found");
+    if (updateCheckInFlight.current) return updateCheckInFlight.current;
+    setUpdateChecking(true);
+    const request = check({
+      timeout: 20_000,
+      headers: { "Cache-Control": "no-cache", Pragma: "no-cache" },
+    }).then((candidate) => {
+      if (!candidate) {
+        if (surfaceError) setUpdateCheckError("");
+        return "none" as const;
+      }
+      updateAvailableRef.current = true;
+      setUpdate(candidate);
+      setUpdateCheckError("");
+      setUpdateInstallError("");
+      setUpdatePromptOpen(true);
+      return "found" as const;
+    }).catch((error) => {
+      console.warn("App update check failed", error);
+      if (surfaceError) {
+        setUpdateCheckError("Не вдалося перевірити оновлення. Перевірте інтернет і спробуйте ще раз");
+      }
+      return "error" as const;
+    }).finally(() => {
+      updateCheckInFlight.current = null;
+      setUpdateChecking(false);
+    });
+    updateCheckInFlight.current = request;
+    return request;
+  }, []);
+
   useEffect(() => {
-    downloadDir().then((directory) => {
-      setOutputDir((current) => {
-        if (current) return current;
-        localStorage.setItem("outputDir", directory);
-        return directory;
-      });
-    }).catch(() => undefined);
     if (!maintenanceStarted.current) {
       maintenanceStarted.current = true;
       maintainRuntime();
     }
-    check({ timeout: 8_000 }).then(setUpdate).catch(() => undefined);
   }, [maintainRuntime]);
+
+  useEffect(() => {
+    const timers = UPDATE_CHECK_DELAYS.map((delay, index) => window.setTimeout(() => {
+      if (updateAvailableRef.current) return;
+      void checkForAppUpdate(index === UPDATE_CHECK_DELAYS.length - 1);
+    }, delay));
+    const periodic = window.setInterval(() => {
+      if (!updateAvailableRef.current) void checkForAppUpdate(false);
+    }, UPDATE_CHECK_INTERVAL);
+    const checkWhenOnline = () => {
+      if (!updateAvailableRef.current) void checkForAppUpdate(true);
+    };
+    window.addEventListener("online", checkWhenOnline);
+    return () => {
+      timers.forEach(window.clearTimeout);
+      window.clearInterval(periodic);
+      window.removeEventListener("online", checkWhenOnline);
+    };
+  }, [checkForAppUpdate]);
 
   useEffect(() => {
     let disposed = false;
@@ -1199,6 +1284,8 @@ function App() {
   async function installAppUpdate() {
     if (!update) return;
     setUpdateBusy(true);
+    setUpdateInstallError("");
+    setUpdateProgress(0);
     let downloaded = 0;
     let total = 0;
     try {
@@ -1211,7 +1298,7 @@ function App() {
       });
       await relaunch();
     } catch (error) {
-      setFormError(`Не вдалося встановити оновлення: ${String(error)}`);
+      setUpdateInstallError(`Не вдалося встановити оновлення: ${String(error)}`);
       setUpdateBusy(false);
     }
   }
@@ -1247,7 +1334,11 @@ function App() {
           {activeView === "download"
             ? <div><p className="eyebrow">ІНСТРУМЕНТ / 01</p><h1>Завантажити</h1><p>Одне посилання. Відео, аудіо, субтитри.</p></div>
             : <div><p className="eyebrow">АРХІВ / 02</p><h1>Історія</h1><p>Завантажені файли й місця, де вони збережені.</p></div>}
-          {update && <button className="update-pill" disabled={updateBusy} onClick={installAppUpdate}><Icon name="refresh" size={16}/>{updateBusy ? `Оновлення ${updateProgress}%` : `Доступна v${update.version}`}</button>}
+          {update
+            ? <button className="update-pill" disabled={updateBusy} onClick={() => setUpdatePromptOpen(true)}><Icon name="refresh" size={16}/>{updateBusy ? `Оновлення ${updateProgress}%` : `Доступна v${update.version}`}</button>
+            : updateCheckError
+              ? <button className="update-pill update-retry" disabled={updateChecking} onClick={() => void checkForAppUpdate(true)}><Icon name="refresh" size={16}/>{updateChecking ? "Перевіряємо…" : "Повторити перевірку"}</button>
+              : null}
         </header>
 
         {activeView === "download" && <section className="download-card" aria-busy={runtimeBusy}>
@@ -1366,6 +1457,19 @@ function App() {
         </div>
       </div>}
 
+      {update && updatePromptOpen && !startupBusy && <div className="modal-backdrop update-modal-backdrop" role="presentation">
+        <div className="modal update-modal" role="dialog" aria-modal="true" aria-labelledby="update-title">
+          <div className="modal-icon update"><Icon name="refresh" size={30}/></div>
+          <p className="eyebrow">ДОСТУПНЕ ОНОВЛЕННЯ</p>
+          <h2 id="update-title">Нова версія {update.version}</h2>
+          <p>Зараз встановлена версія <strong>{update.currentVersion}</strong>. Оновлення завантажиться, встановиться й автоматично перезапустить застосунок.</p>
+          {update.body && <UpdateReleaseNotes notes={update.body}/>}
+          {updateBusy && <div className="update-download-progress" role="progressbar" aria-label="Завантаження оновлення" aria-valuemin={0} aria-valuemax={100} aria-valuenow={updateProgress}><span style={{ width: `${Math.max(2, updateProgress)}%` }}/></div>}
+          {updateInstallError && <div className="modal-detail cancel-error">{updateInstallError}</div>}
+          <div className="modal-actions"><button className="secondary-button" disabled={updateBusy} onClick={() => setUpdatePromptOpen(false)}>Пізніше</button><button className="update-install-button" disabled={updateBusy} onClick={installAppUpdate}>{updateBusy ? `Оновлюємо ${updateProgress}%` : "Оновити зараз"}</button></div>
+        </div>
+      </div>}
+
       {vpnWarning && <div className="modal-backdrop" role="presentation">
         <div className="modal" role="dialog" aria-modal="true" aria-labelledby="vpn-title">
           <div className="modal-icon"><Icon name="shield" size={29}/></div>
@@ -1406,6 +1510,19 @@ function HistoryThumbnail({ entry }: { entry: HistoryEntry }) {
       if (source === cachedSource && entry.thumbnail) setSource(entry.thumbnail);
       else setSource(null);
     }} />}
+  </div>;
+}
+
+function UpdateReleaseNotes({ notes }: { notes: string }) {
+  return <div className="modal-detail update-notes">
+    {notes.split(/\r?\n/).map((line, index) => {
+      const heading = line.match(/^#{1,3}\s+(.+)$/);
+      if (heading) return <strong className="update-notes-heading" key={index}>{heading[1]}</strong>;
+      const item = line.match(/^[-*]\s+(.+)$/);
+      if (item) return <div className="update-notes-item" key={index}><span>•</span><span>{item[1]}</span></div>;
+      if (!line.trim()) return null;
+      return <p key={index}>{line}</p>;
+    })}
   </div>;
 }
 

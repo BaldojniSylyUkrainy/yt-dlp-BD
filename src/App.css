@@ -155,6 +155,7 @@ nav { margin-top: 30px; display: grid; gap: 6px; }
   cursor: pointer;
 }
 .update-pill:hover { color: var(--pink); border-color: var(--pink); }
+.update-pill.update-retry { color: var(--warning); border-color: rgba(239,173,82,.55); }
 
 .download-card, .job-card { max-width: 1080px; margin: 0 auto; border: 0; border-radius: 0; background: var(--panel); box-shadow: none; }
 .download-card { position: relative; isolation: isolate; overflow: hidden; margin-top: 30px; padding: 32px 34px 30px; border-top: 6px solid var(--pink); }
@@ -346,6 +347,7 @@ select:focus { border-color: var(--pink); }
 .modal { width: min(560px, 90vw); padding: 0 28px 28px; border: 1px solid var(--line); border-radius: 0; background: #111; box-shadow: none; text-align: left; }
 .modal-icon { width: calc(100% + 56px); height: 72px; margin: 0 -28px 24px; display: grid; place-items: center; border-radius: 0; color: #1c1004; background: var(--warning); }
 .modal-icon.auth { color: var(--pink-ink); background: var(--pink); }
+.modal-icon.update { color: var(--pink-ink); background: var(--pink); }
 .modal-icon.cancel { color: #1a0809; background: var(--danger); }
 .modal h2 { margin: 0 0 10px; font-family: var(--font-poster); font-size: 34px; font-weight: 900; letter-spacing: -.015em; text-transform: uppercase; }
 .modal > p:not(.eyebrow) { margin: 0; color: #b7b3af; font-size: 13px; line-height: 1.6; }
@@ -360,6 +362,18 @@ select:focus { border-color: var(--pink); }
 .cancel-confirm-button:hover:not(:disabled) { background: #211113; }
 .cancel-confirm-button:disabled, .modal-actions button:disabled { opacity: .55; cursor: default; }
 .modal-detail.cancel-error { color: var(--danger); }
+.update-modal-backdrop { z-index: 120; }
+.update-modal { width: min(600px, 92vw); }
+.update-notes { max-height: 190px; overflow-y: auto; }
+.update-notes-heading { display: block; margin: 12px 0 7px; color: var(--ink); font-size: 12px; letter-spacing: .06em; text-transform: uppercase; }
+.update-notes-heading:first-child { margin-top: 0; }
+.update-notes-item { display: grid; grid-template-columns: 12px minmax(0, 1fr); gap: 5px; margin: 5px 0; }
+.update-notes-item > span:first-child { color: var(--pink); }
+.update-notes p { margin: 7px 0; }
+.update-download-progress { height: 14px; margin: 18px 0; overflow: hidden; border: 1px solid var(--line); background: #090909; }
+.update-download-progress span { display: block; height: 100%; background: var(--pink); transition: width .2s ease-out; }
+.update-install-button { min-height: 42px; padding: 0 17px; border: 0; color: var(--pink-ink); background: var(--pink); font-size: 12px; font-weight: 800; text-transform: uppercase; cursor: pointer; }
+.update-install-button:hover:not(:disabled) { background: var(--pink-hot); }
 .browser-picker { display: block; margin-top: 18px; color: #b7b3af; font-size: 12px; text-transform: uppercase; }
 .browser-picker select { margin-top: 7px; }
 
