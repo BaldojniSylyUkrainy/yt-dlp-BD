@@ -19,15 +19,18 @@ Workflow запускається тільки через `workflow_dispatch`. �
 
 1. Переконайтесь, що потрібний commit уже в `main`, review завершено, а версії
    узгоджені.
-2. Відкрийте **Actions → Manual signed release → Run workflow**.
-3. Branch: `main`.
-4. `tag`: чотирикомпонентний public tag із `package.json`, наприклад
+2. Оновіть `RELEASE_NOTES.md`: вкажіть поточну версію з `package.json` і
+   зрозумілими користувачеві пунктами, що саме змінилося. Один і той самий текст
+   автоматично потрапить у GitHub Release та updater-вікно застосунку.
+3. Відкрийте **Actions → Manual signed release → Run workflow**.
+4. Branch: `main`.
+5. `tag`: чотирикомпонентний public tag із `package.json`, наприклад
    `v0.3.0.0`.
-5. `notes`: короткий текст для updater-вікна.
 6. Натисніть **Run workflow** і вручну approve jobs для environment `release`.
 
 Workflow зупиниться, якщо tag не дорівнює `v${releaseVersion}`, бракує ключа,
-підпису, нотаризації, stapling, Windows NSIS або хоча б одного updater signature.
+підпису, нотаризації, stapling, Windows NSIS, хоча б одного updater signature або
+актуального змістовного `RELEASE_NOTES.md`.
 
 Після зеленого workflow:
 

@@ -14,6 +14,7 @@ import {
   runtimeInstallCommand,
   shouldCacheHistoryThumbnail,
   shouldDeleteUnusedHistoryThumbnail,
+  UPDATE_CHECK_DELAYS,
   type DownloadEvent,
   type Job,
   type HistoryEntry,
@@ -246,5 +247,11 @@ describe("platform defaults", () => {
 
   it("keeps Safari as the macOS default", () => {
     expect(defaultCookieBrowser("macos", null)).toBe("safari");
+  });
+});
+
+describe("application updates", () => {
+  it("checks immediately and retries after short startup delays", () => {
+    expect(UPDATE_CHECK_DELAYS).toEqual([0, 5_000, 30_000]);
   });
 });

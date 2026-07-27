@@ -7,10 +7,6 @@ on:
         description: "Four-part release tag, for example v0.3.0.0"
         required: true
         type: string
-      notes:
-        description: "Release notes used in latest.json"
-        required: false
-        type: string
 
 permissions:
   contents: write
@@ -52,6 +48,7 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
             throw "TAURI_SIGNING_PRIVATE_KEY is missing in the release environment"
           }
+          node scripts/generate-release-json.mjs --validate-notes
 
       - run: npm ci
       - run: npm test
@@ -129,6 +126,7 @@ jobs:
               exit 1
             }
           done
+          node scripts/generate-release-json.mjs --validate-notes
 
       - run: npm ci
       - run: npm test
@@ -229,7 +227,6 @@ jobs:
       - name: Generate and validate combined updater manifest
         env:
           REQUESTED_TAG: ${{ inputs.tag }}
-          RELEASE_NOTES: ${{ inputs.notes }}
         run: |
           RELEASE_VERSION="$(node -p "require('./package.json').releaseVersion")"
           [[ "$REQUESTED_TAG" == "v$RELEASE_VERSION" ]] || {
@@ -251,6 +248,7 @@ jobs:
               exit 1
             }
           else
-            gh release create "$TAG" --draft --target "$GITHUB_SHA" --title "$TAG"
+            gh release create "$TAG" --draft --target "$GITHUB_SHA" --title "yt-dlp BD $TAG" --notes-file RELEASE_NOTES.md
           fi
+          gh release edit "$TAG" --title "yt-dlp BD $TAG" --notes-file RELEASE_NOTES.md
           gh release upload "$TAG" release-assets/* --clobber

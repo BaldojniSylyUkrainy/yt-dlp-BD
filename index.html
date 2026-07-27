@@ -1,13 +1,34 @@
 <!doctype html>
-<html lang="en">
+<html lang="uk">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Tauri + React + Typescript</title>
+    <meta name="color-scheme" content="dark" />
+    <title>yt-dlp BD — Baldojnyi Downloader</title>
+    <style>
+      html, body { margin: 0; min-width: 900px; min-height: 640px; background: #090909; color: #f4f0ed; font-family: "Helvetica Neue", Helvetica, sans-serif; }
+      #boot-shell { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; background: #090909; }
+      #boot-shell .boot-body { width: min(660px, calc(100vw - 70px)); }
+      #boot-shell img { width: min(560px, 100%); height: 150px; margin: 0 0 20px -12px; object-fit: contain; filter: saturate(.72) brightness(.94); }
+      #boot-shell .boot-label { margin: 0 0 12px; color: #c27898; font-size: 12px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+      #boot-shell h1 { max-width: 640px; margin: 0 0 12px; font-size: clamp(44px, 7vw, 78px); font-weight: 900; line-height: .9; letter-spacing: -.03em; text-transform: uppercase; }
+      #boot-shell .boot-message { margin: 0 0 26px; color: #aaa7a4; font-size: 14px; }
+      #boot-shell .boot-progress { width: 82%; max-width: 540px; height: 22px; overflow: hidden; border: 1px solid #343230; background: #151515; }
+      #boot-shell .boot-progress span { display: block; width: 34%; height: 100%; background: #c27898; animation: boot-progress 1.15s ease-in-out infinite; }
+      @keyframes boot-progress { 0% { transform: translateX(-110%); } 100% { transform: translateX(305%); } }
+    </style>
   </head>
 
   <body>
+    <div id="boot-shell" role="status" aria-label="Застосунок запускається">
+      <div class="boot-body">
+        <img src="/src/assets/logo-call-me-hands.png" alt="" />
+        <p class="boot-label">yt-dlp BD</p>
+        <h1>Запускаємо застосунок</h1>
+        <p class="boot-message">Відкриваємо локальні компоненти…</p>
+        <div class="boot-progress" aria-hidden="true"><span></span></div>
+      </div>
+    </div>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
