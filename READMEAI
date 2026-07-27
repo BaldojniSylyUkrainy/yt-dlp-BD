@@ -57,6 +57,7 @@ Current automated coverage includes size confidence, protected-reserve arithmeti
 ## Release and Security Boundaries
 
 - `.secrets/`, signing material, build output, runtime binaries, and release artifacts are ignored and must remain untracked.
+- Versioning is mandatory and documented in `docs/VERSIONING_UK.md`: fixes/performance/security/stability-only releases increment internal PATCH (`0.3.2` → `0.3.3`); any user-visible feature, whether alone or mixed with fixes, increments internal MINOR and resets PATCH (`0.3.2` → `0.4.0`). The public four-part version mirrors it with a final `.0`. Documentation/process-only changes wait for the next app release. Apply one bump per release based on its largest change, not one bump per commit.
 - `.github/workflows/release.yml` is manual-only (`workflow_dispatch`), uses the protected `release` environment and standard GitHub-hosted runners, builds Windows x64 plus macOS arm64, and creates a draft release only after signing, notarization, stapling, and updater-signature checks.
 - The public four-part release version is stored as `package.json.releaseVersion`; Cargo/Tauri retain a monotonically increasing three-part SemVer because Tauri's updater parser requires SemVer. The prepared release is public `0.3.2.0`, internal `0.3.2`, and tag `v0.3.2.0`.
 - The combined `latest.json` contains `darwin-aarch64`, `windows-x86_64-nsis`, and compatibility alias `windows-x86_64`. The manifest generator fails closed if either platform or signature is missing.

@@ -74,6 +74,10 @@ npm run build:mac
 
 ## GitHub і автооновлення
 
+Правило вибору наступного номера версії описане у
+[VERSIONING_UK.md](VERSIONING_UK.md). Коротко: лише виправлення збільшують PATCH,
+а будь-яка нова функція збільшує MINOR і скидає PATCH до нуля.
+
 Repository уже налаштований як `BaldojniSylyUkrainy/yt-dlp-BD`. macOS і Windows
 release збирає ручний GitHub-hosted workflow, а не локальний upload окремих
 файлів. Повний handoff для власника repository:
