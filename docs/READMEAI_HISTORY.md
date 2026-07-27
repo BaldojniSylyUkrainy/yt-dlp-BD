@@ -1375,7 +1375,9 @@ Modified:
 - `package.json` and `package-lock.json` — advanced the npm/SemVer version to `0.3.0` and the public four-part release version to `0.3.0.0`.
 - `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`, and `src-tauri/tauri.conf.json` — synchronized the native application version at `0.3.0`.
 - `.github/workflows/release.yml`, `READMEAI`, and the Ukrainian release/notarization handoff documents — updated current release examples and operational guidance to tag `v0.3.0.0`.
-- Removed the completed one-time Apple notarization setup guide and all references to it; ongoing secret names and release operations remain documented in `docs/SECRETS_UK.md` and `docs/GITHUB_RELEASE_HANDOFF_UK.md`.
+- Removed the completed one-time Apple notarization setup guide and all references to it.
+- Reduced `docs/GITHUB_RELEASE_HANDOFF_UK.md` to the current signed-release procedure; completed branch protection, Actions, environment, secret provisioning, and first-run CI hotfix instructions were removed.
+- Ongoing secret names remain documented in `docs/SECRETS_UK.md`.
 
 Verification:
 
