@@ -83,6 +83,7 @@ Implemented from `HANDOFF_REVIEW_UK.md`:
 - replaced the slow exhaustive size preflight with an immediate approximate calculation based on already-fetched preview metadata; no second network extraction occurs.
 - added production Windows behavior and manual cross-platform GitHub release assembly.
 - added the local download History view, exact final-output metadata, removable-drive availability checks, offline thumbnail cache, same-settings one-click retry, dynamic public version display, and one-click URL clearing; removed the deferred Settings navigation item.
+- removed internal local-build output and GitHub release handoff links from the public README.
 
 ## Remaining Verification / Known Risks
 
