@@ -1365,3 +1365,35 @@ Decision:
 Next step:
 
 - If explicitly required, replace the Git history with a fresh single-snapshot history; this is separate from the now-completed publication and would remove rollback history.
+
+### 2026-07-27 — Version 0.3 Release Preparation
+
+Purpose: prepare the next signed release as a distinct updater target while preserving the already-built `v0.2.0.1` release for upgrade testing.
+
+Modified:
+
+- `package.json` and `package-lock.json` — advanced the npm/SemVer version to `0.3.0` and the public four-part release version to `0.3.0.0`.
+- `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`, and `src-tauri/tauri.conf.json` — synchronized the native application version at `0.3.0`.
+- `.github/workflows/release.yml`, `READMEAI`, and the Ukrainian release/notarization handoff documents — updated current release examples and operational guidance to tag `v0.3.0.0`.
+- Removed the completed one-time Apple notarization setup guide and all references to it.
+- Reduced `docs/GITHUB_RELEASE_HANDOFF_UK.md` to the current signed-release procedure; completed branch protection, Actions, environment, secret provisioning, and first-run CI hotfix instructions were removed.
+- Ongoing secret names remain documented in `docs/SECRETS_UK.md`.
+
+Verification:
+
+- `npm ci` completed with 0 vulnerabilities.
+- 18 frontend tests and 2 release-manifest tests passed.
+- The production frontend build passed.
+- 14 Rust tests passed.
+- `cargo fmt --check` and strict Clippy with `-D warnings` passed.
+- Native `tauri build --debug --no-bundle` completed and built `yt-dlp-desktop v0.3.0`.
+- `git diff --check` reported no whitespace errors.
+
+Decision:
+
+- Keep the updater-facing version at SemVer `0.3.0` while using public release/tag version `0.3.0.0`, matching the existing Tauri compatibility boundary.
+- Do not retag, retarget, or otherwise modify the existing `v0.2.0.1` draft; it remains the old-version installation source for the `0.2.0.1` to `0.3.0.0` updater test.
+
+Next step:
+
+- Review and merge the version bump, then create `v0.3.0.0` from the merged `main` commit and run the manual signed release workflow.

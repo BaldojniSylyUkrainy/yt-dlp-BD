@@ -77,12 +77,10 @@ npm run build:mac
 Repository уже налаштований як `BaldojniSylyUkrainy/yt-dlp-BD`. macOS і Windows
 release збирає ручний GitHub-hosted workflow, а не локальний upload окремих
 файлів. Повний handoff для власника repository:
+[GITHUB_RELEASE_HANDOFF_UK.md](GITHUB_RELEASE_HANDOFF_UK.md).
 
-- [GITHUB_RELEASE_HANDOFF_UK.md](GITHUB_RELEASE_HANDOFF_UK.md);
-- [APPLE_NOTARIZATION_SECRETS_UK.md](APPLE_NOTARIZATION_SECRETS_UK.md).
-
-Поточний public hotfix tag — `v0.2.0.1`, а внутрішня Tauri/SemVer version —
-`0.2.1`. Workflow перевіряє public tag за `package.json.releaseVersion` і
+Поточний public release tag — `v0.3.0.0`, а внутрішня Tauri/SemVer version —
+`0.3.0`. Workflow перевіряє public tag за `package.json.releaseVersion` і
 створює draft Release. Після
 ручної перевірки та публікації `latest.json` встановлені копії побачать нову
 версію, перевірять криптографічний підпис своєї платформи й запропонують
