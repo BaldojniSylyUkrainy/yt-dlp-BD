@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   applyDownloadEvent,
   defaultCookieBrowser,
+  groupHistoryEntries,
   isCurrentProbe,
   isLikelyMultiItemUrl,
   preflightAllowsStart,
@@ -9,6 +10,7 @@ import {
   runtimeInstallCommand,
   type DownloadEvent,
   type Job,
+  type HistoryEntry,
 } from "./App";
 
 const startingJob: Job = {
@@ -34,6 +36,7 @@ function event(kind: DownloadEvent["kind"], overrides: Partial<DownloadEvent> = 
     eta: null,
     message: null,
     storage: null,
+    outputs: null,
     ...overrides,
   };
 }
@@ -67,6 +70,39 @@ describe("download event state", () => {
 
   it("removes a cancelled job", () => {
     expect(applyDownloadEvent(startingJob, event("cancelled"))).toBeNull();
+  });
+});
+
+describe("download history grouping", () => {
+  const entry = (id: string, date: Date): HistoryEntry => ({
+    id,
+    sourceUrl: "https://example.com/video",
+    title: `Відео ${id}`,
+    thumbnail: null,
+    cachedThumbnailPath: null,
+    uploader: null,
+    extractor: "Example",
+    size: 1024,
+    downloadedAt: date.toISOString(),
+    path: `/Downloads/${id}.mp4`,
+    available: true,
+    settings: {
+      outputDir: "/Downloads",
+      mode: "video",
+      quality: "best",
+      audioFormat: "mp3",
+      subtitles: false,
+      playlist: false,
+    },
+  });
+
+  it("sorts newest downloads first and groups them by local calendar day", () => {
+    const now = new Date(2026, 6, 27, 12, 0, 0);
+    const yesterday = new Date(2026, 6, 26, 18, 0, 0);
+    const morning = new Date(2026, 6, 27, 8, 0, 0);
+    const groups = groupHistoryEntries([entry("old", yesterday), entry("new", morning)], now);
+    expect(groups.map((group) => group.label)).toEqual(["Сьогодні", "Вчора"]);
+    expect(groups[0].items[0].id).toBe("new");
   });
 });
 
