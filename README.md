@@ -38,10 +38,6 @@ npm run tauri dev
 npm run build:mac
 ```
 
-Готові файли з’являться в папці `release/`. Детальна інструкція для локального
-macOS build: [docs/START_HERE_UK.md](docs/START_HERE_UK.md). Налаштування ручного
-GitHub release: [docs/GITHUB_RELEASE_HANDOFF_UK.md](docs/GITHUB_RELEASE_HANDOFF_UK.md).
-
 ## Секрети
 
 Ніколи не додавайте до GitHub:

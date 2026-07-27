@@ -25,6 +25,8 @@ const FFMPEG_RELEASE_BASE: &str =
     "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest";
 const MIN_FREE_SPACE_RESERVE: u64 = 500 * 1024 * 1024;
 const DISK_GUARD_TRIGGER: u64 = MIN_FREE_SPACE_RESERVE + 128 * 1024 * 1024;
+const MAX_HISTORY_THUMBNAIL_BYTES: u64 = 8 * 1024 * 1024;
+const HISTORY_THUMBNAIL_CACHE_LIMIT: usize = 550;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -131,6 +133,22 @@ struct DownloadEvent {
     eta: Option<String>,
     message: Option<String>,
     storage: Option<StorageEstimate>,
+    outputs: Option<Vec<DownloadOutput>>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadOutput {
+    path: String,
+    size: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryFileStatus {
+    path: String,
+    available: bool,
+    size: Option<u64>,
 }
 
 #[derive(Clone, Serialize)]
@@ -175,6 +193,11 @@ struct DownloadManager {
 #[derive(Clone, Default)]
 struct ProbeManager {
     active: Arc<Mutex<Option<(String, tokio::task::AbortHandle)>>>,
+}
+
+#[derive(Default)]
+struct HistoryThumbnailCache {
+    operation: tokio::sync::Mutex<()>,
 }
 
 fn runtime_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -1244,6 +1267,7 @@ fn emit_line(app: &AppHandle, id: &str, line: &str) {
                 eta: eta.map(str::to_string),
                 message: message.map(str::to_string),
                 storage: None,
+                outputs: None,
             },
         );
     } else if let Some(payload) = line.strip_prefix(POSTPROCESS_MARKER) {
@@ -1270,6 +1294,7 @@ fn emit_line(app: &AppHandle, id: &str, line: &str) {
                     eta: None,
                     message: Some(message.into()),
                     storage: None,
+                    outputs: None,
                 },
             );
         }
@@ -1296,6 +1321,7 @@ fn emit_line(app: &AppHandle, id: &str, line: &str) {
                     line.trim().to_string()
                 }),
                 storage: None,
+                outputs: None,
             },
         );
     }
@@ -1652,6 +1678,7 @@ fn emit_storage_estimate(
                 available_space,
                 sufficient: available_space.map(|available| available >= required_space),
             }),
+            outputs: None,
         },
     );
 }
@@ -1933,7 +1960,7 @@ fn convert_downloaded_media(
     input: &Path,
     file_position: (usize, usize),
     output_format: &str,
-) -> Result<(), String> {
+) -> Result<PathBuf, String> {
     let (file_index, file_count) = file_position;
     if download_was_cancelled(manager, id) {
         return Err("Завантаження скасовано".into());
@@ -2130,6 +2157,7 @@ fn convert_downloaded_media(
                             format!("Створюємо {format_label}… Не закривайте застосунок")
                         }),
                         storage: None,
+                        outputs: None,
                     },
                 );
             }
@@ -2173,6 +2201,186 @@ fn convert_downloaded_media(
     fs::rename(&temporary, &output)
         .map_err(|error| format!("Не вдалося зберегти готовий {format_label}: {error}"))?;
     let _ = fs::remove_file(input);
+    Ok(output)
+}
+
+#[tauri::command]
+fn inspect_history_files(paths: Vec<String>) -> Vec<HistoryFileStatus> {
+    paths
+        .into_iter()
+        .map(|path| {
+            let metadata = fs::metadata(&path)
+                .ok()
+                .filter(|metadata| metadata.is_file());
+            HistoryFileStatus {
+                path,
+                available: metadata.is_some(),
+                size: metadata.map(|metadata| metadata.len()),
+            }
+        })
+        .collect()
+}
+
+fn history_thumbnail_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let directory = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| format!("Не вдалося знайти папку застосунку: {error}"))?
+        .join("history-thumbnails");
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("Не вдалося створити кеш прев’ю: {error}"))?;
+    Ok(directory)
+}
+
+fn thumbnail_extension(content_type: &str) -> Option<&'static str> {
+    match content_type
+        .split(';')
+        .next()?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "image/jpeg" => Some("jpg"),
+        "image/png" => Some("png"),
+        "image/webp" => Some("webp"),
+        "image/gif" => Some("gif"),
+        "image/avif" => Some("avif"),
+        _ => None,
+    }
+}
+
+fn prune_history_thumbnail_cache(directory: &Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    let mut files = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            metadata.is_file().then(|| {
+                (
+                    metadata
+                        .modified()
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                    entry.path(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    if files.len() <= HISTORY_THUMBNAIL_CACHE_LIMIT {
+        return;
+    }
+    files.sort_by_key(|(modified, _)| *modified);
+    let remove_count = files.len() - HISTORY_THUMBNAIL_CACHE_LIMIT;
+    for (_, path) in files.into_iter().take(remove_count) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+#[tauri::command]
+async fn cache_history_thumbnail(
+    app: AppHandle,
+    cache: State<'_, HistoryThumbnailCache>,
+    url: String,
+) -> Result<String, String> {
+    let _operation = cache.operation.lock().await;
+    let parsed = Url::parse(&url).map_err(|_| "Некоректне посилання на прев’ю".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err("Прев’ю має використовувати HTTP або HTTPS".into());
+    }
+    let directory = history_thumbnail_dir(&app)?;
+    let digest = format!("{:x}", Sha256::digest(url.as_bytes()));
+    for extension in ["jpg", "png", "webp", "gif", "avif"] {
+        let cached = directory.join(format!("{digest}.{extension}"));
+        if cached.is_file() {
+            return Ok(cached.to_string_lossy().into_owned());
+        }
+    }
+
+    let client = download_client()?;
+    let mut response = client
+        .get(parsed)
+        .header("User-Agent", "yt-dlp-desktop")
+        .send()
+        .await
+        .map_err(|error| format!("Не вдалося завантажити прев’ю: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Сервер прев’ю повернув помилку: {error}"))?;
+    if response
+        .content_length()
+        .is_some_and(|size| size > MAX_HISTORY_THUMBNAIL_BYTES)
+    {
+        return Err("Прев’ю завелике для локального кешу".into());
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let extension = thumbnail_extension(content_type)
+        .ok_or_else(|| "Сервер повернув непідтримуваний формат прев’ю".to_string())?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("Не вдалося прочитати прев’ю: {error}"))?
+    {
+        if (bytes.len() as u64).saturating_add(chunk.len() as u64) > MAX_HISTORY_THUMBNAIL_BYTES {
+            return Err("Прев’ю завелике для локального кешу".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.is_empty() {
+        return Err("Сервер повернув порожнє прев’ю".into());
+    }
+    let destination = directory.join(format!("{digest}.{extension}"));
+    let temporary = directory.join(format!(".{digest}.{}.part", Uuid::new_v4()));
+    tokio::fs::write(&temporary, bytes)
+        .await
+        .map_err(|error| format!("Не вдалося записати кеш прев’ю: {error}"))?;
+    if let Err(error) = tokio::fs::rename(&temporary, &destination).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(format!("Не вдалося завершити кешування прев’ю: {error}"));
+    }
+    prune_history_thumbnail_cache(&directory);
+    Ok(destination.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+async fn clear_history_thumbnail_cache(
+    app: AppHandle,
+    cache: State<'_, HistoryThumbnailCache>,
+) -> Result<(), String> {
+    let _operation = cache.operation.lock().await;
+    let directory = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| format!("Не вдалося знайти папку застосунку: {error}"))?
+        .join("history-thumbnails");
+    if directory.exists() {
+        fs::remove_dir_all(&directory)
+            .map_err(|error| format!("Не вдалося очистити кеш прев’ю: {error}"))?;
+    }
+    fs::create_dir_all(directory)
+        .map_err(|error| format!("Не вдалося відновити кеш прев’ю: {error}"))
+}
+
+#[tauri::command]
+async fn delete_history_thumbnail(
+    app: AppHandle,
+    cache: State<'_, HistoryThumbnailCache>,
+    path: String,
+) -> Result<(), String> {
+    let _operation = cache.operation.lock().await;
+    let directory = history_thumbnail_dir(&app)?;
+    let candidate = PathBuf::from(path);
+    if candidate.parent() != Some(directory.as_path()) {
+        return Err("Можна видаляти лише файли кешу прев’ю".into());
+    }
+    if candidate.exists() {
+        fs::remove_file(candidate)
+            .map_err(|error| format!("Не вдалося видалити прев’ю з кешу: {error}"))?;
+    }
     Ok(())
 }
 
@@ -2405,6 +2613,7 @@ fn start_download(
                             eta: None,
                             message: Some(retry_message.into()),
                             storage: None,
+                            outputs: None,
                         },
                     );
                     if let Ok(mut error) = last_error.lock() {
@@ -2472,6 +2681,7 @@ fn start_download(
                     .map(|mut jobs| jobs.remove(&monitor_id))
                     .unwrap_or(false);
                 let mut conversion_error = None;
+                let mut completed_outputs = Vec::new();
                 if status.success() && !cancelled {
                     let files = downloaded_files
                         .lock()
@@ -2485,7 +2695,7 @@ fn start_download(
                         );
                     } else {
                         for (index, file) in files.iter().enumerate() {
-                            if let Err(error) = convert_downloaded_media(
+                            match convert_downloaded_media(
                                 &monitor_app,
                                 &manager,
                                 &monitor_id,
@@ -2494,8 +2704,19 @@ fn start_download(
                                 (index, files.len()),
                                 &output_format,
                             ) {
-                                conversion_error = Some(error);
-                                break;
+                                Ok(output) => {
+                                    let size = fs::metadata(&output)
+                                        .map(|metadata| metadata.len())
+                                        .unwrap_or(0);
+                                    completed_outputs.push(DownloadOutput {
+                                        path: output.to_string_lossy().into_owned(),
+                                        size,
+                                    });
+                                }
+                                Err(error) => {
+                                    conversion_error = Some(error);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -2538,6 +2759,7 @@ fn start_download(
                                 .map(|error| friendly_download_error(&error))
                         }),
                         storage: None,
+                        outputs: (kind == "completed").then_some(completed_outputs),
                     },
                 );
                 break;
@@ -2571,6 +2793,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(DownloadManager::default())
         .manage(ProbeManager::default())
+        .manage(HistoryThumbnailCache::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
@@ -2586,7 +2809,11 @@ pub fn run() {
             folder_free_space,
             preflight_download,
             start_download,
-            cancel_download
+            cancel_download,
+            inspect_history_files,
+            cache_history_thumbnail,
+            clear_history_thumbnail_cache,
+            delete_history_thumbnail
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -2649,6 +2876,34 @@ mod tests {
     #[test]
     fn reports_available_space_for_existing_directory() {
         assert!(available_disk_space(&std::env::temp_dir()).is_some());
+    }
+
+    #[test]
+    fn history_file_status_tracks_existing_and_missing_files() {
+        let fixture_id = Uuid::new_v4();
+        let existing = std::env::temp_dir().join(format!("yt-dlp-bd-{fixture_id}.mp4"));
+        fs::write(&existing, b"video").expect("history fixture");
+        let missing = std::env::temp_dir().join(format!("yt-dlp-bd-{fixture_id}-missing.mp4"));
+        let statuses = inspect_history_files(vec![
+            existing.to_string_lossy().into_owned(),
+            missing.to_string_lossy().into_owned(),
+        ]);
+        assert!(statuses[0].available);
+        assert_eq!(statuses[0].size, Some(5));
+        assert!(!statuses[1].available);
+        assert_eq!(statuses[1].size, None);
+        fs::remove_file(existing).expect("remove history fixture");
+    }
+
+    #[test]
+    fn thumbnail_cache_accepts_only_safe_raster_formats() {
+        assert_eq!(
+            thumbnail_extension("image/jpeg; charset=binary"),
+            Some("jpg")
+        );
+        assert_eq!(thumbnail_extension("IMAGE/WEBP"), Some("webp"));
+        assert_eq!(thumbnail_extension("image/svg+xml"), None);
+        assert_eq!(thumbnail_extension("text/html"), None);
     }
 
     #[test]

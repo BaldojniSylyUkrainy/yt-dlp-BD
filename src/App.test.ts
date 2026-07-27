@@ -1,14 +1,22 @@
 import { describe, expect, it } from "vitest";
 import {
   applyDownloadEvent,
+  applyHistoryFileStatuses,
+  applyHistoryThumbnailCache,
   defaultCookieBrowser,
+  groupHistoryEntries,
+  historyPaths,
   isCurrentProbe,
   isLikelyMultiItemUrl,
+  parseHistoryStorage,
   preflightAllowsStart,
   preflightConfidenceLabel,
   runtimeInstallCommand,
+  shouldCacheHistoryThumbnail,
+  shouldDeleteUnusedHistoryThumbnail,
   type DownloadEvent,
   type Job,
+  type HistoryEntry,
 } from "./App";
 
 const startingJob: Job = {
@@ -34,6 +42,7 @@ function event(kind: DownloadEvent["kind"], overrides: Partial<DownloadEvent> = 
     eta: null,
     message: null,
     storage: null,
+    outputs: null,
     ...overrides,
   };
 }
@@ -67,6 +76,116 @@ describe("download event state", () => {
 
   it("removes a cancelled job", () => {
     expect(applyDownloadEvent(startingJob, event("cancelled"))).toBeNull();
+  });
+});
+
+describe("download history grouping", () => {
+  const entry = (id: string, date: Date): HistoryEntry => ({
+    id,
+    sourceUrl: "https://example.com/video",
+    title: `Відео ${id}`,
+    thumbnail: null,
+    cachedThumbnailPath: null,
+    uploader: null,
+    extractor: "Example",
+    size: 1024,
+    downloadedAt: date.toISOString(),
+    path: `/Downloads/${id}.mp4`,
+    available: true,
+    settings: {
+      outputDir: "/Downloads",
+      mode: "video",
+      quality: "best",
+      audioFormat: "mp3",
+      subtitles: false,
+      playlist: false,
+    },
+  });
+
+  it("sorts newest downloads first and groups them by local calendar day", () => {
+    const now = new Date(2026, 6, 27, 12, 0, 0);
+    const yesterday = new Date(2026, 6, 26, 18, 0, 0);
+    const morning = new Date(2026, 6, 27, 8, 0, 0);
+    const groups = groupHistoryEntries([entry("old", yesterday), entry("new", morning)], now);
+    expect(groups.map((group) => group.label)).toEqual(["Сьогодні", "Вчора"]);
+    expect(groups[0].items[0].id).toBe("new");
+  });
+
+  it("polls replacement paths at the 500-entry limit without rebuilding unchanged state", () => {
+    const full = Array.from({ length: 500 }, (_, index) => entry(`old-${index}`, new Date(2026, 6, 27, 8, 0, index)));
+    const replacement = entry("replacement", new Date(2026, 6, 27, 12, 0, 0));
+    const current = [replacement, ...full.slice(0, 499)];
+    expect(current).toHaveLength(full.length);
+    expect(historyPaths(current)).toContain("/Downloads/replacement.mp4");
+    expect(historyPaths(current)).not.toContain("/Downloads/old-499.mp4");
+
+    const unchanged = applyHistoryFileStatuses(current, current.map((item) => ({
+      path: item.path,
+      available: item.available,
+      size: item.size,
+    })));
+    expect(unchanged).toBe(current);
+
+    const changed = applyHistoryFileStatuses(current, [{
+      path: replacement.path,
+      available: false,
+      size: null,
+    }]);
+    expect(changed).not.toBe(current);
+    expect(changed[0]).toMatchObject({ id: "replacement", available: false });
+  });
+
+  it("caches only completed jobs and does not resurrect history cleared during caching", () => {
+    const outputs = [{ path: "/Downloads/video.mp4", size: 1024 }];
+    expect(shouldCacheHistoryThumbnail("completed", outputs, "https://example.com/thumb.jpg")).toBe(true);
+    expect(shouldCacheHistoryThumbnail("failed", outputs, "https://example.com/thumb.jpg")).toBe(false);
+    expect(shouldCacheHistoryThumbnail("cancelled", outputs, "https://example.com/thumb.jpg")).toBe(false);
+    expect(shouldCacheHistoryThumbnail("completed", outputs, null)).toBe(false);
+
+    const populated = [entry("completed", new Date(2026, 6, 27, 12, 0, 0))];
+    expect(applyHistoryThumbnailCache(populated, new Set(["completed"]), "/cache/thumb.jpg")[0].cachedThumbnailPath)
+      .toBe("/cache/thumb.jpg");
+    const cleared: HistoryEntry[] = [];
+    expect(applyHistoryThumbnailCache(cleared, new Set(["completed"]), "/cache/thumb.jpg")).toBe(cleared);
+    expect(shouldDeleteUnusedHistoryThumbnail(cleared, "https://example.com/thumb.jpg", "/cache/thumb.jpg")).toBe(true);
+    const sharedThumbnail = [{ ...populated[0], thumbnail: "https://example.com/thumb.jpg" }];
+    expect(shouldDeleteUnusedHistoryThumbnail(sharedThumbnail, "https://example.com/thumb.jpg", "/cache/thumb.jpg")).toBe(false);
+  });
+
+  it("rejects malformed storage and invalid required fields without losing valid neighbours", () => {
+    expect(parseHistoryStorage("{broken")).toEqual([]);
+    expect(parseHistoryStorage(JSON.stringify({ entry: "not an array" }))).toEqual([]);
+
+    const valid = entry("valid", new Date(2026, 6, 27, 12, 0, 0));
+    const invalidDate = { ...valid, id: "bad-date", downloadedAt: "not-a-date" };
+    const missingSource = { ...valid, id: "missing-source", sourceUrl: undefined };
+    const parsed = parseHistoryStorage(JSON.stringify([invalidDate, valid, missingSource]));
+    expect(parsed.map((item) => item.id)).toEqual(["valid"]);
+  });
+
+  it("migrates partial settings and normalizes unknown enum values", () => {
+    const legacy = {
+      ...entry("legacy", new Date(2026, 6, 27, 12, 0, 0)),
+      size: "unknown",
+      available: "yes",
+      settings: {
+        outputDir: "",
+        mode: "document",
+        quality: "8k",
+        audioFormat: "flac",
+        subtitles: "yes",
+      },
+    };
+    const [parsed] = parseHistoryStorage(JSON.stringify([legacy]));
+    expect(parsed).toMatchObject({ size: 0, available: true });
+    expect(parsed.settings).toEqual({
+      outputDir: "/Downloads",
+      mode: "video",
+      quality: "best",
+      audioFormat: "mp3",
+      subtitles: false,
+      playlist: false,
+    });
   });
 });
 

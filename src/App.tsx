@@ -1,16 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { downloadDir } from "@tauri-apps/api/path";
 import { open } from "@tauri-apps/plugin-dialog";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import brandLogo from "./assets/logo-call-me-hands.png";
 import loadingHandOne from "./assets/logo-call-me-hand-frame-1.png";
 import loadingHandTwo from "./assets/logo-call-me-hand-frame-2.png";
 import loadingHandThree from "./assets/logo-call-me-hand-frame-3.png";
+import packageMetadata from "../package.json";
 import "./App.css";
+
+const APP_RELEASE_VERSION = packageMetadata.releaseVersion;
+const HISTORY_STORAGE_KEY = "downloadHistory.v1";
+const HISTORY_LIMIT = 500;
 
 type ComponentStatus = {
   installed: boolean;
@@ -42,6 +47,51 @@ export type DownloadEvent = {
   eta: string | null;
   message: string | null;
   storage: StorageEstimate | null;
+  outputs: DownloadOutput[] | null;
+};
+
+type DownloadOutput = {
+  path: string;
+  size: number;
+};
+
+export type HistoryEntry = {
+  id: string;
+  sourceUrl: string;
+  title: string;
+  thumbnail: string | null;
+  cachedThumbnailPath: string | null;
+  uploader: string | null;
+  extractor: string | null;
+  size: number;
+  downloadedAt: string;
+  path: string;
+  available: boolean;
+  settings: HistoryDownloadSettings;
+};
+
+export type HistoryDownloadSettings = {
+  outputDir: string;
+  mode: "video" | "audio";
+  quality: string;
+  audioFormat: string;
+  subtitles: boolean;
+  playlist: boolean;
+};
+
+export type HistoryFileStatus = {
+  path: string;
+  available: boolean;
+  size: number | null;
+};
+
+type HistoryContext = {
+  sourceUrl: string;
+  title: string;
+  thumbnail: string | null;
+  uploader: string | null;
+  extractor: string | null;
+  settings: HistoryDownloadSettings;
 };
 
 type StorageEstimate = {
@@ -269,6 +319,161 @@ function formatByteSize(value: number): string {
   return `${new Intl.NumberFormat("uk-UA", { maximumFractionDigits: unit === 0 ? 0 : 1 }).format(size)} ${units[unit]}`;
 }
 
+function historyDayKey(value: string): string {
+  const date = new Date(value);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+function historyDayLabel(key: string, now = new Date()): string {
+  const today = historyDayKey(now.toISOString());
+  const yesterday = new Date(now);
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (key === today) return "Сьогодні";
+  if (key === historyDayKey(yesterday.toISOString())) return "Вчора";
+  return new Intl.DateTimeFormat("uk-UA", { day: "numeric", month: "long", year: "numeric" })
+    .format(new Date(`${key}T12:00:00`));
+}
+
+export function groupHistoryEntries(entries: HistoryEntry[], now = new Date()) {
+  const groups = new Map<string, HistoryEntry[]>();
+  [...entries]
+    .sort((left, right) => Date.parse(right.downloadedAt) - Date.parse(left.downloadedAt))
+    .forEach((entry) => {
+      const key = historyDayKey(entry.downloadedAt);
+      groups.set(key, [...(groups.get(key) || []), entry]);
+    });
+  return Array.from(groups, ([key, items]) => ({ key, label: historyDayLabel(key, now), items }));
+}
+
+function fileTitle(path: string): string {
+  const filename = path.split(/[\\/]/).filter(Boolean).pop() || path;
+  return filename.replace(/\.[^.]+$/, "") || filename;
+}
+
+function parentDirectory(path: string): string {
+  const separator = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  return separator > 0 ? path.slice(0, separator) : "";
+}
+
+function fallbackHistorySettings(path: string): HistoryDownloadSettings {
+  const extension = path.split(".").pop()?.toLowerCase() || "";
+  const audio = ["mp3", "m4a", "opus", "wav"].includes(extension);
+  return {
+    outputDir: parentDirectory(path),
+    mode: audio ? "audio" : "video",
+    quality: "best",
+    audioFormat: audio ? extension : "mp3",
+    subtitles: false,
+    playlist: false,
+  };
+}
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function normalizeHistorySettings(value: unknown, path: string): HistoryDownloadSettings {
+  const fallback = fallbackHistorySettings(path);
+  const settings = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const quality = nonEmptyString(settings.quality);
+  const audioFormat = nonEmptyString(settings.audioFormat)?.toLowerCase() || null;
+  return {
+    outputDir: nonEmptyString(settings.outputDir) || fallback.outputDir,
+    mode: settings.mode === "video" || settings.mode === "audio" ? settings.mode : fallback.mode,
+    quality: quality && ["best", "2160", "1080", "720", "480"].includes(quality) ? quality : "best",
+    audioFormat: audioFormat && ["mp3", "m4a", "opus", "wav"].includes(audioFormat)
+      ? audioFormat
+      : fallback.audioFormat,
+    subtitles: typeof settings.subtitles === "boolean" ? settings.subtitles : false,
+    playlist: typeof settings.playlist === "boolean" ? settings.playlist : false,
+  };
+}
+
+function normalizeHistoryEntry(value: unknown): HistoryEntry | null {
+  if (!value || typeof value !== "object") return null;
+  const entry = value as Record<string, unknown>;
+  const id = nonEmptyString(entry.id);
+  const path = nonEmptyString(entry.path);
+  const title = nonEmptyString(entry.title);
+  const sourceUrl = nonEmptyString(entry.sourceUrl);
+  const downloadedAt = nonEmptyString(entry.downloadedAt);
+  if (!id || !path || !title || !sourceUrl || !downloadedAt || !Number.isFinite(Date.parse(downloadedAt))) {
+    return null;
+  }
+  const normalizedSourceUrl = normalizeInputUrl(sourceUrl);
+  if (!normalizedSourceUrl || !/^https?:/i.test(normalizedSourceUrl)) return null;
+  const size = typeof entry.size === "number" && Number.isFinite(entry.size) && entry.size >= 0
+    ? entry.size
+    : 0;
+  return {
+    id,
+    sourceUrl: normalizedSourceUrl,
+    title,
+    thumbnail: nonEmptyString(entry.thumbnail),
+    cachedThumbnailPath: nonEmptyString(entry.cachedThumbnailPath),
+    uploader: nonEmptyString(entry.uploader),
+    extractor: nonEmptyString(entry.extractor),
+    size,
+    downloadedAt,
+    path,
+    available: typeof entry.available === "boolean" ? entry.available : true,
+    settings: normalizeHistorySettings(entry.settings, path),
+  };
+}
+
+export function parseHistoryStorage(raw: string | null): HistoryEntry[] {
+  try {
+    const parsed: unknown = JSON.parse(raw || "[]");
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((entry) => {
+      const normalized = normalizeHistoryEntry(entry);
+      return normalized ? [normalized] : [];
+    }).slice(0, HISTORY_LIMIT);
+  } catch {
+    return [];
+  }
+}
+
+function loadHistory(): HistoryEntry[] {
+  return parseHistoryStorage(localStorage.getItem(HISTORY_STORAGE_KEY));
+}
+
+export function historyPaths(entries: HistoryEntry[]): string[] {
+  return Array.from(new Set(entries.map((entry) => entry.path)));
+}
+
+export function applyHistoryFileStatuses(entries: HistoryEntry[], statuses: HistoryFileStatus[]): HistoryEntry[] {
+  const byPath = new Map(statuses.map((status) => [status.path, status]));
+  let changed = false;
+  const next = entries.map((entry) => {
+    const status = byPath.get(entry.path);
+    if (!status) return entry;
+    const size = status.size ?? entry.size;
+    if (entry.available === status.available && entry.size === size) return entry;
+    changed = true;
+    return { ...entry, available: status.available, size };
+  });
+  return changed ? next : entries;
+}
+
+export function shouldCacheHistoryThumbnail(kind: DownloadEvent["kind"], outputs: DownloadOutput[] | null, thumbnail: string | null): boolean {
+  return kind === "completed" && Boolean(outputs?.length) && Boolean(thumbnail);
+}
+
+export function applyHistoryThumbnailCache(entries: HistoryEntry[], targetIds: Set<string>, cachedThumbnailPath: string): HistoryEntry[] {
+  let changed = false;
+  const next = entries.map((entry) => {
+    if (!targetIds.has(entry.id) || entry.cachedThumbnailPath === cachedThumbnailPath) return entry;
+    changed = true;
+    return { ...entry, cachedThumbnailPath };
+  });
+  return changed ? next : entries;
+}
+
+export function shouldDeleteUnusedHistoryThumbnail(entries: HistoryEntry[], sourceThumbnail: string, cachedThumbnailPath: string): boolean {
+  return !entries.some((entry) => entry.thumbnail === sourceThumbnail || entry.cachedThumbnailPath === cachedThumbnailPath);
+}
+
 function jobStageNumber(status: Job["status"]): string | null {
   if (status === "starting") return "0";
   if (status === "downloading") return "1";
@@ -304,6 +509,7 @@ function App() {
   const mainContentRef = useRef<HTMLElement>(null);
   const jobTitleTextRef = useRef<HTMLDivElement>(null);
   const pendingDownloadEvents = useRef(new Map<string, DownloadEvent[]>());
+  const historyContexts = useRef(new Map<string, HistoryContext>());
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [runtimeBusy, setRuntimeBusy] = useState(false);
   const [runtimeStage, setRuntimeStage] = useState<RuntimeStage>(null);
@@ -311,6 +517,11 @@ function App() {
   const [runtimeFailures, setRuntimeFailures] = useState(new Set<Exclude<RuntimeStage, null>>());
   const [runtimeInstallProgress, setRuntimeInstallProgress] = useState<RuntimeInstallProgress | null>(null);
   const [url, setUrl] = useState("");
+  const urlInputRef = useRef<HTMLInputElement>(null);
+  const [activeView, setActiveView] = useState<"download" | "history">("download");
+  const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>(loadHistory);
+  const historyEntriesRef = useRef(historyEntries);
+  const [historyRetryPending, setHistoryRetryPending] = useState<string | null>(null);
   const [outputDir, setOutputDir] = useState(localStorage.getItem("outputDir") || "");
   const [outputFreeSpace, setOutputFreeSpace] = useState<number | null>(null);
   const [mode, setMode] = useState<"video" | "audio">("video");
@@ -410,7 +621,43 @@ function App() {
       resizeObserver.disconnect();
       window.removeEventListener("resize", updateScrollMode);
     };
-  }, []);
+  }, [activeView]);
+
+  useEffect(() => {
+    historyEntriesRef.current = historyEntries;
+    try {
+      localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(historyEntries.slice(0, HISTORY_LIMIT)));
+    } catch {
+      // History is helpful but must never interrupt downloading when storage is unavailable.
+    }
+  }, [historyEntries]);
+
+  useEffect(() => {
+    if (activeView !== "history" || historyEntries.length === 0) return;
+    let disposed = false;
+    let checking = false;
+    const refreshAvailability = async () => {
+      if (checking) return;
+      checking = true;
+      try {
+        const paths = historyPaths(historyEntriesRef.current);
+        if (paths.length === 0) return;
+        const statuses = await invoke<HistoryFileStatus[]>("inspect_history_files", { paths });
+        if (disposed) return;
+        setHistoryEntries((current) => applyHistoryFileStatuses(current, statuses));
+      } catch {
+        // Keep the last known state if a removable volume is temporarily unavailable.
+      } finally {
+        checking = false;
+      }
+    };
+    refreshAvailability();
+    const timer = window.setInterval(refreshAvailability, 10_000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [activeView, historyEntries.length]);
 
   const refreshManagedComponents = useCallback(async () => {
     const now = Date.now();
@@ -641,7 +888,62 @@ function App() {
   }, [url, runtime?.ytDlp.installed, playlistIntent, vpnDecisionVersion]);
 
   useEffect(() => {
+    if (!historyRetryPending || active || pendingStart) return;
+    if (probeState === "invalid") {
+      setHistoryRetryPending(null);
+      setFormError("Збережене посилання більше не схоже на коректне");
+      return;
+    }
+    if (probeState !== "valid" && probeState !== "unverified") return;
+    setHistoryRetryPending(null);
+    void beginDownload();
+  }, [historyRetryPending, probeState, active, pendingStart]);
+
+  useEffect(() => {
     const unlisten = listen<DownloadEvent>("download-event", ({ payload }) => {
+      if (payload.kind === "completed" && payload.outputs?.length) {
+        const context = historyContexts.current.get(payload.id);
+        if (context) {
+          const downloadedAt = new Date().toISOString();
+          const multiple = payload.outputs.length > 1;
+          const additions = payload.outputs.map((output, index): HistoryEntry => ({
+            id: `${payload.id}:${index}`,
+            sourceUrl: context.sourceUrl,
+            title: multiple ? fileTitle(output.path) : context.title,
+            thumbnail: context.thumbnail,
+            cachedThumbnailPath: null,
+            uploader: context.uploader,
+            extractor: context.extractor,
+            size: output.size,
+            downloadedAt,
+            path: output.path,
+            available: true,
+            settings: context.settings,
+          }));
+          setHistoryEntries((current) => [
+            ...additions,
+            ...current.filter((entry) => !additions.some((addition) => addition.path === entry.path)),
+          ].slice(0, HISTORY_LIMIT));
+          if (shouldCacheHistoryThumbnail(payload.kind, payload.outputs, context.thumbnail)) {
+            const additionIds = new Set(additions.map((entry) => entry.id));
+            void invoke<string>("cache_history_thumbnail", { url: context.thumbnail })
+              .then((cachedThumbnailPath) => {
+                setHistoryEntries((current) => {
+                  const next = applyHistoryThumbnailCache(current, additionIds, cachedThumbnailPath);
+                  if (next === current && context.thumbnail
+                    && shouldDeleteUnusedHistoryThumbnail(current, context.thumbnail, cachedThumbnailPath)) {
+                    void invoke("delete_history_thumbnail", { path: cachedThumbnailPath }).catch(() => undefined);
+                  }
+                  return next;
+                });
+              })
+              .catch(() => undefined);
+          }
+        }
+      }
+      if (["completed", "failed", "cancelled"].includes(payload.kind)) {
+        historyContexts.current.delete(payload.id);
+      }
       if (payload.storage?.availableSpace !== null && payload.storage?.availableSpace !== undefined) {
         setOutputFreeSpace(payload.storage.availableSpace);
       }
@@ -679,6 +981,24 @@ function App() {
 
   async function launchDownload(downloadUrl: string, parsedHost: string, preflightResult: PreflightResult, cookiesBrowser?: string, playlist = playlistIntent === "playlist") {
     const id = crypto.randomUUID();
+    const normalizedDownloadUrl = normalizeInputUrl(downloadUrl) || downloadUrl;
+    const thumbnail = preview?.thumbnail || quickThumbnail;
+    const context: HistoryContext = {
+      sourceUrl: normalizedDownloadUrl,
+      title: preview?.title || parsedHost,
+      thumbnail,
+      uploader: preview?.uploader || null,
+      extractor: preview?.extractor || parsedHost,
+      settings: {
+        outputDir,
+        mode,
+        quality,
+        audioFormat,
+        subtitles,
+        playlist,
+      },
+    };
+    historyContexts.current.set(id, context);
     const initialJob: Job = {
       id,
       url: downloadUrl,
@@ -717,6 +1037,7 @@ function App() {
       });
       setUrl("");
     } catch (error) {
+      historyContexts.current.delete(id);
       const message = String(error);
       setJob((current) => current?.id === id ? { ...current, status: "failed", message } : current);
     }
@@ -790,6 +1111,49 @@ function App() {
     await runPreflight(url, parsedHost);
   }
 
+  function clearUrl() {
+    probeSequence.current += 1;
+    setUrl("");
+    setPreview(null);
+    setProbeState("idle");
+    setProbeError("");
+    setFormError("");
+    window.requestAnimationFrame(() => urlInputRef.current?.focus());
+  }
+
+  async function retryHistoryDownload(entry: HistoryEntry) {
+    if (active || historyRetryPending) return;
+    setHistoryRetryPending(entry.id);
+    setFormError("");
+    let destination = entry.settings.outputDir || parentDirectory(entry.path);
+    try {
+      if (!destination) throw new Error("missing destination");
+      await invoke<number>("folder_free_space", { path: destination });
+    } catch {
+      try {
+        destination = await downloadDir();
+      } catch {
+        setHistoryRetryPending(null);
+        setActiveView("download");
+        setFormError("Не вдалося відкрити попередню папку або системну папку Завантаження");
+        return;
+      }
+    }
+    setOutputDir(destination);
+    localStorage.setItem("outputDir", destination);
+    setMode(entry.settings.mode);
+    setQuality(entry.settings.quality);
+    setAudioFormat(entry.settings.audioFormat);
+    setSubtitles(entry.settings.subtitles);
+    setPlaylistIntent(entry.settings.playlist ? "playlist" : "single");
+    cancelledDownloadRestore.current = { url: entry.sourceUrl, playlist: entry.settings.playlist };
+    setPreview(null);
+    setProbeState("idle");
+    setUrl(entry.sourceUrl);
+    setVpnDecisionVersion((current) => current + 1);
+    setActiveView("download");
+  }
+
   function dismissVpnWarning() {
     setVpnWarning(null);
     setProbeState("invalid");
@@ -820,6 +1184,7 @@ function App() {
     setCancelError("");
     try {
       await invoke("cancel_download", { id: jobId });
+      historyContexts.current.delete(jobId);
       cancelledDownloadRestore.current = { url: cancelledUrl, playlist: cancelledPlaylist };
       setUrl(cancelledUrl);
       setCancelConfirmOpen(false);
@@ -860,9 +1225,8 @@ function App() {
           <div><small>yt-dlp BD</small><strong>Baldojnyi Downloader</strong></div>
         </div>
         <nav>
-          <button className="nav-item active"><span className="nav-index">01</span>Завантажити<Icon name="chevron" /></button>
-          <button className="nav-item"><span className="nav-index">02</span>Історія<span className="soon">згодом</span></button>
-          <button className="nav-item"><span className="nav-index">03</span>Налаштування<span className="soon">згодом</span></button>
+          <button className={`nav-item ${activeView === "download" ? "active" : ""}`} onClick={() => setActiveView("download")}><span className="nav-index">01</span>Завантажити{activeView === "download" && <Icon name="chevron" />}</button>
+          <button className={`nav-item ${activeView === "history" ? "active" : ""}`} onClick={() => setActiveView("history")}><span className="nav-index">02</span>Історія{activeView === "history" && <Icon name="chevron" />}</button>
         </nav>
         <div className="runtime-panel">
           <div className="runtime-heading"><span>Компоненти</span><small>{runtimeBusy ? "перевірка" : runtimeReady ? "готові" : "очікуємо"}</small></div>
@@ -875,22 +1239,25 @@ function App() {
           <span>Щось не працює?</span>
           <button onClick={contactSupport}>baldojnisyly@gmail.com <span aria-hidden="true">↗</span></button>
         </div>
-        <div className="sidebar-footer"><span className="status-dot"/>Версія 0.1.0 · Apple Silicon</div>
+        <div className="sidebar-footer"><span className="status-dot"/>Версія {APP_RELEASE_VERSION} · {isWindows ? "Windows x64" : "Apple Silicon"}</div>
       </aside>
 
-      <main ref={mainContentRef} className={`main-content ${mainScrollable ? "is-scrollable" : "is-fixed"}`}>
+      <main ref={mainContentRef} className={`main-content ${mainScrollable || activeView === "history" ? "is-scrollable" : "is-fixed"}`}>
         <header className="topbar">
-          <div><p className="eyebrow">ІНСТРУМЕНТ / 01</p><h1>Завантажити</h1><p>Одне посилання. Відео, аудіо, субтитри.</p></div>
+          {activeView === "download"
+            ? <div><p className="eyebrow">ІНСТРУМЕНТ / 01</p><h1>Завантажити</h1><p>Одне посилання. Відео, аудіо, субтитри.</p></div>
+            : <div><p className="eyebrow">АРХІВ / 02</p><h1>Історія</h1><p>Завантажені файли й місця, де вони збережені.</p></div>}
           {update && <button className="update-pill" disabled={updateBusy} onClick={installAppUpdate}><Icon name="refresh" size={16}/>{updateBusy ? `Оновлення ${updateProgress}%` : `Доступна v${update.version}`}</button>}
         </header>
 
-        <section className="download-card" aria-busy={runtimeBusy}>
+        {activeView === "download" && <section className="download-card" aria-busy={runtimeBusy}>
           {runtimeBusy && <RuntimePreparationOverlay stage={runtimeStage} runtime={runtime} progress={runtimeInstallProgress} />}
           <div className="download-card-content" inert={runtimeBusy ? true : undefined}>
           <label className="field-label" htmlFor="media-url">Посилання</label>
           <div className={`url-field ${probeState}`}>
             <Icon name="link" />
-            <input id="media-url" value={url} onChange={(event) => setUrl(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !active) beginDownload(); }} placeholder="https://youtube.com/watch?v=…" autoFocus />
+            <input ref={urlInputRef} id="media-url" value={url} onChange={(event) => setUrl(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !active) beginDownload(); }} placeholder="https://youtube.com/watch?v=…" autoFocus />
+            {url && <button type="button" className="url-clear" aria-label="Очистити посилання" title="Очистити посилання" onClick={clearUrl}><Icon name="x" size={17}/></button>}
             {probeState === "checking" && <span className="url-checking" aria-label="Перевіряємо посилання"><i/></span>}
             {probeState === "valid" && <span className="valid-check" aria-label="Відео доступне"><Icon name="check" size={15}/></span>}
             {probeState === "unverified" && <span className="unverified-check" aria-label="Не вдалося підтвердити посилання">!</span>}
@@ -945,7 +1312,20 @@ function App() {
           <button className="primary-button" disabled={(probeState !== "valid" && probeState !== "unverified") || !!active || pendingStart || runtimeBusy || !runtimeReady} onClick={() => beginDownload()}><Icon name="download" />{runtimeBusy ? "Встановлюємо компоненти…" : probeState === "checking" ? "Перевіряємо посилання…" : pendingStart ? "Починаємо…" : active ? "Завантаження триває" : "Завантажити"}</button>
           <p className="legal-note">Завантажуйте лише матеріали, на які маєте відповідні права.</p>
           </div>
-        </section>
+        </section>}
+
+        {activeView === "history" && <HistoryView
+          entries={historyEntries}
+          retryingId={historyRetryPending}
+          retryDisabled={Boolean(active)}
+          onRetry={retryHistoryDownload}
+          onClear={() => {
+            if (!window.confirm("Очистити історію? Завантажені файли залишаться на диску.")) return;
+            historyEntriesRef.current = [];
+            setHistoryEntries([]);
+            void invoke("clear_history_thumbnail_cache").catch(() => undefined);
+          }}
+        />}
 
       </main>
 
@@ -1010,6 +1390,88 @@ function App() {
       </div>}
     </div>
   );
+}
+
+function HistoryThumbnail({ entry }: { entry: HistoryEntry }) {
+  const cachedSource = entry.cachedThumbnailPath ? convertFileSrc(entry.cachedThumbnailPath) : null;
+  const [source, setSource] = useState(cachedSource || entry.thumbnail);
+
+  useEffect(() => {
+    setSource(cachedSource || entry.thumbnail);
+  }, [cachedSource, entry.thumbnail]);
+
+  return <div className="history-thumb">
+    <span><Icon name="download" size={24}/></span>
+    {source && <img src={source} alt="" onError={() => {
+      if (source === cachedSource && entry.thumbnail) setSource(entry.thumbnail);
+      else setSource(null);
+    }} />}
+  </div>;
+}
+
+function HistoryView({ entries, retryingId, retryDisabled, onRetry, onClear }: {
+  entries: HistoryEntry[];
+  retryingId: string | null;
+  retryDisabled: boolean;
+  onRetry: (entry: HistoryEntry) => void;
+  onClear: () => void;
+}) {
+  const groups = groupHistoryEntries(entries);
+  const [openGroups, setOpenGroups] = useState<Set<string>>(() => new Set(groups[0] ? [groups[0].key] : []));
+
+  useEffect(() => {
+    const firstKey = groups[0]?.key;
+    if (!firstKey) return;
+    setOpenGroups((current) => current.size ? current : new Set([firstKey]));
+  }, [groups[0]?.key]);
+
+  if (!entries.length) {
+    return <section className="history-panel empty-history">
+      <div className="empty-history-mark"><Icon name="clock" size={34}/></div>
+      <p className="eyebrow">ПОКИ ПОРОЖНЬО</p>
+      <h2>Завантаження з’являться тут</h2>
+      <p>Після успішного завершення ми збережемо прев’ю, точний розмір, час і шлях до файла. Самі файли нікуди не копіюються.</p>
+    </section>;
+  }
+
+  return <section className="history-panel">
+    <div className="history-toolbar">
+      <div><strong>{entries.length}</strong><span>{entries.length === 1 ? "файл в історії" : "файлів в історії"}</span></div>
+      <button type="button" onClick={onClear}>Очистити історію</button>
+    </div>
+    <div className="history-groups">
+      {groups.map((group) => <details
+        key={group.key}
+        open={openGroups.has(group.key)}
+        onToggle={(event) => {
+          const isOpen = event.currentTarget.open;
+          setOpenGroups((current) => {
+            if (current.has(group.key) === isOpen) return current;
+            const next = new Set(current);
+            if (isOpen) next.add(group.key); else next.delete(group.key);
+            return next;
+          });
+        }}
+      >
+        <summary><span>{group.label}</span><small>{group.items.length}</small><Icon name="chevron" size={17}/></summary>
+        <div className="history-list">
+          {group.items.map((entry) => <article className={`history-item ${entry.available ? "available" : "missing"}`} key={entry.id}>
+            <HistoryThumbnail entry={entry}/>
+            <div className="history-copy">
+              <div className="history-title-row"><strong>{entry.title}</strong><time dateTime={entry.downloadedAt}>{new Intl.DateTimeFormat("uk-UA", { hour: "2-digit", minute: "2-digit" }).format(new Date(entry.downloadedAt))}</time></div>
+              <p>{[entry.uploader, entry.extractor, formatByteSize(entry.size)].filter(Boolean).join(" · ")}</p>
+              <div className="history-location" title={entry.path}><span className={`history-state-dot ${entry.available ? "ready" : "missing"}`}/><span>{entry.available ? "Файл на місці" : "Файл недоступний"}</span><Icon name="folder" size={14}/><code>{entry.path}</code></div>
+            </div>
+            <div className="history-actions">
+              <button type="button" className="history-retry-button" disabled={retryDisabled || retryingId !== null} onClick={() => onRetry(entry)}>{retryingId === entry.id ? "Готуємо…" : "Завантажити ще раз"}</button>
+              <button type="button" disabled={!entry.available} onClick={() => revealItemInDir(entry.path)}>Показати</button>
+              <button type="button" onClick={() => openUrl(entry.sourceUrl)}>Джерело</button>
+            </div>
+          </article>)}
+        </div>
+      </details>)}
+    </div>
+  </section>;
 }
 
 function RuntimeRow({ label, component, loading = false, retry }: { label: string; component?: ComponentStatus; loading?: boolean; retry?: () => void }) {
