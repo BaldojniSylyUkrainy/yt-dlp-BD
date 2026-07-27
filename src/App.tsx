@@ -79,7 +79,7 @@ export type HistoryDownloadSettings = {
   playlist: boolean;
 };
 
-type HistoryFileStatus = {
+export type HistoryFileStatus = {
   path: string;
   available: boolean;
   size: number | null;
@@ -89,8 +89,6 @@ type HistoryContext = {
   sourceUrl: string;
   title: string;
   thumbnail: string | null;
-  cachedThumbnailPath: string | null;
-  thumbnailCache: Promise<string | null> | null;
   uploader: string | null;
   extractor: string | null;
   settings: HistoryDownloadSettings;
@@ -370,26 +368,110 @@ function fallbackHistorySettings(path: string): HistoryDownloadSettings {
   };
 }
 
-function loadHistory(): HistoryEntry[] {
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function normalizeHistorySettings(value: unknown, path: string): HistoryDownloadSettings {
+  const fallback = fallbackHistorySettings(path);
+  const settings = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const quality = nonEmptyString(settings.quality);
+  const audioFormat = nonEmptyString(settings.audioFormat)?.toLowerCase() || null;
+  return {
+    outputDir: nonEmptyString(settings.outputDir) || fallback.outputDir,
+    mode: settings.mode === "video" || settings.mode === "audio" ? settings.mode : fallback.mode,
+    quality: quality && ["best", "2160", "1080", "720", "480"].includes(quality) ? quality : "best",
+    audioFormat: audioFormat && ["mp3", "m4a", "opus", "wav"].includes(audioFormat)
+      ? audioFormat
+      : fallback.audioFormat,
+    subtitles: typeof settings.subtitles === "boolean" ? settings.subtitles : false,
+    playlist: typeof settings.playlist === "boolean" ? settings.playlist : false,
+  };
+}
+
+function normalizeHistoryEntry(value: unknown): HistoryEntry | null {
+  if (!value || typeof value !== "object") return null;
+  const entry = value as Record<string, unknown>;
+  const id = nonEmptyString(entry.id);
+  const path = nonEmptyString(entry.path);
+  const title = nonEmptyString(entry.title);
+  const sourceUrl = nonEmptyString(entry.sourceUrl);
+  const downloadedAt = nonEmptyString(entry.downloadedAt);
+  if (!id || !path || !title || !sourceUrl || !downloadedAt || !Number.isFinite(Date.parse(downloadedAt))) {
+    return null;
+  }
+  const normalizedSourceUrl = normalizeInputUrl(sourceUrl);
+  if (!normalizedSourceUrl || !/^https?:/i.test(normalizedSourceUrl)) return null;
+  const size = typeof entry.size === "number" && Number.isFinite(entry.size) && entry.size >= 0
+    ? entry.size
+    : 0;
+  return {
+    id,
+    sourceUrl: normalizedSourceUrl,
+    title,
+    thumbnail: nonEmptyString(entry.thumbnail),
+    cachedThumbnailPath: nonEmptyString(entry.cachedThumbnailPath),
+    uploader: nonEmptyString(entry.uploader),
+    extractor: nonEmptyString(entry.extractor),
+    size,
+    downloadedAt,
+    path,
+    available: typeof entry.available === "boolean" ? entry.available : true,
+    settings: normalizeHistorySettings(entry.settings, path),
+  };
+}
+
+export function parseHistoryStorage(raw: string | null): HistoryEntry[] {
   try {
-    const parsed = JSON.parse(localStorage.getItem(HISTORY_STORAGE_KEY) || "[]");
+    const parsed: unknown = JSON.parse(raw || "[]");
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter((entry) => Boolean(
-      entry && typeof entry.id === "string" && typeof entry.path === "string"
-      && typeof entry.title === "string" && typeof entry.downloadedAt === "string",
-    )).map((entry): HistoryEntry => ({
-      ...entry,
-      thumbnail: typeof entry.thumbnail === "string" ? entry.thumbnail : null,
-      cachedThumbnailPath: typeof entry.cachedThumbnailPath === "string" ? entry.cachedThumbnailPath : null,
-      uploader: typeof entry.uploader === "string" ? entry.uploader : null,
-      extractor: typeof entry.extractor === "string" ? entry.extractor : null,
-      size: Number.isFinite(entry.size) ? entry.size : 0,
-      available: entry.available !== false,
-      settings: entry.settings || fallbackHistorySettings(entry.path),
-    })).slice(0, HISTORY_LIMIT);
+    return parsed.flatMap((entry) => {
+      const normalized = normalizeHistoryEntry(entry);
+      return normalized ? [normalized] : [];
+    }).slice(0, HISTORY_LIMIT);
   } catch {
     return [];
   }
+}
+
+function loadHistory(): HistoryEntry[] {
+  return parseHistoryStorage(localStorage.getItem(HISTORY_STORAGE_KEY));
+}
+
+export function historyPaths(entries: HistoryEntry[]): string[] {
+  return Array.from(new Set(entries.map((entry) => entry.path)));
+}
+
+export function applyHistoryFileStatuses(entries: HistoryEntry[], statuses: HistoryFileStatus[]): HistoryEntry[] {
+  const byPath = new Map(statuses.map((status) => [status.path, status]));
+  let changed = false;
+  const next = entries.map((entry) => {
+    const status = byPath.get(entry.path);
+    if (!status) return entry;
+    const size = status.size ?? entry.size;
+    if (entry.available === status.available && entry.size === size) return entry;
+    changed = true;
+    return { ...entry, available: status.available, size };
+  });
+  return changed ? next : entries;
+}
+
+export function shouldCacheHistoryThumbnail(kind: DownloadEvent["kind"], outputs: DownloadOutput[] | null, thumbnail: string | null): boolean {
+  return kind === "completed" && Boolean(outputs?.length) && Boolean(thumbnail);
+}
+
+export function applyHistoryThumbnailCache(entries: HistoryEntry[], targetIds: Set<string>, cachedThumbnailPath: string): HistoryEntry[] {
+  let changed = false;
+  const next = entries.map((entry) => {
+    if (!targetIds.has(entry.id) || entry.cachedThumbnailPath === cachedThumbnailPath) return entry;
+    changed = true;
+    return { ...entry, cachedThumbnailPath };
+  });
+  return changed ? next : entries;
+}
+
+export function shouldDeleteUnusedHistoryThumbnail(entries: HistoryEntry[], sourceThumbnail: string, cachedThumbnailPath: string): boolean {
+  return !entries.some((entry) => entry.thumbnail === sourceThumbnail || entry.cachedThumbnailPath === cachedThumbnailPath);
 }
 
 function jobStageNumber(status: Job["status"]): string | null {
@@ -438,6 +520,7 @@ function App() {
   const urlInputRef = useRef<HTMLInputElement>(null);
   const [activeView, setActiveView] = useState<"download" | "history">("download");
   const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>(loadHistory);
+  const historyEntriesRef = useRef(historyEntries);
   const [historyRetryPending, setHistoryRetryPending] = useState<string | null>(null);
   const [outputDir, setOutputDir] = useState(localStorage.getItem("outputDir") || "");
   const [outputFreeSpace, setOutputFreeSpace] = useState<number | null>(null);
@@ -541,6 +624,7 @@ function App() {
   }, [activeView]);
 
   useEffect(() => {
+    historyEntriesRef.current = historyEntries;
     try {
       localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(historyEntries.slice(0, HISTORY_LIMIT)));
     } catch {
@@ -556,14 +640,11 @@ function App() {
       if (checking) return;
       checking = true;
       try {
-        const paths = Array.from(new Set(historyEntries.map((entry) => entry.path)));
+        const paths = historyPaths(historyEntriesRef.current);
+        if (paths.length === 0) return;
         const statuses = await invoke<HistoryFileStatus[]>("inspect_history_files", { paths });
         if (disposed) return;
-        const byPath = new Map(statuses.map((status) => [status.path, status]));
-        setHistoryEntries((current) => current.map((entry) => {
-          const status = byPath.get(entry.path);
-          return status ? { ...entry, available: status.available, size: status.size ?? entry.size } : entry;
-        }));
+        setHistoryEntries((current) => applyHistoryFileStatuses(current, statuses));
       } catch {
         // Keep the last known state if a removable volume is temporarily unavailable.
       } finally {
@@ -830,7 +911,7 @@ function App() {
             sourceUrl: context.sourceUrl,
             title: multiple ? fileTitle(output.path) : context.title,
             thumbnail: context.thumbnail,
-            cachedThumbnailPath: context.cachedThumbnailPath,
+            cachedThumbnailPath: null,
             uploader: context.uploader,
             extractor: context.extractor,
             size: output.size,
@@ -843,14 +924,20 @@ function App() {
             ...additions,
             ...current.filter((entry) => !additions.some((addition) => addition.path === entry.path)),
           ].slice(0, HISTORY_LIMIT));
-          if (context.thumbnailCache) {
+          if (shouldCacheHistoryThumbnail(payload.kind, payload.outputs, context.thumbnail)) {
             const additionIds = new Set(additions.map((entry) => entry.id));
-            context.thumbnailCache.then((cachedThumbnailPath) => {
-              if (!cachedThumbnailPath) return;
-              setHistoryEntries((current) => current.map((entry) => additionIds.has(entry.id)
-                ? { ...entry, cachedThumbnailPath }
-                : entry));
-            });
+            void invoke<string>("cache_history_thumbnail", { url: context.thumbnail })
+              .then((cachedThumbnailPath) => {
+                setHistoryEntries((current) => {
+                  const next = applyHistoryThumbnailCache(current, additionIds, cachedThumbnailPath);
+                  if (next === current && context.thumbnail
+                    && shouldDeleteUnusedHistoryThumbnail(current, context.thumbnail, cachedThumbnailPath)) {
+                    void invoke("delete_history_thumbnail", { path: cachedThumbnailPath }).catch(() => undefined);
+                  }
+                  return next;
+                });
+              })
+              .catch(() => undefined);
           }
         }
       }
@@ -900,8 +987,6 @@ function App() {
       sourceUrl: normalizedDownloadUrl,
       title: preview?.title || parsedHost,
       thumbnail,
-      cachedThumbnailPath: null,
-      thumbnailCache: null,
       uploader: preview?.uploader || null,
       extractor: preview?.extractor || parsedHost,
       settings: {
@@ -913,14 +998,6 @@ function App() {
         playlist,
       },
     };
-    if (thumbnail) {
-      context.thumbnailCache = invoke<string>("cache_history_thumbnail", { url: thumbnail })
-        .then((cachedThumbnailPath) => {
-          context.cachedThumbnailPath = cachedThumbnailPath;
-          return cachedThumbnailPath;
-        })
-        .catch(() => null);
-    }
     historyContexts.current.set(id, context);
     const initialJob: Job = {
       id,
@@ -1244,6 +1321,7 @@ function App() {
           onRetry={retryHistoryDownload}
           onClear={() => {
             if (!window.confirm("Очистити історію? Завантажені файли залишаться на диску.")) return;
+            historyEntriesRef.current = [];
             setHistoryEntries([]);
             void invoke("clear_history_thumbnail_cache").catch(() => undefined);
           }}

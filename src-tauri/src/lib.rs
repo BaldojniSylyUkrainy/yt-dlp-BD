@@ -195,6 +195,11 @@ struct ProbeManager {
     active: Arc<Mutex<Option<(String, tokio::task::AbortHandle)>>>,
 }
 
+#[derive(Default)]
+struct HistoryThumbnailCache {
+    operation: tokio::sync::Mutex<()>,
+}
+
 fn runtime_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let directory = app
         .path()
@@ -2273,7 +2278,12 @@ fn prune_history_thumbnail_cache(directory: &Path) {
 }
 
 #[tauri::command]
-async fn cache_history_thumbnail(app: AppHandle, url: String) -> Result<String, String> {
+async fn cache_history_thumbnail(
+    app: AppHandle,
+    cache: State<'_, HistoryThumbnailCache>,
+    url: String,
+) -> Result<String, String> {
+    let _operation = cache.operation.lock().await;
     let parsed = Url::parse(&url).map_err(|_| "Некоректне посилання на прев’ю".to_string())?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
         return Err("Прев’ю має використовувати HTTP або HTTPS".into());
@@ -2337,7 +2347,11 @@ async fn cache_history_thumbnail(app: AppHandle, url: String) -> Result<String, 
 }
 
 #[tauri::command]
-fn clear_history_thumbnail_cache(app: AppHandle) -> Result<(), String> {
+async fn clear_history_thumbnail_cache(
+    app: AppHandle,
+    cache: State<'_, HistoryThumbnailCache>,
+) -> Result<(), String> {
+    let _operation = cache.operation.lock().await;
     let directory = app
         .path()
         .app_local_data_dir()
@@ -2349,6 +2363,25 @@ fn clear_history_thumbnail_cache(app: AppHandle) -> Result<(), String> {
     }
     fs::create_dir_all(directory)
         .map_err(|error| format!("Не вдалося відновити кеш прев’ю: {error}"))
+}
+
+#[tauri::command]
+async fn delete_history_thumbnail(
+    app: AppHandle,
+    cache: State<'_, HistoryThumbnailCache>,
+    path: String,
+) -> Result<(), String> {
+    let _operation = cache.operation.lock().await;
+    let directory = history_thumbnail_dir(&app)?;
+    let candidate = PathBuf::from(path);
+    if candidate.parent() != Some(directory.as_path()) {
+        return Err("Можна видаляти лише файли кешу прев’ю".into());
+    }
+    if candidate.exists() {
+        fs::remove_file(candidate)
+            .map_err(|error| format!("Не вдалося видалити прев’ю з кешу: {error}"))?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -2760,6 +2793,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(DownloadManager::default())
         .manage(ProbeManager::default())
+        .manage(HistoryThumbnailCache::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
@@ -2778,7 +2812,8 @@ pub fn run() {
             cancel_download,
             inspect_history_files,
             cache_history_thumbnail,
-            clear_history_thumbnail_cache
+            clear_history_thumbnail_cache,
+            delete_history_thumbnail
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
