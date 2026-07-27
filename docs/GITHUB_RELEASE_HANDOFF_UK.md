@@ -92,9 +92,6 @@ environment approval. Зовнішні pull requests із forks їх не отр
 repository й environment рівнях, бо environment value перекриє repository
 value.
 
-Apple-значення описані покроково в
-[`APPLE_NOTARIZATION_SECRETS_UK.md`](APPLE_NOTARIZATION_SECRETS_UK.md).
-
 Не створюйте новий Tauri updater key: він має відповідати `pubkey`, уже вбудованому
 в `src-tauri/tauri.conf.json`. Втрата або заміна цього приватного ключа зламає
 оновлення для вже встановлених копій.
