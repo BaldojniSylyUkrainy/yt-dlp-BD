@@ -309,8 +309,8 @@ fn find_deno(app: &AppHandle) -> Result<ComponentStatus, String> {
 }
 
 fn runtime_status_blocking(app: &AppHandle) -> Result<RuntimeStatus, String> {
-    let directory = runtime_dir(&app)?;
-    let path = yt_dlp_path(&app)?;
+    let directory = runtime_dir(app)?;
+    let path = yt_dlp_path(app)?;
     let installed = path.is_file();
     let version = installed.then(|| {
         fs::read_to_string(directory.join(".yt-dlp.version"))
@@ -327,8 +327,8 @@ fn runtime_status_blocking(app: &AppHandle) -> Result<RuntimeStatus, String> {
             path: installed.then(|| path.to_string_lossy().to_string()),
             managed: true,
         },
-        ffmpeg: find_ffmpeg(&app)?,
-        deno: find_deno(&app)?,
+        ffmpeg: find_ffmpeg(app)?,
+        deno: find_deno(app)?,
         runtime_dir: directory.to_string_lossy().to_string(),
         platform: std::env::consts::OS.into(),
     })
@@ -366,9 +366,18 @@ async fn fetch_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, Str
 }
 
 fn release_version_from_download_url(url: &Url) -> Option<String> {
+    if url.scheme() != "https" || url.host_str() != Some("github.com") {
+        return None;
+    }
     let segments = url.path_segments()?.collect::<Vec<_>>();
-    let download = segments.iter().position(|segment| *segment == "download")?;
-    let version = *segments.get(download + 1)?;
+    let releases = segments
+        .windows(2)
+        .position(|pair| pair == ["releases", "download"])?;
+    let version = *segments.get(releases + 2)?;
+    let file = *segments.get(releases + 3)?;
+    if file.is_empty() {
+        return None;
+    }
     (!version.is_empty() && version != "latest").then(|| version.to_string())
 }
 
@@ -2965,11 +2974,23 @@ mod tests {
         let unresolved =
             Url::parse("https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS")
                 .unwrap();
+        let malformed =
+            Url::parse("https://github.com/yt-dlp/yt-dlp/download/2026.07.04/SHA2-256SUMS")
+                .unwrap();
+        let missing_file =
+            Url::parse("https://github.com/yt-dlp/yt-dlp/releases/download/2026.07.04/").unwrap();
+        let non_github = Url::parse(
+            "https://example.com/yt-dlp/yt-dlp/releases/download/2026.07.04/SHA2-256SUMS",
+        )
+        .unwrap();
         assert_eq!(
             release_version_from_download_url(&release).as_deref(),
             Some("2026.07.04")
         );
         assert_eq!(release_version_from_download_url(&unresolved), None);
+        assert_eq!(release_version_from_download_url(&malformed), None);
+        assert_eq!(release_version_from_download_url(&missing_file), None);
+        assert_eq!(release_version_from_download_url(&non_github), None);
     }
 
     #[test]
