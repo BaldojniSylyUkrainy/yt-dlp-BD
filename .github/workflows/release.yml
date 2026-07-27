@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Four-part release tag, for example v0.3.2.0"
+        description: "Four-part release tag, for example v0.3.3.0"
         required: true
         type: string
 
@@ -74,7 +74,7 @@ jobs:
             throw "Tauri updater signature is missing or empty"
           }
           New-Item -ItemType Directory -Force -Path release-assets | Out-Null
-          $target = "yt-dlp-BD_${releaseVersion}_windows-x86_64-setup.exe"
+          $target = "BaldojnyiDownloader-$releaseVersion-Windows-x64-Setup.exe"
           Copy-Item -LiteralPath $installers[0].FullName -Destination "release-assets/$target"
           Copy-Item -LiteralPath $signature -Destination "release-assets/$target.sig"
 
@@ -178,9 +178,9 @@ jobs:
         run: |
           RELEASE_VERSION="$(node -p "require('./package.json').releaseVersion")"
           for FILE in \
-            "release/yt-dlp-BD_${RELEASE_VERSION}_aarch64.dmg" \
-            "release/yt-dlp-BD_${RELEASE_VERSION}_aarch64.app.tar.gz" \
-            "release/yt-dlp-BD_${RELEASE_VERSION}_aarch64.app.tar.gz.sig"; do
+            "release/BaldojnyiDownloader-${RELEASE_VERSION}-Mac-Apple-Silicon.dmg" \
+            "release/BaldojnyiDownloader-${RELEASE_VERSION}-Mac-Apple-Silicon-AutoUpdate.app.tar.gz" \
+            "release/BaldojnyiDownloader-${RELEASE_VERSION}-Mac-Apple-Silicon-AutoUpdate.app.tar.gz.sig"; do
             [[ -s "$FILE" ]] || {
               echo "Missing or empty artifact: $FILE"
               exit 1

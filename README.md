@@ -24,7 +24,7 @@
 
 Підтримуються Mac із процесорами M1, M2, M3, M4 та новішими, macOS 12.3 або новіша.
 
-1. Завантажте файл із назвою `yt-dlp-BD_…_aarch64.dmg`.
+1. Завантажте файл із назвою `BaldojnyiDownloader-…-Mac-Apple-Silicon.dmg`.
 2. Відкрийте `.dmg` і перенесіть **yt-dlp BD** у папку **Applications**.
 3. Запустіть застосунок із папки **Applications**.
 
@@ -32,7 +32,7 @@
 
 ### Windows — x64
 
-1. Завантажте файл із назвою `yt-dlp-BD_…_windows-x86_64-setup.exe`.
+1. Завантажте файл із назвою `BaldojnyiDownloader-…-Windows-x64-Setup.exe`.
 2. Запустіть інсталятор і завершіть встановлення.
 3. Відкрийте **yt-dlp BD** через меню Start.
 

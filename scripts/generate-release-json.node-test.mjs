@@ -10,6 +10,14 @@ const releaseVersion = "0.2.0.0";
 const updaterVersion = "0.2.0";
 const expected = expectedAssetNames(releaseVersion);
 
+test("uses stable human-readable names for every public release asset", () => {
+  assert.deepEqual(expected, {
+    macUpdater: "BaldojnyiDownloader-0.2.0.0-Mac-Apple-Silicon-AutoUpdate.app.tar.gz",
+    macDmg: "BaldojnyiDownloader-0.2.0.0-Mac-Apple-Silicon.dmg",
+    windowsInstaller: "BaldojnyiDownloader-0.2.0.0-Windows-x64-Setup.exe",
+  });
+});
+
 test("builds a combined macOS and Windows updater manifest", () => {
   const manifest = buildReleaseManifest({
     assetNames: [
@@ -40,7 +48,11 @@ test("builds a combined macOS and Windows updater manifest", () => {
   );
   assert.match(
     manifest.platforms["windows-x86_64"].url,
-    /releases\/download\/v0\.2\.0\.0\/yt-dlp-BD_0\.2\.0\.0_windows-x86_64-setup\.exe$/,
+    /releases\/download\/v0\.2\.0\.0\/BaldojnyiDownloader-0\.2\.0\.0-Windows-x64-Setup\.exe$/,
+  );
+  assert.match(
+    manifest.platforms["darwin-aarch64"].url,
+    /releases\/download\/v0\.2\.0\.0\/BaldojnyiDownloader-0\.2\.0\.0-Mac-Apple-Silicon-AutoUpdate\.app\.tar\.gz$/,
   );
 });
 

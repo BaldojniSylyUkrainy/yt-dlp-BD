@@ -15,6 +15,12 @@ Workflow запускається тільки через `workflow_dispatch`. �
 
 ## Запустити реліз
 
+Номер наступного релізу визначайте за
+[правилом версіювання](VERSIONING_UK.md): реліз лише з виправленнями збільшує
+PATCH (`0.3.2` → `0.3.3`), а реліз із будь-якою новою функцією — MINOR зі
+скиданням PATCH (`0.3.2` → `0.4.0`). Якщо нова функція та виправлення виходять
+разом, застосовується MINOR.
+
 Перед запуском:
 
 1. Переконайтесь, що потрібний commit уже в `main`, review завершено, а версії
@@ -25,7 +31,7 @@ Workflow запускається тільки через `workflow_dispatch`. �
 3. Відкрийте **Actions → Manual signed release → Run workflow**.
 4. Branch: `main`.
 5. `tag`: чотирикомпонентний public tag із `package.json`, наприклад
-   `v0.3.2.0`.
+   `v0.3.3.0`.
 6. Натисніть **Run workflow** і вручну approve jobs для environment `release`.
 
 Workflow зупиниться, якщо tag не дорівнює `v${releaseVersion}`, бракує ключа,
@@ -37,8 +43,9 @@ Workflow зупиниться, якщо tag не дорівнює `v${releaseVer
 1. Відкрийте **Releases**.
 2. Знайдіть draft із потрібним tag.
 3. Перевірте наявність:
-   - Windows `.exe` і `.exe.sig`;
-   - macOS `.dmg`, `.app.tar.gz` і `.app.tar.gz.sig`;
+   - `BaldojnyiDownloader-…-Windows-x64-Setup.exe` і його `.sig`;
+   - `BaldojnyiDownloader-…-Mac-Apple-Silicon.dmg`;
+   - `BaldojnyiDownloader-…-Mac-Apple-Silicon-AutoUpdate.app.tar.gz` і його `.sig`;
    - `latest.json`.
 4. За можливості встановіть `.exe` і `.dmg` на чистих тестових машинах.
 5. Натисніть **Publish release**.

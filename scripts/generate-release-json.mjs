@@ -12,9 +12,9 @@ function argumentValue(name) {
 
 export function expectedAssetNames(releaseVersion) {
   return {
-    macUpdater: `yt-dlp-BD_${releaseVersion}_aarch64.app.tar.gz`,
-    macDmg: `yt-dlp-BD_${releaseVersion}_aarch64.dmg`,
-    windowsInstaller: `yt-dlp-BD_${releaseVersion}_windows-x86_64-setup.exe`,
+    macUpdater: `BaldojnyiDownloader-${releaseVersion}-Mac-Apple-Silicon-AutoUpdate.app.tar.gz`,
+    macDmg: `BaldojnyiDownloader-${releaseVersion}-Mac-Apple-Silicon.dmg`,
+    windowsInstaller: `BaldojnyiDownloader-${releaseVersion}-Windows-x64-Setup.exe`,
   };
 }
 

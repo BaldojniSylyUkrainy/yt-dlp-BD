@@ -35,6 +35,13 @@ Release-build є fail-closed: команда не створить `release/`, �
 - `.app.tar.gz.sig` — підпис пакета оновлення;
 - `latest.json` — опис останньої версії для застосунку.
 
+Публічні файли мають стабільний читабельний формат:
+`BaldojnyiDownloader-<public-version>-Mac-Apple-Silicon.dmg`,
+`BaldojnyiDownloader-<public-version>-Mac-Apple-Silicon-AutoUpdate.app.tar.gz` і
+`BaldojnyiDownloader-<public-version>-Windows-x64-Setup.exe`. Внутрішні назви,
+які створює Tauri, перейменовуються лише після складання; `latest.json` завжди
+містить URL уже перейменованих підписаних updater-пакетів.
+
 ## Apple Developer certificate
 
 Для розповсюдження поза App Store потрібен certificate типу **Developer ID Application**.
@@ -74,13 +81,17 @@ npm run build:mac
 
 ## GitHub і автооновлення
 
+Правило вибору наступного номера версії описане у
+[VERSIONING_UK.md](VERSIONING_UK.md). Коротко: лише виправлення збільшують PATCH,
+а будь-яка нова функція збільшує MINOR і скидає PATCH до нуля.
+
 Repository уже налаштований як `BaldojniSylyUkrainy/yt-dlp-BD`. macOS і Windows
 release збирає ручний GitHub-hosted workflow, а не локальний upload окремих
 файлів. Повний handoff для власника repository:
 [GITHUB_RELEASE_HANDOFF_UK.md](GITHUB_RELEASE_HANDOFF_UK.md).
 
-Підготовлений public release tag — `v0.3.2.0`, а внутрішня Tauri/SemVer version —
-`0.3.2`. Workflow перевіряє public tag за `package.json.releaseVersion` і
+Підготовлений public release tag — `v0.3.3.0`, а внутрішня Tauri/SemVer version —
+`0.3.3`. Workflow перевіряє public tag за `package.json.releaseVersion` і
 створює draft Release. Після
 ручної перевірки та публікації `latest.json` встановлені копії побачать нову
 версію, перевірять криптографічний підпис своєї платформи й запропонують
