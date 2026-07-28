@@ -19,6 +19,10 @@ const HISTORY_LIMIT = 500;
 export const UPDATE_CHECK_DELAYS = [0, 5_000, 30_000] as const;
 const UPDATE_CHECK_INTERVAL = 6 * 60 * 60 * 1_000;
 
+export function shouldPlayCompletionSound(kind: DownloadEvent["kind"]): boolean {
+  return kind === "completed";
+}
+
 type ComponentStatus = {
   installed: boolean;
   version: string | null;
@@ -994,6 +998,9 @@ function App() {
 
   useEffect(() => {
     const unlisten = listen<DownloadEvent>("download-event", ({ payload }) => {
+      if (shouldPlayCompletionSound(payload.kind)) {
+        void invoke("play_completion_sound").catch(() => undefined);
+      }
       if (payload.kind === "completed" && payload.outputs?.length) {
         const context = historyContexts.current.get(payload.id);
         if (context) {
@@ -1340,7 +1347,7 @@ function App() {
       <main ref={mainContentRef} className={`main-content ${mainScrollable || activeView === "history" ? "is-scrollable" : "is-fixed"}`}>
         <header className="topbar">
           {activeView === "download"
-            ? <div><p className="eyebrow">ІНСТРУМЕНТ / 01</p><h1>Завантажити</h1><p>Одне посилання. Відео, аудіо, субтитри.</p></div>
+            ? <div><p className="eyebrow">ІНСТРУМЕНТ / 01</p><h1>Завантажити</h1><p>Відео, аудіо й субтитри з YouTube, Instagram, Twitter — і майже звідусіль, звідки захочете.</p></div>
             : <div><p className="eyebrow">АРХІВ / 02</p><h1>Історія</h1><p>Завантажені файли й місця, де вони збережені.</p></div>}
           {update
             ? <button className="update-pill" disabled={updateBusy} onClick={() => setUpdatePromptOpen(true)}><Icon name="refresh" size={16}/>{updateBusy ? `Оновлення ${updateProgress}%` : `Доступна v${update.version}`}</button>

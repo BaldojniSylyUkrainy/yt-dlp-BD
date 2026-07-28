@@ -241,6 +241,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
         run: |
+          RELEASE_VERSION="$(node -p "require('./package.json').releaseVersion")"
           if gh release view "$TAG" >/dev/null 2>&1; then
             IS_DRAFT="$(gh release view "$TAG" --json isDraft --jq .isDraft)"
             [[ "$IS_DRAFT" == "true" ]] || {
@@ -248,7 +249,7 @@ jobs:
               exit 1
             }
           else
-            gh release create "$TAG" --draft --target "$GITHUB_SHA" --title "yt-dlp BD $TAG" --notes-file RELEASE_NOTES.md
+            gh release create "$TAG" --draft --target "$GITHUB_SHA" --title "BaldojnyiDownloader $RELEASE_VERSION" --notes-file RELEASE_NOTES.md
           fi
-          gh release edit "$TAG" --title "yt-dlp BD $TAG" --notes-file RELEASE_NOTES.md
+          gh release edit "$TAG" --title "BaldojnyiDownloader $RELEASE_VERSION" --notes-file RELEASE_NOTES.md
           gh release upload "$TAG" release-assets/* --clobber

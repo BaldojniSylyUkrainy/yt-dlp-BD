@@ -12,6 +12,7 @@ import {
   preflightAllowsStart,
   preflightConfidenceLabel,
   runtimeInstallCommand,
+  shouldPlayCompletionSound,
   shouldCacheHistoryThumbnail,
   shouldDeleteUnusedHistoryThumbnail,
   UPDATE_CHECK_DELAYS,
@@ -49,6 +50,12 @@ function event(kind: DownloadEvent["kind"], overrides: Partial<DownloadEvent> = 
 }
 
 describe("download event state", () => {
+  it("plays the completion sound only after a successful job", () => {
+    expect(shouldPlayCompletionSound("completed")).toBe(true);
+    expect(shouldPlayCompletionSound("failed")).toBe(false);
+    expect(shouldPlayCompletionSound("cancelled")).toBe(false);
+  });
+
   it("applies progress even when it is the first event after job creation", () => {
     const next = applyDownloadEvent(startingJob, event("progress", {
       percent: 12.5,

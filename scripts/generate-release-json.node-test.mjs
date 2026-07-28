@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   buildReleaseManifest,
@@ -16,6 +17,12 @@ test("uses stable human-readable names for every public release asset", () => {
     macDmg: "BaldojnyiDownloader-0.2.0.0-Mac-Apple-Silicon.dmg",
     windowsInstaller: "BaldojnyiDownloader-0.2.0.0-Windows-x64-Setup.exe",
   });
+});
+
+test("uses the public product name and version for GitHub Release titles", async () => {
+  const workflow = await readFile(".github/workflows/release.yml", "utf8");
+  const expectedTitle = '--title "BaldojnyiDownloader $RELEASE_VERSION"';
+  assert.equal(workflow.match(new RegExp(expectedTitle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"))?.length, 2);
 });
 
 test("builds a combined macOS and Windows updater manifest", () => {
