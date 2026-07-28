@@ -32,6 +32,7 @@ test("keeps every current project and public release version in sync", async () 
   const tauriConfig = JSON.parse(await readFile("src-tauri/tauri.conf.json", "utf8"));
   const cargoToml = await readFile("src-tauri/Cargo.toml", "utf8");
   const cargoLock = await readFile("src-tauri/Cargo.lock", "utf8");
+  const releaseWorkflow = await readFile(".github/workflows/release.yml", "utf8");
   const internalVersionPattern = packageJson.version.replaceAll(".", "\\.");
   const publicVersionPattern = packageJson.releaseVersion.replaceAll(".", "\\.");
 
@@ -41,6 +42,7 @@ test("keeps every current project and public release version in sync", async () 
   assert.equal(tauriConfig.version, packageJson.version);
   assert.match(cargoToml, new RegExp(`^version = "${internalVersionPattern}"$`, "m"));
   assert.match(cargoLock, new RegExp(`name = "yt-dlp-desktop"\\nversion = "${internalVersionPattern}"`));
+  assert.match(releaseWorkflow, new RegExp(`default: "v${publicVersionPattern}"`));
 
   for (const file of ["RELEASE_NOTES.md", "docs/START_HERE_UK.md", "docs/GITHUB_RELEASE_HANDOFF_UK.md", "READMEAI"]) {
     assert.match(await readFile(file, "utf8"), new RegExp(publicVersionPattern), `${file} must mention ${packageJson.releaseVersion}`);
