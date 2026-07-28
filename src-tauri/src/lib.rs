@@ -2831,6 +2831,36 @@ fn cancel_download(manager: State<'_, DownloadManager>, id: String) -> Result<()
     stop_child_process_group(&child)
 }
 
+#[tauri::command]
+fn play_completion_sound() {
+    thread::spawn(|| {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = Command::new("/usr/bin/afplay")
+                .args(["-v", "0.28", "/System/Library/Sounds/Ping.aiff"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let mut command = Command::new("powershell.exe");
+            configure_command(&mut command);
+            let _ = command
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "[System.Media.SystemSounds]::Asterisk.Play()",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -2853,6 +2883,7 @@ pub fn run() {
             preflight_download,
             start_download,
             cancel_download,
+            play_completion_sound,
             inspect_history_files,
             cache_history_thumbnail,
             clear_history_thumbnail_cache,

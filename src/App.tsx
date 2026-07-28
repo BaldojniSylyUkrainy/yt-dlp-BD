@@ -19,6 +19,10 @@ const HISTORY_LIMIT = 500;
 export const UPDATE_CHECK_DELAYS = [0, 5_000, 30_000] as const;
 const UPDATE_CHECK_INTERVAL = 6 * 60 * 60 * 1_000;
 
+export function shouldPlayCompletionSound(kind: DownloadEvent["kind"]): boolean {
+  return kind === "completed";
+}
+
 type ComponentStatus = {
   installed: boolean;
   version: string | null;
@@ -994,6 +998,9 @@ function App() {
 
   useEffect(() => {
     const unlisten = listen<DownloadEvent>("download-event", ({ payload }) => {
+      if (shouldPlayCompletionSound(payload.kind)) {
+        void invoke("play_completion_sound").catch(() => undefined);
+      }
       if (payload.kind === "completed" && payload.outputs?.length) {
         const context = historyContexts.current.get(payload.id);
         if (context) {
