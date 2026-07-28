@@ -36,5 +36,19 @@
 - Перед запуском manual release workflow усі версії, notes і tag мають бути
   узгоджені в одному PR.
 
+Після кожного bump обов’язково перевіряємо всі поточні джерела версії:
+
+- `package.json`: `version` і `releaseVersion`;
+- `package-lock.json`: кореневі `version`;
+- `src-tauri/Cargo.toml` і запис застосунку в `src-tauri/Cargo.lock`;
+- `src-tauri/tauri.conf.json`;
+- `RELEASE_NOTES.md`;
+- актуальні release-приклади в `docs/START_HERE_UK.md`,
+  `docs/GITHUB_RELEASE_HANDOFF_UK.md` і `READMEAI`.
+
+Опис поля `workflow_dispatch` навмисно використовує універсальний приклад
+`vX.Y.Z.0`, щоб у GitHub Actions більше не залишався застарілий номер. Release-тест
+автоматично перевіряє узгодженість усіх поточних значень вище.
+
 MAJOR-версію до `1.0.0` або вище змінюємо лише окремим свідомим рішенням для
 великого несумісного релізу, а не автоматично.
