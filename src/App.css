@@ -374,7 +374,7 @@ select:focus { border-color: var(--pink); }
 .update-download-progress span { display: block; height: 100%; background: var(--pink); transition: width .2s ease-out; }
 .modal-actions > .update-install-button { min-height: 42px; padding: 0 17px; border: 0; color: var(--pink-ink); background: var(--pink); font-size: 12px; font-weight: 800; text-transform: uppercase; cursor: pointer; }
 .modal-actions > .update-install-button:hover:not(:disabled) { background: var(--pink-hot); }
-.modal-actions > .update-install-button:disabled { color: rgba(17, 17, 17, .72); background: var(--pink); opacity: .72; }
+.modal-actions > .update-install-button:disabled { color: var(--pink-ink); background: var(--pink); opacity: 1; cursor: default; }
 .browser-picker { display: block; margin-top: 18px; color: #b7b3af; font-size: 12px; text-transform: uppercase; }
 .browser-picker select { margin-top: 7px; }
 
