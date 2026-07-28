@@ -5,7 +5,7 @@ on:
     inputs:
       tag:
         description: "Four-part release tag from package.json, for example vX.Y.Z.0"
-        default: "v0.4.1.0"
+        default: "v0.5.0.0"
         required: true
         type: string
 

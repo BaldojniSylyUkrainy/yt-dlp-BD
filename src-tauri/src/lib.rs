@@ -30,6 +30,17 @@ const HISTORY_THUMBNAIL_CACHE_LIMIT: usize = 550;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+extern "system" {
+    fn SetThreadExecutionState(es_flags: u32) -> u32;
+}
+
+#[cfg(target_os = "windows")]
+const ES_CONTINUOUS: u32 = 0x8000_0000;
+#[cfg(target_os = "windows")]
+const ES_SYSTEM_REQUIRED: u32 = 0x0000_0001;
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ComponentStatus {
@@ -134,6 +145,11 @@ struct DownloadEvent {
     message: Option<String>,
     storage: Option<StorageEstimate>,
     outputs: Option<Vec<DownloadOutput>>,
+    title: Option<String>,
+    thumbnail: Option<String>,
+    uploader: Option<String>,
+    extractor: Option<String>,
+    error_code: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -193,6 +209,14 @@ struct DownloadManager {
 #[derive(Clone, Default)]
 struct ProbeManager {
     active: Arc<Mutex<Option<(String, tokio::task::AbortHandle)>>>,
+}
+
+#[derive(Default)]
+struct SleepPrevention {
+    #[cfg(target_os = "macos")]
+    process: Mutex<Option<Child>>,
+    #[cfg(target_os = "windows")]
+    stop: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 #[derive(Default)]
@@ -896,6 +920,46 @@ fn friendly_download_error(message: &str) -> String {
     }
 }
 
+fn download_error_code(message: &str) -> &'static str {
+    let value = message.to_ascii_lowercase();
+    if value.contains("недостатньо вільного місця") || value.contains("no space left")
+    {
+        "low_disk"
+    } else if value.contains("429")
+        || value.contains("too many requests")
+        || value.contains("rate limit")
+    {
+        "rate_limited"
+    } else if [
+        "sign in",
+        "login required",
+        "cookies are required",
+        "private video",
+    ]
+    .iter()
+    .any(|pattern| value.contains(pattern))
+    {
+        "auth_required"
+    } else if ["unsupported url", "no suitable extractor"]
+        .iter()
+        .any(|pattern| value.contains(pattern))
+    {
+        "unsupported"
+    } else if ["404", "not found", "removed", "unavailable"]
+        .iter()
+        .any(|pattern| value.contains(pattern))
+    {
+        "unavailable"
+    } else if ["network", "timed out", "connection", "temporary failure"]
+        .iter()
+        .any(|pattern| value.contains(pattern))
+    {
+        "network"
+    } else {
+        "unknown"
+    }
+}
+
 fn host_matches(host: &str, domain: &str) -> bool {
     host == domain || host.ends_with(&format!(".{domain}"))
 }
@@ -1311,6 +1375,11 @@ fn emit_line(app: &AppHandle, id: &str, line: &str) {
                 message: message.map(str::to_string),
                 storage: None,
                 outputs: None,
+                title: message.map(str::to_string),
+                thumbnail: None,
+                uploader: None,
+                extractor: None,
+                error_code: None,
             },
         );
     } else if let Some(payload) = line.strip_prefix(POSTPROCESS_MARKER) {
@@ -1338,6 +1407,11 @@ fn emit_line(app: &AppHandle, id: &str, line: &str) {
                     message: Some(message.into()),
                     storage: None,
                     outputs: None,
+                    title: None,
+                    thumbnail: None,
+                    uploader: None,
+                    extractor: None,
+                    error_code: None,
                 },
             );
         }
@@ -1365,6 +1439,11 @@ fn emit_line(app: &AppHandle, id: &str, line: &str) {
                 }),
                 storage: None,
                 outputs: None,
+                title: None,
+                thumbnail: None,
+                uploader: None,
+                extractor: None,
+                error_code: None,
             },
         );
     }
@@ -1396,8 +1475,7 @@ fn json_number(value: Option<&serde_json::Value>) -> Option<f64> {
     })
 }
 
-fn parse_size_estimate(payload: &str) -> Option<SelectedMediaEstimate> {
-    let metadata: serde_json::Value = serde_json::from_str(payload).ok()?;
+fn parse_size_estimate(metadata: &serde_json::Value) -> Option<SelectedMediaEstimate> {
     let media_id = metadata
         .get("id")
         .and_then(|value| value.as_str())
@@ -1423,6 +1501,45 @@ fn parse_size_estimate(payload: &str) -> Option<SelectedMediaEstimate> {
             total_bitrate_kbps,
         },
     )
+}
+
+fn metadata_string(metadata: &serde_json::Value, key: &str) -> Option<String> {
+    metadata
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn emit_download_metadata(app: &AppHandle, id: &str, metadata: &serde_json::Value) {
+    let title = metadata_string(metadata, "title");
+    let thumbnail = metadata_string(metadata, "thumbnail");
+    let uploader =
+        metadata_string(metadata, "uploader").or_else(|| metadata_string(metadata, "channel"));
+    let extractor = metadata_string(metadata, "extractor_key")
+        .or_else(|| metadata_string(metadata, "extractor"));
+    if title.is_none() && thumbnail.is_none() && uploader.is_none() && extractor.is_none() {
+        return;
+    }
+    let _ = app.emit(
+        "download-event",
+        DownloadEvent {
+            id: id.into(),
+            kind: "metadata".into(),
+            percent: None,
+            speed: None,
+            eta: None,
+            message: None,
+            storage: None,
+            outputs: None,
+            title,
+            thumbnail,
+            uploader,
+            extractor,
+            error_code: None,
+        },
+    );
 }
 
 fn target_video_bitrate(height: Option<u64>, fps: Option<f64>, fallback_kbps: Option<f64>) -> u64 {
@@ -1722,6 +1839,11 @@ fn emit_storage_estimate(
                 sufficient: available_space.map(|available| available >= required_space),
             }),
             outputs: None,
+            title: None,
+            thumbnail: None,
+            uploader: None,
+            extractor: None,
+            error_code: None,
         },
     );
 }
@@ -1738,10 +1860,13 @@ fn read_output<R: Read + Send + 'static>(
     thread::spawn(move || {
         for line in BufReader::new(reader).lines().map_while(Result::ok) {
             if let Some(payload) = line.strip_prefix("__YTDLP_SIZE__") {
-                if let (Some(tracker), Some(estimate)) =
-                    (storage_tracker.as_ref(), parse_size_estimate(payload))
-                {
-                    emit_storage_estimate(&app, &id, tracker, estimate);
+                if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(payload) {
+                    emit_download_metadata(&app, &id, &metadata);
+                    if let (Some(tracker), Some(estimate)) =
+                        (storage_tracker.as_ref(), parse_size_estimate(&metadata))
+                    {
+                        emit_storage_estimate(&app, &id, tracker, estimate);
+                    }
                 }
                 continue;
             } else if let Some(path) = line.strip_prefix("__YTDLP_FILE__") {
@@ -2201,6 +2326,11 @@ fn convert_downloaded_media(
                         }),
                         storage: None,
                         outputs: None,
+                        title: None,
+                        thumbnail: None,
+                        uploader: None,
+                        extractor: None,
+                        error_code: None,
                     },
                 );
             }
@@ -2436,13 +2566,17 @@ fn start_download(
     let id = Uuid::parse_str(&request.id)
         .map_err(|_| "Некоректний ідентифікатор завантаження".to_string())?
         .to_string();
-    if manager
-        .jobs
-        .lock()
-        .map_err(|_| "Внутрішня помилка черги".to_string())?
-        .contains_key(&id)
     {
-        return Err("Це завантаження вже запущено".into());
+        let jobs = manager
+            .jobs
+            .lock()
+            .map_err(|_| "Внутрішня помилка черги".to_string())?;
+        if jobs.contains_key(&id) {
+            return Err("Це завантаження вже запущено".into());
+        }
+        if !jobs.is_empty() {
+            return Err("Інше завантаження ще не завершено".into());
+        }
     }
     let parsed = Url::parse(&request.url).map_err(|_| "Вставте повне посилання".to_string())?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
@@ -2456,8 +2590,11 @@ fn start_download(
         })
         .unwrap_or(false);
     let output_dir = PathBuf::from(&request.output_dir);
-    fs::create_dir_all(&output_dir)
-        .map_err(|error| format!("Не вдалося відкрити папку завантажень: {error}"))?;
+    if !output_dir.is_dir() {
+        return Err(
+            "Обрана папка завантажень недоступна. Підключіть диск або виберіть іншу папку".into(),
+        );
+    }
     let available_space = available_disk_space(&output_dir)
         .ok_or_else(|| "Не вдалося визначити вільне місце в обраній папці".to_string())?;
     let enough_space = request
@@ -2482,7 +2619,7 @@ fn start_download(
         "--no-colors",
         "--progress",
         "--print",
-        "video:__YTDLP_SIZE__%(.{id,filesize,filesize_approx,duration,tbr,height,fps})j",
+        "video:__YTDLP_SIZE__%(.{id,title,thumbnail,uploader,channel,extractor,extractor_key,webpage_url,filesize,filesize_approx,duration,tbr,height,fps})j",
         "--progress-delta",
         "0.25",
         "--progress-template",
@@ -2657,6 +2794,11 @@ fn start_download(
                             message: Some(retry_message.into()),
                             storage: None,
                             outputs: None,
+                            title: None,
+                            thumbnail: None,
+                            uploader: None,
+                            extractor: None,
+                            error_code: None,
                         },
                     );
                     if let Ok(mut error) = last_error.lock() {
@@ -2784,6 +2926,28 @@ fn start_download(
                 } else {
                     "failed"
                 };
+                let raw_error = conversion_error.clone().or_else(|| {
+                    if low_disk {
+                        return Some(
+                            "Недостатньо вільного місця. Процес зупинено, щоб захистити диск."
+                                .into(),
+                        );
+                    }
+                    (!status.success())
+                        .then(|| last_error.lock().ok().and_then(|error| error.clone()))
+                        .flatten()
+                });
+                let message = if conversion_error.is_some() || low_disk {
+                    raw_error.clone()
+                } else {
+                    raw_error.as_deref().map(friendly_download_error)
+                };
+                let error_code = match kind {
+                    "completed" => None,
+                    "cancelled" => Some("cancelled".into()),
+                    "auth_required" => Some("auth_required".into()),
+                    _ => Some(download_error_code(raw_error.as_deref().unwrap_or_default()).into()),
+                };
                 let _ = monitor_app.emit(
                     "download-event",
                     DownloadEvent {
@@ -2792,17 +2956,14 @@ fn start_download(
                         percent: (status.success() && conversion_error.is_none()).then_some(100.0),
                         speed: None,
                         eta: None,
-                        message: conversion_error.or_else(|| {
-                            if low_disk {
-                                return Some("Недостатньо вільного місця. Процес зупинено, щоб захистити диск.".into());
-                            }
-                            (!status.success())
-                                .then(|| last_error.lock().ok().and_then(|error| error.clone()))
-                                .flatten()
-                                .map(|error| friendly_download_error(&error))
-                        }),
+                        message,
                         storage: None,
                         outputs: (kind == "completed").then_some(completed_outputs),
+                        title: None,
+                        thumbnail: None,
+                        uploader: None,
+                        extractor: None,
+                        error_code,
                     },
                 );
                 break;
@@ -2861,12 +3022,122 @@ fn play_completion_sound() {
     });
 }
 
+#[tauri::command]
+fn request_user_attention(app: AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Не вдалося знайти головне вікно".to_string())?;
+    window
+        .show()
+        .map_err(|error| format!("Не вдалося показати вікно: {error}"))?;
+    if window.is_minimized().unwrap_or(false) {
+        let _ = window.unminimize();
+    }
+    let _ = window.request_user_attention(Some(tauri::UserAttentionType::Critical));
+    let _ = window.set_always_on_top(true);
+    let _ = window.set_focus();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(900));
+        let _ = window.set_always_on_top(false);
+    });
+    Ok(())
+}
+
+fn update_sleep_prevention(state: &SleepPrevention, enabled: bool) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut process = state
+            .process
+            .lock()
+            .map_err(|_| "Не вдалося змінити захист від сну".to_string())?;
+        if enabled {
+            if process.is_none() {
+                let child = Command::new("/usr/bin/caffeinate")
+                    .args(["-i", "-w", &std::process::id().to_string()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .map_err(|error| format!("Не вдалося ввімкнути захист від сну: {error}"))?;
+                *process = Some(child);
+            }
+        } else if let Some(mut child) = process.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut stop = state
+            .stop
+            .lock()
+            .map_err(|_| "Не вдалося змінити захист від сну".to_string())?;
+        if enabled {
+            if stop.is_none() {
+                let (sender, receiver) = std::sync::mpsc::channel();
+                thread::spawn(move || {
+                    // SAFETY: SetThreadExecutionState is process-local, takes only documented
+                    // flag bits, and is cleared on the same dedicated thread before it exits.
+                    unsafe {
+                        SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
+                    }
+                    let _ = receiver.recv();
+                    unsafe {
+                        SetThreadExecutionState(ES_CONTINUOUS);
+                    }
+                });
+                *stop = Some(sender);
+            }
+        } else if let Some(sender) = stop.take() {
+            let _ = sender.send(());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = state;
+        let _ = enabled;
+        Err("Захист від сну для цієї платформи не підтримується".into())
+    }
+}
+
+#[tauri::command]
+fn set_queue_sleep_prevention(
+    state: State<'_, SleepPrevention>,
+    enabled: bool,
+) -> Result<(), String> {
+    update_sleep_prevention(state.inner(), enabled)
+}
+
+fn stop_all_downloads(manager: &DownloadManager) {
+    let active = manager
+        .jobs
+        .lock()
+        .ok()
+        .map(|mut jobs| jobs.drain().collect::<Vec<_>>())
+        .unwrap_or_default();
+    if let Ok(mut cancelled) = manager.cancelled.lock() {
+        cancelled.extend(active.iter().map(|(id, _)| id.clone()));
+    }
+    for (_, child) in active {
+        let _ = stop_child_process_group(&child);
+    }
+}
+
+fn cleanup_background_work(app: &AppHandle) {
+    stop_all_downloads(app.state::<DownloadManager>().inner());
+    let _ = update_sleep_prevention(app.state::<SleepPrevention>().inner(), false);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .manage(DownloadManager::default())
         .manage(ProbeManager::default())
         .manage(HistoryThumbnailCache::default())
+        .manage(SleepPrevention::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
@@ -2884,13 +3155,28 @@ pub fn run() {
             start_download,
             cancel_download,
             play_completion_sound,
+            request_user_attention,
+            set_queue_sleep_prevention,
             inspect_history_files,
             cache_history_thumbnail,
             clear_history_thumbnail_cache,
             delete_history_thumbnail
         ])
-        .run(tauri::generate_context!())
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                cleanup_background_work(window.app_handle());
+            }
+        })
+        .build(tauri::generate_context!())
         .expect("error while running tauri application");
+    app.run(|app_handle, event| {
+        if matches!(
+            event,
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+        ) {
+            cleanup_background_work(app_handle);
+        }
+    });
 }
 
 #[cfg(test)]
