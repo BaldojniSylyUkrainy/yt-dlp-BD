@@ -41,7 +41,7 @@ test("keeps every current project and public release version in sync", async () 
   assert.equal(packageLock.packages[""].version, packageJson.version);
   assert.equal(tauriConfig.version, packageJson.version);
   assert.match(cargoToml, new RegExp(`^version = "${internalVersionPattern}"$`, "m"));
-  assert.match(cargoLock, new RegExp(`name = "yt-dlp-desktop"\\nversion = "${internalVersionPattern}"`));
+  assert.match(cargoLock, new RegExp(`name = "yt-dlp-desktop"\\r?\\nversion = "${internalVersionPattern}"`));
   assert.match(releaseWorkflow, new RegExp(`default: "v${publicVersionPattern}"`));
 
   for (const file of ["RELEASE_NOTES.md", "docs/START_HERE_UK.md", "docs/GITHUB_RELEASE_HANDOFF_UK.md", "READMEAI"]) {
