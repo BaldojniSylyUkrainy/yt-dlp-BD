@@ -470,6 +470,7 @@ select:focus { border-color: var(--pink); }
 .modal-icon.auth { color: var(--pink-ink); background: var(--pink); }
 .modal-icon.update { color: var(--pink-ink); background: var(--pink); }
 .modal-icon.cancel { color: #1a0809; background: var(--danger); }
+.modal-icon.app-close { color: #1a0809; background: var(--danger); }
 .modal h2 { margin: 0 0 10px; font-family: var(--font-poster); font-size: 34px; font-weight: 900; letter-spacing: -.015em; text-transform: uppercase; }
 .modal > p:not(.eyebrow) { margin: 0; color: #b7b3af; font-size: 13px; line-height: 1.6; }
 .modal > p strong { color: var(--ink); }
@@ -483,6 +484,15 @@ select:focus { border-color: var(--pink); }
 .cancel-confirm-button:hover:not(:disabled) { background: #211113; }
 .cancel-confirm-button:disabled, .modal-actions button:disabled { opacity: .55; cursor: default; }
 .modal-detail.cancel-error { color: var(--danger); }
+.app-close-backdrop { z-index: 220; }
+.app-close-modal { width: min(600px, 92vw); }
+.app-close-processes { margin: 18px 0; padding: 15px 17px; border: 1px solid rgba(255,101,110,.46); color: #c7c2be; background: #171011; }
+.app-close-processes > strong { display: block; margin-bottom: 9px; color: var(--danger); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; }
+.app-close-processes ul { margin: 0; padding-left: 18px; }
+.app-close-processes li { margin: 6px 0; font-size: 13px; line-height: 1.4; }
+.modal-actions > .app-close-confirm-button { min-height: 42px; padding: 0 17px; border: 0; color: #1a0809; background: var(--danger); font-size: 12px; font-weight: 800; text-transform: uppercase; cursor: pointer; }
+.modal-actions > .app-close-confirm-button:hover:not(:disabled) { background: #ff7a82; }
+.modal-actions > .app-close-confirm-button:disabled { color: #1a0809; background: var(--danger); opacity: 1; cursor: default; }
 .update-modal-backdrop { z-index: 120; }
 .update-modal { width: min(600px, 92vw); }
 .update-notes { max-height: 190px; overflow-y: auto; }

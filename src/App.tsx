@@ -184,6 +184,31 @@ export type Job = {
   outputFormat: string;
 };
 
+type AppCloseRequest = {
+  activeDownloads: number;
+};
+
+export type AppCloseActivity = {
+  singleStage: Job["status"] | null;
+  batchDownload: boolean;
+  runtimeMaintenance: boolean;
+  appUpdate: boolean;
+  linkCheck: boolean;
+  backendDownloads: number;
+};
+
+export function appCloseActivityLabels(activity: AppCloseActivity): string[] {
+  const labels: string[] = [];
+  if (activity.singleStage === "converting") labels.push("Конвертація файла ще триває.");
+  else if (activity.singleStage && ["starting", "downloading", "postprocessing"].includes(activity.singleStage)) labels.push("Завантаження або обробка файла ще триває.");
+  if (activity.batchDownload) labels.push("Пакетне завантаження ще виконується.");
+  if (activity.runtimeMaintenance) labels.push("Компоненти зараз перевіряються або оновлюються.");
+  if (activity.appUpdate) labels.push("Оновлення застосунку ще завантажується або встановлюється.");
+  if (activity.linkCheck) labels.push("Посилання ще перевіряється або готується до завантаження.");
+  if (activity.backendDownloads > 0 && !activity.singleStage && !activity.batchDownload) labels.push("Фонове завантаження або конвертація ще триває.");
+  return labels;
+}
+
 export function applyDownloadEvent(current: Job, payload: DownloadEvent): Job | null {
   if (payload.kind === "cancelled") return null;
   if (payload.kind === "metadata") {
@@ -657,6 +682,9 @@ function App() {
   const [queueNotice, setQueueNotice] = useState("");
   const [queueAlert, setQueueAlert] = useState<{ title: string; message: string } | null>(null);
   const [queueMonitorOpen, setQueueMonitorOpen] = useState(false);
+  const [closeRequest, setCloseRequest] = useState<AppCloseRequest | null>(null);
+  const [closeBusy, setCloseBusy] = useState(false);
+  const [closeError, setCloseError] = useState("");
   const queueLaunchInFlight = useRef(false);
   const queueCancellationIntent = useRef<"skip" | "stop" | null>(null);
   const sleepPreventionChain = useRef<Promise<unknown>>(Promise.resolve());
@@ -669,6 +697,14 @@ function App() {
   const isWindows = runtime?.platform === "windows";
   const quickThumbnail = youtubeThumbnailFromInput(url);
   const multiItemCandidate = isLikelyMultiItemUrl(url);
+  const closeActivities = appCloseActivityLabels({
+    singleStage: active ? job?.status || null : null,
+    batchDownload: Boolean(queueProcessActive || downloadQueue?.status === "running"),
+    runtimeMaintenance: runtimeBusy,
+    appUpdate: updateBusy,
+    linkCheck: pendingStart || probeState === "checking",
+    backendDownloads: closeRequest?.activeDownloads || 0,
+  });
 
   const updateQueue = useCallback((producer: (current: DownloadQueue | null) => DownloadQueue | null) => {
     const next = producer(downloadQueueRef.current);
@@ -684,6 +720,24 @@ function App() {
       .then(() => invoke("set_queue_sleep_prevention", { enabled }))
       .catch(() => undefined);
   }, [active, downloadQueue?.activeItemId, downloadQueue?.status]);
+
+  useEffect(() => {
+    let disposed = false;
+    const showCloseConfirmation = (request: AppCloseRequest) => {
+      if (disposed) return;
+      setCloseError("");
+      setCloseBusy(false);
+      setCloseRequest(request);
+    };
+    const unlisten = listen<AppCloseRequest>("app-close-requested", ({ payload }) => showCloseConfirmation(payload));
+    void invoke<AppCloseRequest | null>("take_app_close_request")
+      .then((request) => { if (request) showCloseConfirmation(request); })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten.then((dispose) => dispose());
+    };
+  }, []);
 
   useEffect(() => {
     let timer = 0;
@@ -1901,10 +1955,34 @@ function App() {
           if (total) setUpdateProgress(Math.round((downloaded / total) * 100));
         }
       });
-      await relaunch();
+      await invoke("allow_app_exit_once");
+      try {
+        await relaunch();
+      } catch (error) {
+        await invoke("cancel_app_exit_approval").catch(() => undefined);
+        throw error;
+      }
     } catch (error) {
       setUpdateInstallError(`Не вдалося встановити оновлення: ${String(error)}`);
       setUpdateBusy(false);
+    }
+  }
+
+  async function dismissAppClose() {
+    setCloseRequest(null);
+    setCloseBusy(false);
+    setCloseError("");
+    await invoke("dismiss_app_close_request").catch(() => undefined);
+  }
+
+  async function confirmAppClose() {
+    setCloseBusy(true);
+    setCloseError("");
+    try {
+      await invoke("confirm_app_close");
+    } catch (error) {
+      setCloseError(`Не вдалося закрити застосунок: ${String(error)}`);
+      setCloseBusy(false);
     }
   }
 
@@ -2142,6 +2220,23 @@ function App() {
           <label className="browser-picker">Ваш браузер<select value={cookieBrowser} onChange={(event) => setCookieBrowser(event.target.value)}>{!isWindows && <option value="safari">Safari</option>}<option value="edge">Microsoft Edge</option><option value="chrome">Google Chrome</option><option value="firefox">Firefox</option><option value="brave">Brave</option><option value="vivaldi">Vivaldi</option></select></label>
           <div className="modal-detail">yt-dlp прочитає cookies безпосередньо з обраного браузера лише для повторної спроби. yt-dlp BD не експортує їх у файл і не зберігає.</div>
           <div className="modal-actions"><button className="secondary-button" onClick={() => setJob(null)}>Скасувати</button><button className="warning-button auth" disabled={pendingStart} onClick={retryWithCookies}>{pendingStart ? "Перевіряємо…" : "Повторити з cookies"}</button></div>
+        </DialogSurface>
+      </div>}
+
+      {closeRequest && <div className="modal-backdrop app-close-backdrop" role="presentation">
+        <DialogSurface className="modal app-close-modal" labelledBy="app-close-title" describedBy="app-close-description" onEscape={!closeBusy ? () => void dismissAppClose() : undefined}>
+          <div className="modal-icon app-close"><Icon name="x" size={30}/></div>
+          <p className="eyebrow">ЗАКРИТТЯ ЗАСТОСУНКУ</p>
+          <h2 id="app-close-title">Ти точно хочеш закрити?</h2>
+          <p id="app-close-description">{closeActivities.length
+            ? "Зараз у застосунку ще виконуються процеси. Якщо закрити його, вони зупиняться, а незавершені файли можуть не зберегтися."
+            : "Активних процесів зараз немає, але ми все одно перепитуємо, щоб застосунок не закрився випадково."}</p>
+          {closeActivities.length > 0 && <div className="app-close-processes" aria-label="Активні процеси">
+            <strong>Зараз працює</strong>
+            <ul>{closeActivities.map((activity) => <li key={activity}>{activity}</li>)}</ul>
+          </div>}
+          {closeError && <div className="modal-detail cancel-error">{closeError}</div>}
+          <div className="modal-actions"><button className="secondary-button" disabled={closeBusy} onClick={() => void dismissAppClose()}>Ні, залишитись</button><button className="app-close-confirm-button" disabled={closeBusy} onClick={() => void confirmAppClose()}>{closeBusy ? "Закриваємо…" : "Так, закрити"}</button></div>
         </DialogSurface>
       </div>}
 

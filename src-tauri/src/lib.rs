@@ -8,7 +8,10 @@ use std::{
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -227,6 +230,70 @@ struct HistoryThumbnailCache {
 #[derive(Default)]
 struct RuntimeMaintenance {
     operation: tokio::sync::Mutex<()>,
+}
+
+#[derive(Default)]
+struct AppExitConfirmation {
+    approved: AtomicBool,
+    pending: AtomicBool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppCloseRequest {
+    active_downloads: usize,
+}
+
+fn app_close_request(manager: &DownloadManager) -> AppCloseRequest {
+    AppCloseRequest {
+        active_downloads: manager.jobs.lock().map(|jobs| jobs.len()).unwrap_or(0),
+    }
+}
+
+fn request_app_close_confirmation(app: &AppHandle) {
+    app.state::<AppExitConfirmation>()
+        .pending
+        .store(true, Ordering::SeqCst);
+    let payload = app_close_request(app.state::<DownloadManager>().inner());
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+        let _ = window.emit("app-close-requested", payload);
+    }
+}
+
+#[tauri::command]
+fn take_app_close_request(
+    manager: State<'_, DownloadManager>,
+    confirmation: State<'_, AppExitConfirmation>,
+) -> Option<AppCloseRequest> {
+    confirmation
+        .pending
+        .swap(false, Ordering::SeqCst)
+        .then(|| app_close_request(manager.inner()))
+}
+
+#[tauri::command]
+fn dismiss_app_close_request(confirmation: State<'_, AppExitConfirmation>) {
+    confirmation.pending.store(false, Ordering::SeqCst);
+}
+
+#[tauri::command]
+fn allow_app_exit_once(confirmation: State<'_, AppExitConfirmation>) {
+    confirmation.pending.store(false, Ordering::SeqCst);
+    confirmation.approved.store(true, Ordering::SeqCst);
+}
+
+#[tauri::command]
+fn cancel_app_exit_approval(confirmation: State<'_, AppExitConfirmation>) {
+    confirmation.approved.store(false, Ordering::SeqCst);
+}
+
+#[tauri::command]
+fn confirm_app_close(app: AppHandle, confirmation: State<'_, AppExitConfirmation>) {
+    confirmation.pending.store(false, Ordering::SeqCst);
+    confirmation.approved.store(true, Ordering::SeqCst);
+    app.exit(0);
 }
 
 fn ensure_runtime_idle(manager: &DownloadManager) -> Result<(), String> {
@@ -3327,6 +3394,7 @@ pub fn run() {
         .manage(HistoryThumbnailCache::default())
         .manage(RuntimeMaintenance::default())
         .manage(SleepPrevention::default())
+        .manage(AppExitConfirmation::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
@@ -3346,25 +3414,36 @@ pub fn run() {
             play_completion_sound,
             request_user_attention,
             set_queue_sleep_prevention,
+            take_app_close_request,
+            dismiss_app_close_request,
+            allow_app_exit_once,
+            cancel_app_exit_approval,
+            confirm_app_close,
             inspect_history_files,
             cache_history_thumbnail,
             clear_history_thumbnail_cache,
             delete_history_thumbnail
         ])
         .on_window_event(|window, event| {
-            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
-                cleanup_background_work(window.app_handle());
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                request_app_close_confirmation(window.app_handle());
             }
         })
         .build(tauri::generate_context!())
         .expect("error while running tauri application");
-    app.run(|app_handle, event| {
-        if matches!(
-            event,
-            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
-        ) {
-            cleanup_background_work(app_handle);
+    app.run(|app_handle, event| match event {
+        tauri::RunEvent::ExitRequested { api, .. } => {
+            let confirmation = app_handle.state::<AppExitConfirmation>();
+            if confirmation.approved.swap(false, Ordering::SeqCst) {
+                cleanup_background_work(app_handle);
+            } else {
+                api.prevent_exit();
+                request_app_close_confirmation(app_handle);
+            }
         }
+        tauri::RunEvent::Exit => cleanup_background_work(app_handle),
+        _ => {}
     });
 }
 
