@@ -13,6 +13,7 @@ import {
   preflightConfidenceLabel,
   runtimeInstallCommand,
   shouldPlayCompletionSound,
+  shouldPlayQueueCompletionSound,
   shouldCacheHistoryThumbnail,
   shouldDeleteUnusedHistoryThumbnail,
   UPDATE_CHECK_DELAYS,
@@ -20,6 +21,7 @@ import {
   type Job,
   type HistoryEntry,
 } from "./App";
+import { createQueueItem } from "./queue";
 
 const startingJob: Job = {
   id: "job-1",
@@ -54,6 +56,17 @@ describe("download event state", () => {
     expect(shouldPlayCompletionSound("completed")).toBe(true);
     expect(shouldPlayCompletionSound("failed")).toBe(false);
     expect(shouldPlayCompletionSound("cancelled")).toBe(false);
+  });
+
+  it("plays one queue sound only when the batch produced at least one finished file", () => {
+    expect(shouldPlayQueueCompletionSound([
+      { ...createQueueItem("https://example.com/one"), status: "failed" },
+      { ...createQueueItem("https://example.com/two"), status: "skipped" },
+    ])).toBe(false);
+    expect(shouldPlayQueueCompletionSound([
+      { ...createQueueItem("https://example.com/one"), status: "failed" },
+      { ...createQueueItem("https://example.com/two"), status: "completed" },
+    ])).toBe(true);
   });
 
   it("applies progress even when it is the first event after job creation", () => {
@@ -146,8 +159,9 @@ describe("download history grouping", () => {
   it("caches only completed jobs and does not resurrect history cleared during caching", () => {
     const outputs = [{ path: "/Downloads/video.mp4", size: 1024 }];
     expect(shouldCacheHistoryThumbnail("completed", outputs, "https://example.com/thumb.jpg")).toBe(true);
-    expect(shouldCacheHistoryThumbnail("failed", outputs, "https://example.com/thumb.jpg")).toBe(false);
-    expect(shouldCacheHistoryThumbnail("cancelled", outputs, "https://example.com/thumb.jpg")).toBe(false);
+    expect(shouldCacheHistoryThumbnail("failed", outputs, "https://example.com/thumb.jpg")).toBe(true);
+    expect(shouldCacheHistoryThumbnail("cancelled", outputs, "https://example.com/thumb.jpg")).toBe(true);
+    expect(shouldCacheHistoryThumbnail("failed", null, "https://example.com/thumb.jpg")).toBe(false);
     expect(shouldCacheHistoryThumbnail("completed", outputs, null)).toBe(false);
 
     const populated = [entry("completed", new Date(2026, 6, 27, 12, 0, 0))];

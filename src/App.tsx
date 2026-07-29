@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ClipboardEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type ClipboardEvent, type ReactNode } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { downloadDir } from "@tauri-apps/api/path";
@@ -12,8 +12,8 @@ import loadingHandTwo from "./assets/logo-call-me-hand-frame-2.png";
 import loadingHandThree from "./assets/logo-call-me-hand-frame-3.png";
 import packageMetadata from "../package.json";
 import {
-  appendQueueUrls,
   canEditQueueItem,
+  commitQueueInput,
   nextPendingQueueItem,
   normalizeHttpUrl,
   parseQueueStorage,
@@ -22,6 +22,7 @@ import {
   queueHasActiveProcess,
   queuePreventsOtherWork,
   queueProgress,
+  resetEntireQueueForReplay,
   resetQueueItemsForRetry,
   type DownloadQueue,
   type QueueItem,
@@ -37,6 +38,10 @@ const UPDATE_CHECK_INTERVAL = 6 * 60 * 60 * 1_000;
 
 export function shouldPlayCompletionSound(kind: DownloadEvent["kind"]): boolean {
   return kind === "completed";
+}
+
+export function shouldPlayQueueCompletionSound(items: QueueItem[]): boolean {
+  return items.some((item) => item.status === "completed");
 }
 
 type ComponentStatus = {
@@ -289,6 +294,58 @@ function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
   return <svg aria-hidden="true" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
 }
 
+function DialogSurface({ className, labelledBy, describedBy, onEscape, children }: {
+  className: string;
+  labelledBy: string;
+  describedBy?: string;
+  onEscape?: () => void;
+  children: ReactNode;
+}) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const escapeRef = useRef(onEscape);
+  escapeRef.current = onEscape;
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const focusableSelector = "button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex='-1'])";
+    const focusable = () => Array.from(dialog.querySelectorAll<HTMLElement>(focusableSelector));
+    const frame = window.requestAnimationFrame(() => (focusable()[0] || dialog).focus());
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && escapeRef.current) {
+        event.preventDefault();
+        escapeRef.current();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const controls = focusable();
+      if (!controls.length) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = controls[0];
+      const last = controls[controls.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    dialog.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      dialog.removeEventListener("keydown", handleKeyDown);
+      previous?.focus();
+    };
+  }, []);
+
+  return <div ref={dialogRef} className={className} role="dialog" aria-modal="true" aria-labelledby={labelledBy} aria-describedby={describedBy} tabIndex={-1}>{children}</div>;
+}
+
 function hostFromInput(value: string): string | null {
   try {
     return new URL(/^https?:\/\//i.test(value.trim()) ? value.trim() : `https://${value.trim()}`).hostname.toLowerCase();
@@ -493,7 +550,7 @@ export function applyHistoryFileStatuses(entries: HistoryEntry[], statuses: Hist
 }
 
 export function shouldCacheHistoryThumbnail(kind: DownloadEvent["kind"], outputs: DownloadOutput[] | null, thumbnail: string | null): boolean {
-  return kind === "completed" && Boolean(outputs?.length) && Boolean(thumbnail);
+  return ["completed", "failed", "cancelled"].includes(kind) && Boolean(outputs?.length) && Boolean(thumbnail);
 }
 
 export function applyHistoryThumbnailCache(entries: HistoryEntry[], targetIds: Set<string>, cachedThumbnailPath: string): HistoryEntry[] {
@@ -599,6 +656,7 @@ function App() {
   const [queueInput, setQueueInput] = useState("");
   const [queueNotice, setQueueNotice] = useState("");
   const [queueAlert, setQueueAlert] = useState<{ title: string; message: string } | null>(null);
+  const [queueMonitorOpen, setQueueMonitorOpen] = useState(false);
   const queueLaunchInFlight = useRef(false);
   const queueCancellationIntent = useRef<"skip" | "stop" | null>(null);
   const sleepPreventionChain = useRef<Promise<unknown>>(Promise.resolve());
@@ -808,17 +866,33 @@ function App() {
   const refreshManagedComponents = useCallback(async () => {
     const now = Date.now();
     const schedules = [
-      { command: "update_ytdlp", key: "runtimeUpdate.ytDlp", interval: 24 * 60 * 60 * 1000 },
-      { command: "install_ffmpeg", key: "runtimeUpdate.ffmpeg", interval: 7 * 24 * 60 * 60 * 1000 },
-      { command: "install_deno", key: "runtimeUpdate.deno", interval: 7 * 24 * 60 * 60 * 1000 },
+      { command: "update_ytdlp", stage: "ytDlp" as const, key: "runtimeUpdate.ytDlp", interval: 24 * 60 * 60 * 1000 },
+      { command: "install_ffmpeg", stage: "ffmpeg" as const, key: "runtimeUpdate.ffmpeg", interval: 7 * 24 * 60 * 60 * 1000 },
+      { command: "install_deno", stage: "deno" as const, key: "runtimeUpdate.deno", interval: 7 * 24 * 60 * 60 * 1000 },
     ];
     const due = schedules.filter(({ key, interval }) => now - Number(localStorage.getItem(key) || 0) >= interval);
     if (!due.length) return;
-    const results = await Promise.allSettled(due.map(({ command }) => invoke<void>(command)));
-    results.forEach((result, index) => {
-      if (result.status === "fulfilled") localStorage.setItem(due[index].key, String(now));
-    });
-    invoke<RuntimeStatus>("runtime_status").then(setRuntime).catch(() => undefined);
+    setRuntimeBusy(true);
+    setRuntimeError("");
+    const issues: string[] = [];
+    try {
+      for (const component of due) {
+        setRuntimeStage(component.stage);
+        setRuntimeInstallProgress(null);
+        try {
+          await invoke<void>(component.command);
+          localStorage.setItem(component.key, String(now));
+        } catch (error) {
+          issues.push(String(error));
+        }
+      }
+      setRuntime(await invoke<RuntimeStatus>("runtime_status"));
+      setRuntimeError(issues.join(" · "));
+    } finally {
+      setRuntimeStage(null);
+      setRuntimeInstallProgress(null);
+      setRuntimeBusy(false);
+    }
   }, []);
 
   const maintainRuntime = useCallback(async () => {
@@ -848,6 +922,7 @@ function App() {
         setStartupProgress(62 + Math.round((index / missing.length) * 30));
         try {
           await invoke<void>(component.command);
+          localStorage.setItem(`runtimeUpdate.${component.stage}`, String(Date.now()));
           setRuntimeFailures((current) => {
             const next = new Set(current);
             next.delete(component.stage);
@@ -1149,7 +1224,7 @@ function App() {
           context.extractor = payload.extractor || context.extractor;
         }
       }
-      if (payload.kind === "completed" && payload.outputs?.length) {
+      if (["completed", "failed", "cancelled"].includes(payload.kind) && payload.outputs?.length) {
         const context = historyContexts.current.get(payload.id);
         if (context) {
           const downloadedAt = new Date().toISOString();
@@ -1229,17 +1304,20 @@ function App() {
             if (payload.kind === "cancelled") {
               const status = cancellationIntent === "skip" ? "skipped" as const : "interrupted" as const;
               if (cancellationIntent !== "skip") pauseQueue = true;
-              return { ...item, status, message: status === "skipped" ? "Пропущено" : "Зупинено користувачем", jobId: null };
+              const outputs = payload.outputs || [];
+              return { ...item, status, outputs, finalSize: outputs.reduce((sum, output) => sum + output.size, 0), message: status === "skipped" ? "Пропущено" : "Зупинено користувачем", jobId: null };
             }
             if (payload.kind === "failed" || payload.kind === "auth_required") {
               const blocking = payload.errorCode === "low_disk" || payload.errorCode === "rate_limited" || payload.kind === "auth_required";
               pauseQueue = blocking;
-              return { ...item, status: blocking ? "interrupted" as const : "failed" as const, message: payload.message || "Не вдалося завантажити", errorCode: payload.errorCode || (payload.kind === "auth_required" ? "auth_required" : "unknown"), jobId: null };
+              const outputs = payload.outputs || [];
+              return { ...item, status: blocking ? "interrupted" as const : "failed" as const, outputs, finalSize: outputs.reduce((sum, output) => sum + output.size, 0), message: payload.message || "Не вдалося завантажити", errorCode: payload.errorCode || (payload.kind === "auth_required" ? "auth_required" : "unknown"), jobId: null };
             }
             return item;
           });
           if (pauseQueue) {
             const failedItem = items.find((item) => item.id === queueItem.id);
+            setQueueMonitorOpen(true);
             setQueueAlert({
               title: payload.kind === "auth_required" ? "Потрібен вхід" : payload.errorCode === "low_disk" ? "Замало місця" : "Чергу призупинено",
               message: payload.kind === "auth_required"
@@ -1542,17 +1620,8 @@ function App() {
   function addQueueText(raw = queueInput) {
     if (!raw.trim()) return;
     const current = downloadQueueRef.current;
-    const result = appendQueueUrls(current?.items || [], raw);
-    const now = new Date().toISOString();
-    updateQueue(() => ({
-      version: 1,
-      status: current?.status === "completed" ? "draft" : current?.status || "draft",
-      settings: current?.settings || currentQueueSettings(),
-      items: result.items,
-      activeItemId: current?.activeItemId || null,
-      createdAt: current?.createdAt || now,
-      updatedAt: now,
-    }));
+    const result = commitQueueInput(current, currentQueueSettings(), raw);
+    updateQueue(() => result.queue);
     setQueueInput("");
     setQueueNotice(result.rejected ? `Додано максимум ${QUEUE_LIMIT} посилань. Зайві рядки не потрапили в чергу.` : "");
   }
@@ -1598,9 +1667,10 @@ function App() {
   }
 
   async function startQueue() {
+    if (queueInput.trim()) addQueueText(queueInput);
     const current = downloadQueueRef.current;
     if (!current?.items.length || active || current.activeItemId || queueLaunchInFlight.current) return;
-    if (!runtimeReady) {
+    if (runtimeBusy || !runtimeReady) {
       setQueueNotice("Компоненти ще готуються. Зачекайте кілька секунд.");
       return;
     }
@@ -1627,6 +1697,8 @@ function App() {
       }
     }
     if (destination === current.settings.outputDir) setQueueNotice("");
+    setQueueAlert(null);
+    setQueueMonitorOpen(true);
     updateQueue((queue) => queue ? { ...queue, status: "running", updatedAt: new Date().toISOString() } : queue);
   }
 
@@ -1663,7 +1735,36 @@ function App() {
       activeItemId: null,
       updatedAt: new Date().toISOString(),
     } : queue);
+    setQueueAlert(null);
+    setQueueMonitorOpen(true);
     void startQueue();
+  }
+
+  function replayEntireQueue() {
+    const current = downloadQueueRef.current;
+    if (!current?.items.length || active || current.activeItemId) return;
+    updateQueue((queue) => queue ? {
+      ...queue,
+      status: "paused",
+      items: resetEntireQueueForReplay(queue.items),
+      activeItemId: null,
+      updatedAt: new Date().toISOString(),
+    } : queue);
+    setQueueAlert(null);
+    setQueueMonitorOpen(true);
+    void startQueue();
+  }
+
+  function createNewQueue() {
+    if (queueHasActiveProcess(downloadQueueRef.current)) {
+      setQueueNotice("Дочекайтеся завершення поточного файла або зупиніть його перед створенням нової черги.");
+      return;
+    }
+    updateQueue(() => null);
+    setQueueInput("");
+    setQueueNotice("");
+    setQueueAlert(null);
+    setQueueMonitorOpen(false);
   }
 
   useEffect(() => {
@@ -1671,10 +1772,22 @@ function App() {
     if (!queue || queue.status !== "running" || queue.activeItemId || queueLaunchInFlight.current || active) return;
     const item = nextPendingQueueItem(queue.items);
     if (!item) {
+      const failed = queue.items.filter((candidate) => candidate.status === "failed").length;
+      const skipped = queue.items.filter((candidate) => candidate.status === "skipped").length;
       updateQueue((current) => current?.status === "running" ? { ...current, status: "completed", updatedAt: new Date().toISOString() } : current);
-      void invoke("play_completion_sound").catch(() => undefined);
+      if (shouldPlayQueueCompletionSound(queue.items)) {
+        void invoke("play_completion_sound").catch(() => undefined);
+      }
       void invoke("request_user_attention").catch(() => undefined);
-      setQueueAlert({ title: "Пакетне завантаження завершено", message: "Усі посилання оброблено. Результати вже зібрані в таблиці." });
+      setQueueMonitorOpen(true);
+      setQueueAlert({
+        title: failed ? "Чергу завершено з помилками" : skipped ? "Чергу завершено з пропусками" : "Пакетне завантаження завершено",
+        message: failed
+          ? `Усі посилання оброблено. Не завантажено: ${failed + skipped}. Можна повторити всю чергу або лише проблемні рядки.`
+          : skipped
+            ? `Усі посилання оброблено. Пропущено: ${skipped}. Кнопка «Повторити чергу» знову запустить усі початкові посилання.`
+            : "Усі посилання успішно завантажено. Результати вже зібрані в таблиці.",
+      });
       return;
     }
     const normalized = normalizeHttpUrl(item.url);
@@ -1764,6 +1877,7 @@ function App() {
         updatedAt: new Date().toISOString(),
       } : current);
       if (blocking) {
+        setQueueMonitorOpen(true);
         setQueueAlert({ title: "Чергу призупинено", message });
         void invoke("request_user_attention").catch(() => undefined);
       }
@@ -1835,13 +1949,12 @@ function App() {
               : null}
         </header>
 
-        {activeView !== "queue" && downloadQueue && ["running", "paused"].includes(downloadQueue.status) && <button className="queue-strip" onClick={() => setActiveView("queue")}>
+        {activeView !== "queue" && downloadQueue && ["running", "paused"].includes(downloadQueue.status) && <button className="queue-strip" onClick={() => setQueueMonitorOpen(true)}>
           <span><strong>Пакетне завантаження: {downloadQueue.status === "running" ? "працює" : downloadQueue.activeItemId ? "завершує поточний файл" : "призупинене"}</strong><small>{queueProgress(downloadQueue.items).done} із {queueProgress(downloadQueue.items).total} оброблено</small></span>
           <span>{queueProgress(downloadQueue.items).percent}% →</span>
         </button>}
 
         {activeView === "download" && <section className="download-card" aria-busy={runtimeBusy}>
-          {runtimeBusy && <RuntimePreparationOverlay stage={runtimeStage} runtime={runtime} progress={runtimeInstallProgress} />}
           <div className="download-card-content" inert={runtimeBusy ? true : undefined}>
           <label className="field-label" htmlFor="media-url">Посилання</label>
           <div className={`url-field ${probeState}`}>
@@ -1908,7 +2021,7 @@ function App() {
           queue={downloadQueue}
           input={queueInput}
           notice={queueNotice}
-          runtimeReady={runtimeReady}
+          runtimeReady={runtimeReady && !runtimeBusy}
           singleDownloadActive={Boolean(active)}
           isWindows={isWindows}
           onInput={setQueueInput}
@@ -1924,15 +2037,8 @@ function App() {
           onSkip={() => void skipQueueItem()}
           onStop={() => void stopQueue()}
           onRetry={retryFailedQueueItems}
-          onNew={() => {
-            if (queueHasActiveProcess(downloadQueueRef.current)) {
-              setQueueNotice("Дочекайтеся завершення поточного файла або зупиніть його перед створенням нової черги.");
-              return;
-            }
-            updateQueue(() => null);
-            setQueueInput("");
-            setQueueNotice("");
-          }}
+          onReplay={replayEntireQueue}
+          onNew={createNewQueue}
         />}
 
         {activeView === "history" && <HistoryView
@@ -1950,8 +2056,10 @@ function App() {
 
       </main>
 
+      {runtimeBusy && !startupBusy && <RuntimePreparationOverlay stage={runtimeStage} runtime={runtime} progress={runtimeInstallProgress} />}
+
       {job && job.status !== "auth_required" && <div className="download-progress-backdrop" role="presentation">
-        <section className={`job-card ${job.status}`} role="dialog" aria-modal="true" aria-labelledby="download-progress-title">
+        <DialogSurface className={`job-card ${job.status}`} labelledBy="download-progress-title" onEscape={!active ? () => setJob(null) : undefined}>
           {job.status === "completed" ? (
             <button type="button" className="job-icon job-icon-button" aria-label="Закрити повідомлення про завершення" onClick={() => setJob(null)}><Icon name="check"/></button>
           ) : job.status === "failed" ? (
@@ -1973,65 +2081,70 @@ function App() {
           </div>
           {active && <button className="stop-button" aria-label="Зупинити" onClick={() => { setCancelError(""); setCancelConfirmOpen(true); }}><Icon name="stop" size={18}/></button>}
           {!active && <button className="stop-button close" aria-label="Закрити" onClick={() => setJob(null)}><Icon name="x" size={18}/></button>}
-        </section>
+        </DialogSurface>
       </div>}
 
+      {queueMonitorOpen && downloadQueue && downloadQueue.status !== "draft" && <QueueProgressModal
+        queue={downloadQueue}
+        alert={queueAlert}
+        singleDownloadActive={Boolean(active)}
+        onClose={() => { setQueueMonitorOpen(false); setQueueAlert(null); }}
+        onPause={pauseQueue}
+        onResume={() => void startQueue()}
+        onSkip={() => void skipQueueItem()}
+        onStop={() => void stopQueue()}
+        onRetry={retryFailedQueueItems}
+        onReplay={replayEntireQueue}
+        onNew={createNewQueue}
+      />}
+
       {cancelConfirmOpen && job && active && <div className="modal-backdrop" role="presentation">
-        <div className="modal" role="dialog" aria-modal="true" aria-labelledby="cancel-title">
+        <DialogSurface className="modal" labelledBy="cancel-title" describedBy="cancel-description" onEscape={!cancelBusy ? () => setCancelConfirmOpen(false) : undefined}>
           <div className="modal-icon cancel"><Icon name="stop" size={28}/></div>
           <p className="eyebrow">АКТИВНЕ ЗАВАНТАЖЕННЯ</p>
           <h2 id="cancel-title">Скасувати процес?</h2>
-          <p>Завантаження або конвертація зупиниться. Після підтвердження це вікно одразу закриється.</p>
+          <p id="cancel-description">Завантаження або конвертація зупиниться. Після підтвердження це вікно одразу закриється.</p>
           {cancelError && <div className="modal-detail cancel-error">{cancelError}</div>}
           <div className="modal-actions"><button className="secondary-button" disabled={cancelBusy} onClick={() => setCancelConfirmOpen(false)}>Продовжити</button><button className="cancel-confirm-button" disabled={cancelBusy} onClick={cancelJob}>{cancelBusy ? "Зупиняємо…" : "Так, скасувати"}</button></div>
-        </div>
+        </DialogSurface>
       </div>}
 
       {update && updatePromptOpen && !startupBusy && !active && !queueBusy && <div className="modal-backdrop update-modal-backdrop" role="presentation">
-        <div className="modal update-modal" role="dialog" aria-modal="true" aria-labelledby="update-title">
+        <DialogSurface className="modal update-modal" labelledBy="update-title" describedBy="update-description" onEscape={!updateBusy ? () => setUpdatePromptOpen(false) : undefined}>
           <div className="modal-icon update"><Icon name="refresh" size={30}/></div>
           <p className="eyebrow">ДОСТУПНЕ ОНОВЛЕННЯ</p>
           <h2 id="update-title">Нова версія {update.version}</h2>
-          <p>Зараз встановлена версія <strong>{update.currentVersion}</strong>. Оновлення завантажиться, встановиться й автоматично перезапустить застосунок.</p>
+          <p id="update-description">Зараз встановлена версія <strong>{update.currentVersion}</strong>. Оновлення завантажиться, встановиться й автоматично перезапустить застосунок.</p>
           {update.body && <UpdateReleaseNotes notes={update.body}/>}
           {updateBusy && <div className="update-download-progress" role="progressbar" aria-label="Завантаження оновлення" aria-valuemin={0} aria-valuemax={100} aria-valuenow={updateProgress}><span style={{ width: `${Math.max(2, updateProgress)}%` }}/></div>}
           {updateInstallError && <div className="modal-detail cancel-error">{updateInstallError}</div>}
           <div className="modal-actions"><button className="secondary-button" disabled={updateBusy} onClick={() => setUpdatePromptOpen(false)}>Пізніше</button><button className="update-install-button" disabled={updateBusy} onClick={installAppUpdate}>{updateBusy ? `Оновлюємо ${updateProgress}%` : "Оновити зараз"}</button></div>
-        </div>
+        </DialogSurface>
       </div>}
 
       {vpnWarning && <div className="modal-backdrop" role="presentation">
-        <div className="modal" role="dialog" aria-modal="true" aria-labelledby="vpn-title">
+        <DialogSurface className="modal" labelledBy="vpn-title" describedBy="vpn-description" onEscape={dismissVpnWarning}>
           <div className="modal-icon"><Icon name="shield" size={29}/></div>
           <p className="eyebrow">ПЕРЕВІРКА БЕЗПЕКИ</p>
           <h2 id="vpn-title">VPN не виявлено</h2>
-          <p>Ви збираєтесь завантажити матеріал із <strong>{vpnWarning.host}</strong>. Не вдалося підтвердити, що VPN увімкнений.</p>
+          <p id="vpn-description">Ви збираєтесь завантажити матеріал із <strong>{vpnWarning.host}</strong>. Не вдалося підтвердити, що VPN увімкнений.</p>
           <div className="modal-detail">{vpnWarning.status.detail}</div>
           <div className="modal-actions"><button className="secondary-button" onClick={dismissVpnWarning}>Скасувати</button><button className="warning-button" onClick={approveVpnWarning}>Продовжити без VPN</button></div>
-        </div>
+        </DialogSurface>
       </div>}
 
       {job?.status === "auth_required" && <div className="modal-backdrop" role="presentation">
-        <div className="modal" role="dialog" aria-modal="true" aria-labelledby="auth-title">
+        <DialogSurface className="modal" labelledBy="auth-title" describedBy="auth-description" onEscape={() => setJob(null)}>
           <div className="modal-icon auth"><Icon name="link" size={28}/></div>
           <p className="eyebrow">ПОТРІБНА АВТОРИЗАЦІЯ</p>
           <h2 id="auth-title">Увійдіть через браузер</h2>
-          <p>Сайт просить підтвердити вік, акаунт або що ви не бот. Увійдіть на цей сайт у браузері та виберіть його нижче.</p>
+          <p id="auth-description">Сайт просить підтвердити вік, акаунт або що ви не бот. Увійдіть на цей сайт у браузері та виберіть його нижче.</p>
           <label className="browser-picker">Ваш браузер<select value={cookieBrowser} onChange={(event) => setCookieBrowser(event.target.value)}>{!isWindows && <option value="safari">Safari</option>}<option value="edge">Microsoft Edge</option><option value="chrome">Google Chrome</option><option value="firefox">Firefox</option><option value="brave">Brave</option><option value="vivaldi">Vivaldi</option></select></label>
           <div className="modal-detail">yt-dlp прочитає cookies безпосередньо з обраного браузера лише для повторної спроби. yt-dlp BD не експортує їх у файл і не зберігає.</div>
           <div className="modal-actions"><button className="secondary-button" onClick={() => setJob(null)}>Скасувати</button><button className="warning-button auth" disabled={pendingStart} onClick={retryWithCookies}>{pendingStart ? "Перевіряємо…" : "Повторити з cookies"}</button></div>
-        </div>
+        </DialogSurface>
       </div>}
 
-      {queueAlert && <div className="modal-backdrop queue-alert-backdrop" role="presentation">
-        <div className="modal" role="dialog" aria-modal="true" aria-labelledby="queue-alert-title">
-          <div className="modal-icon auth"><Icon name="list" size={28}/></div>
-          <p className="eyebrow">ПАКЕТНЕ ЗАВАНТАЖЕННЯ</p>
-          <h2 id="queue-alert-title">{queueAlert.title}</h2>
-          <p>{queueAlert.message}</p>
-          <div className="modal-actions"><button className="secondary-button" onClick={() => setQueueAlert(null)}>Закрити</button><button className="update-install-button" onClick={() => { setQueueAlert(null); setActiveView("queue"); }}>Відкрити список</button></div>
-        </div>
-      </div>}
     </div>
   );
 }
@@ -2054,7 +2167,7 @@ function queueStorageLabel(item: QueueItem): string | null {
   return `${available} · потрібно до ${formatByteSize(item.storage.requiredSpace)}`;
 }
 
-function QueueView({ queue, input, notice, runtimeReady, singleDownloadActive, isWindows, onInput, onPaste, onAdd, onChangeItem, onRemoveItem, onSettings, onChooseFolder, onStart, onPause, onResume, onSkip, onStop, onRetry, onNew }: {
+function QueueView({ queue, input, notice, runtimeReady, singleDownloadActive, isWindows, onInput, onPaste, onAdd, onChangeItem, onRemoveItem, onSettings, onChooseFolder, onStart, onPause, onResume, onSkip, onStop, onRetry, onReplay, onNew }: {
   queue: DownloadQueue | null;
   input: string;
   notice: string;
@@ -2074,6 +2187,7 @@ function QueueView({ queue, input, notice, runtimeReady, singleDownloadActive, i
   onSkip: () => void;
   onStop: () => void;
   onRetry: () => void;
+  onReplay: () => void;
   onNew: () => void;
 }) {
   const progress = queueProgress(queue?.items || []);
@@ -2129,6 +2243,7 @@ function QueueView({ queue, input, notice, runtimeReady, singleDownloadActive, i
           {item.id === activeItem?.id && <div className={`queue-item-progress ${item.status === "postprocessing" ? "indeterminate" : ""}`}><span style={item.status === "postprocessing" ? undefined : { width: `${item.percent}%` }}/></div>}
         </div>
         {item.status === "completed" ? <span className="queue-item-result">{formatByteSize(item.finalSize)}<Icon name="check" size={16}/></span>
+          : item.finalSize > 0 ? <span className={`queue-item-result partial ${item.status}`}>{formatByteSize(item.finalSize)}<small>{queueStatusLabel(item)}</small></span>
           : itemEditable ? <button className="queue-remove" aria-label={`Видалити рядок ${index + 1}`} onClick={() => onRemoveItem(item.id)}><Icon name="x" size={16}/></button>
             : <span className={`queue-state ${item.status}`}>{queueStatusLabel(item)}</span>}
       </article>})}
@@ -2147,12 +2262,70 @@ function QueueView({ queue, input, notice, runtimeReady, singleDownloadActive, i
 
     {notice && <div className="inline-error queue-notice">{notice}</div>}
     <div className="queue-actions">
-      {(!queue || queue.status === "draft") && <button className="primary-button" disabled={!queue?.items.length || !runtimeReady || singleDownloadActive} onClick={onStart}><Icon name="download"/>Почати пакетне завантаження</button>}
+      {(!queue || queue.status === "draft") && <button className="primary-button" disabled={(!queue?.items.length && !input.trim()) || !runtimeReady || singleDownloadActive} onClick={onStart}><Icon name="download"/>Почати пакетне завантаження</button>}
       {queue?.status === "running" && <><button className="secondary-button" onClick={onPause}>Пауза після поточного</button><button className="secondary-button" disabled={!activeItem} onClick={onSkip}>Пропустити поточне</button><button className="cancel-confirm-button" onClick={onStop}>Зупинити все</button></>}
-      {queue?.status === "paused" && <><button className="primary-button compact" disabled={singleDownloadActive || Boolean(activeItem)} onClick={onResume}><Icon name="download"/>{activeItem ? "Завершуємо поточний файл…" : "Продовжити"}</button>{activeItem && <button className="secondary-button" onClick={onSkip}>Пропустити поточне</button>}<button className="secondary-button" disabled={Boolean(activeItem)} onClick={onNew}>Нова черга</button></>}
-      {queue?.status === "completed" && <>{failedCount > 0 && <button className="primary-button compact" onClick={onRetry}><Icon name="refresh"/>Спробувати проблемні ще раз ({failedCount})</button>}<button className="secondary-button" onClick={onNew}>Нова черга</button></>}
+      {queue?.status === "paused" && <><button className="primary-button compact" disabled={singleDownloadActive || Boolean(activeItem)} onClick={onResume}><Icon name="download"/>{activeItem ? "Завершуємо поточний файл…" : "Продовжити"}</button>{activeItem && <button className="secondary-button" onClick={onSkip}>Пропустити поточне</button>}<button className="queue-new-button" disabled={Boolean(activeItem)} onClick={onNew}>Нова черга</button></>}
+      {queue?.status === "completed" && <>{failedCount > 0 && <button className="secondary-button" onClick={onRetry}>Спробувати проблемні ({failedCount})</button>}<button className="primary-button compact" onClick={onReplay}><Icon name="refresh"/>Повторити чергу</button><button className="queue-new-button" onClick={onNew}>Нова черга</button></>}
     </div>
   </section>;
+}
+
+function QueueProgressModal({ queue, alert, singleDownloadActive, onClose, onPause, onResume, onSkip, onStop, onRetry, onReplay, onNew }: {
+  queue: DownloadQueue;
+  alert: { title: string; message: string } | null;
+  singleDownloadActive: boolean;
+  onClose: () => void;
+  onPause: () => void;
+  onResume: () => void;
+  onSkip: () => void;
+  onStop: () => void;
+  onRetry: () => void;
+  onReplay: () => void;
+  onNew: () => void;
+}) {
+  const progress = queueProgress(queue.items);
+  const activeItem = queue.items.find((item) => item.id === queue.activeItemId) || null;
+  const failedCount = queue.items.filter((item) => item.status === "failed" || item.status === "interrupted").length;
+  const skippedCount = queue.items.filter((item) => item.status === "skipped").length;
+  const statusTitle = queue.status === "running"
+    ? activeItem ? "Завантажуємо чергу" : "Готуємо наступне посилання"
+    : queue.status === "paused" ? "Чергу призупинено" : "Чергу оброблено";
+
+  return <div className="download-progress-backdrop queue-progress-backdrop" role="presentation">
+    <DialogSurface className={`queue-progress-modal ${queue.status}`} labelledBy="queue-progress-title" onEscape={onClose}>
+      <header className="queue-progress-header">
+        <div className="queue-progress-symbol"><Icon name={queue.status === "completed" ? "check" : "list"} size={24}/></div>
+        <div>
+          <p className="eyebrow">ПАКЕТНЕ ЗАВАНТАЖЕННЯ</p>
+          <h2 id="queue-progress-title">{statusTitle}</h2>
+          <p>{progress.done} із {progress.total} оброблено{failedCount ? ` · проблемних ${failedCount}` : ""}{skippedCount ? ` · пропущено ${skippedCount}` : ""}</p>
+        </div>
+        <strong className="queue-progress-value">{progress.percent}%</strong>
+        <button type="button" className="queue-progress-close" aria-label="Згорнути стан черги" title="Згорнути" onClick={onClose}><Icon name="x" size={18}/></button>
+      </header>
+      <div className="queue-modal-progress" role="progressbar" aria-label="Загальний прогрес черги" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress.percent}><span style={{ width: `${progress.percent}%` }}/></div>
+      {alert && <div className="queue-progress-alert"><Icon name={queue.status === "completed" ? "check" : "shield"} size={18}/><span><strong>{alert.title}</strong><small>{alert.message}</small></span></div>}
+      <div className="queue-progress-list">
+        {queue.items.map((item, index) => {
+          const active = item.id === activeItem?.id;
+          return <article className={`queue-progress-row ${item.status} ${active ? "active" : ""}`} key={item.id}>
+            <span className="queue-progress-index">{String(index + 1).padStart(2, "0")}</span>
+            <div className="queue-progress-copy">
+              <strong title={item.title || item.url}>{item.title || item.url}</strong>
+              <small>{queueStatusLabel(item)}{item.message && item.message !== queueStatusLabel(item) ? ` · ${item.message}` : ""}</small>
+              {active && <div className={`queue-item-progress ${item.status === "postprocessing" ? "indeterminate" : ""}`}><span style={item.status === "postprocessing" ? undefined : { width: `${item.percent}%` }}/></div>}
+            </div>
+            <span className={`queue-progress-status ${item.status}`}>{item.finalSize > 0 ? <>{formatByteSize(item.finalSize)}{item.status !== "completed" && <small>{queueStatusLabel(item)}</small>}</> : ["downloading", "converting"].includes(item.status) ? `${Math.round(item.percent)}%` : queueStatusLabel(item)}</span>
+          </article>;
+        })}
+      </div>
+      <footer className="queue-modal-actions">
+        {queue.status === "running" && <><button className="secondary-button" onClick={onPause}>Пауза після поточного</button><button className="secondary-button" disabled={!activeItem} onClick={onSkip}>Пропустити поточне</button><button className="cancel-confirm-button" onClick={onStop}>Зупинити все</button></>}
+        {queue.status === "paused" && <><button className="primary-button compact" disabled={singleDownloadActive || Boolean(activeItem)} onClick={onResume}><Icon name="download"/>{activeItem ? "Завершуємо поточний файл…" : "Продовжити"}</button>{activeItem && <button className="secondary-button" onClick={onSkip}>Пропустити поточне</button>}<button className="queue-new-button" disabled={Boolean(activeItem)} onClick={onNew}>Нова черга</button></>}
+        {queue.status === "completed" && <>{failedCount > 0 && <button className="secondary-button" onClick={onRetry}>Проблемні ще раз ({failedCount})</button>}<button className="primary-button compact" onClick={onReplay}><Icon name="refresh"/>Повторити чергу</button><button className="queue-new-button" onClick={onNew}>Нова черга</button></>}
+      </footer>
+    </DialogSurface>
+  </div>;
 }
 
 function HistoryThumbnail({ entry }: { entry: HistoryEntry }) {
@@ -2279,12 +2452,12 @@ function RuntimePreparationOverlay({ stage, runtime, progress }: { stage: Runtim
     { key: "deno", label: "Deno", component: runtime?.deno },
   ] as const;
 
-  return <div className="runtime-preparation-backdrop" role="dialog" aria-modal="true" aria-labelledby="runtime-preparation-title" aria-describedby="runtime-preparation-description">
-    <div className="runtime-preparation-modal">
+  return <div className="runtime-preparation-backdrop" role="presentation">
+    <DialogSurface className="runtime-preparation-modal" labelledBy="runtime-preparation-title" describedBy="runtime-preparation-description">
       <div className="runtime-preparation-spinner" aria-hidden="true"><span/></div>
       <p className="eyebrow">ПІДГОТОВКА ДО РОБОТИ</p>
       <h2 id="runtime-preparation-title">Готуємо компоненти</h2>
-      <p id="runtime-preparation-description">Встановлюємо відсутні компоненти, необхідні для завантаження.</p>
+      <p id="runtime-preparation-description">Перевіряємо та за потреби оновлюємо компоненти, необхідні для завантаження.</p>
       <div className="runtime-preparation-list" aria-label="Стан компонентів">
         {components.map(({ key, label, component }) => {
           const activeStage = stage === key;
@@ -2297,7 +2470,7 @@ function RuntimePreparationOverlay({ stage, runtime, progress }: { stage: Runtim
         })}
       </div>
       <p className="runtime-wait-note">Будь ласка, зачекайте й не закривайте застосунок. Завантаження стане доступним автоматично.</p>
-    </div>
+    </DialogSurface>
   </div>;
 }
 

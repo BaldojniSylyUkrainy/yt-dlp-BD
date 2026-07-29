@@ -5,7 +5,7 @@ use std::{
     ffi::OsString,
     fs,
     io::{BufRead, BufReader, Read},
-    net::ToSocketAddrs,
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
@@ -224,6 +224,23 @@ struct HistoryThumbnailCache {
     operation: tokio::sync::Mutex<()>,
 }
 
+#[derive(Default)]
+struct RuntimeMaintenance {
+    operation: tokio::sync::Mutex<()>,
+}
+
+fn ensure_runtime_idle(manager: &DownloadManager) -> Result<(), String> {
+    let active = manager
+        .jobs
+        .lock()
+        .map_err(|_| "Не вдалося перевірити активні завантаження".to_string())?;
+    if active.is_empty() {
+        Ok(())
+    } else {
+        Err("Компоненти оновляться після завершення активного завантаження".into())
+    }
+}
+
 fn runtime_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let directory = app
         .path()
@@ -413,6 +430,72 @@ fn download_client() -> Result<reqwest::Client, String> {
         .map_err(|error| format!("Не вдалося підготувати завантаження: {error}"))
 }
 
+fn is_public_thumbnail_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, c, _] = ip.octets();
+            !(ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_multicast()
+                || ip.is_broadcast()
+                || ip.is_unspecified()
+                || a == 0
+                || a >= 240
+                || (a == 100 && (64..=127).contains(&b))
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 192 && b == 0 && c == 2)
+                || (a == 198 && (b == 18 || b == 19))
+                || (a == 198 && b == 51 && c == 100)
+                || (a == 203 && b == 0 && c == 113))
+        }
+        IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return is_public_thumbnail_ip(IpAddr::V4(mapped));
+            }
+            !(ip.is_loopback()
+                || ip.is_multicast()
+                || ip.is_unspecified()
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80
+                || (segments[0] & 0xffc0) == 0xfec0
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8))
+        }
+    }
+}
+
+async fn public_thumbnail_client(url: &Url) -> Result<reqwest::Client, String> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| "Посилання на прев’ю не містить адреси сервера".to_string())?
+        .to_string();
+    let port = url.port_or_known_default().unwrap_or(443);
+    let lookup_host = host.clone();
+    let addresses = tauri::async_runtime::spawn_blocking(move || {
+        (lookup_host.as_str(), port)
+            .to_socket_addrs()
+            .map(|addresses| addresses.collect::<Vec<SocketAddr>>())
+    })
+    .await
+    .map_err(|error| format!("Не вдалося перевірити адресу прев’ю: {error}"))?
+    .map_err(|error| format!("Не вдалося знайти сервер прев’ю: {error}"))?;
+    if addresses.is_empty()
+        || addresses
+            .iter()
+            .any(|address| !is_public_thumbnail_ip(address.ip()))
+    {
+        return Err("Прев’ю вказує на локальну або службову мережеву адресу".into());
+    }
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(20))
+        .resolve_to_addrs(&host, &addresses)
+        .build()
+        .map_err(|error| format!("Не вдалося підготувати безпечне завантаження прев’ю: {error}"))
+}
+
 async fn fetch_to_file(
     app: &AppHandle,
     client: &reqwest::Client,
@@ -487,6 +570,31 @@ fn verify_sha256_file_expected(path: &Path, expected: &str, label: &str) -> Resu
 fn verify_sha256_file(path: &Path, checksum_file: &[u8], label: &str) -> Result<(), String> {
     let expected = checksum_value(checksum_file, label)?;
     verify_sha256_file_expected(path, &expected, label)
+}
+
+fn replace_runtime_file(temporary: &Path, destination: &Path, label: &str) -> Result<(), String> {
+    if !destination.exists() {
+        return fs::rename(temporary, destination)
+            .map_err(|error| format!("Не вдалося встановити {label}: {error}"));
+    }
+    let backup = destination.with_extension(format!("previous-{}", Uuid::new_v4()));
+    fs::rename(destination, &backup)
+        .map_err(|error| format!("Не вдалося підготувати заміну {label}: {error}"))?;
+    match fs::rename(temporary, destination) {
+        Ok(()) => {
+            let _ = fs::remove_file(backup);
+            Ok(())
+        }
+        Err(error) => {
+            let restore = fs::rename(&backup, destination);
+            if let Err(restore_error) = restore {
+                return Err(format!(
+                    "Не вдалося встановити {label}: {error}. Також не вдалося відновити попередню версію: {restore_error}"
+                ));
+            }
+            Err(format!("Не вдалося встановити {label}: {error}"))
+        }
+    }
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -580,16 +688,10 @@ fn extract_binary_from_file(
         fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755))
             .map_err(|error| format!("Не вдалося дозволити запуск {binary_name}: {error}"))?;
     }
-    if destination.exists() {
-        fs::remove_file(destination)
-            .map_err(|error| format!("Не вдалося замінити старий {binary_name}: {error}"))?;
-    }
-    fs::rename(&temporary, destination)
-        .map_err(|error| format!("Не вдалося встановити {binary_name}: {error}"))
+    replace_runtime_file(&temporary, destination, binary_name)
 }
 
-#[tauri::command]
-async fn install_ffmpeg(app: AppHandle) -> Result<(), String> {
+async fn install_ffmpeg_inner(app: AppHandle) -> Result<(), String> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         const RELEASES_PAGE: &str = "https://ffmpeg.martin-riedl.de/";
@@ -707,7 +809,17 @@ async fn install_ffmpeg(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn install_deno(app: AppHandle) -> Result<(), String> {
+async fn install_ffmpeg(
+    app: AppHandle,
+    maintenance: State<'_, RuntimeMaintenance>,
+    manager: State<'_, DownloadManager>,
+) -> Result<(), String> {
+    let _operation = maintenance.operation.lock().await;
+    ensure_runtime_idle(manager.inner())?;
+    install_ffmpeg_inner(app).await
+}
+
+async fn install_deno_inner(app: AppHandle) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let asset_name = if cfg!(target_arch = "aarch64") {
         "deno-aarch64-apple-darwin.zip"
@@ -761,7 +873,17 @@ async fn install_deno(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn install_ytdlp(app: AppHandle) -> Result<(), String> {
+async fn install_deno(
+    app: AppHandle,
+    maintenance: State<'_, RuntimeMaintenance>,
+    manager: State<'_, DownloadManager>,
+) -> Result<(), String> {
+    let _operation = maintenance.operation.lock().await;
+    ensure_runtime_idle(manager.inner())?;
+    install_deno_inner(app).await
+}
+
+async fn install_ytdlp_inner(app: AppHandle) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let asset_name = "yt-dlp_macos";
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -822,12 +944,7 @@ async fn install_ytdlp(app: AppHandle) -> Result<(), String> {
             .map_err(|error| format!("Не вдалося дозволити запуск yt-dlp: {error}"))?;
     }
 
-    if destination.exists() {
-        fs::remove_file(&destination)
-            .map_err(|error| format!("Не вдалося замінити старий yt-dlp: {error}"))?;
-    }
-    fs::rename(&temporary, &destination)
-        .map_err(|error| format!("Не вдалося завершити встановлення yt-dlp: {error}"))?;
+    replace_runtime_file(&temporary, &destination, "yt-dlp")?;
     if let Some(version) = release_version {
         let _ = fs::write(version_stamp, version);
     }
@@ -836,8 +953,25 @@ async fn install_ytdlp(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn update_ytdlp(app: AppHandle) -> Result<(), String> {
-    let result = install_ytdlp(app).await;
+async fn install_ytdlp(
+    app: AppHandle,
+    maintenance: State<'_, RuntimeMaintenance>,
+    manager: State<'_, DownloadManager>,
+) -> Result<(), String> {
+    let _operation = maintenance.operation.lock().await;
+    ensure_runtime_idle(manager.inner())?;
+    install_ytdlp_inner(app).await
+}
+
+#[tauri::command]
+async fn update_ytdlp(
+    app: AppHandle,
+    maintenance: State<'_, RuntimeMaintenance>,
+    manager: State<'_, DownloadManager>,
+) -> Result<(), String> {
+    let _operation = maintenance.operation.lock().await;
+    ensure_runtime_idle(manager.inner())?;
+    let result = install_ytdlp_inner(app).await;
     if let Err(error) = &result {
         eprintln!("Не вдалося оновити yt-dlp: {error}");
     }
@@ -917,6 +1051,25 @@ fn friendly_download_error(message: &str) -> String {
             .into()
     } else {
         "Не вдалося прочитати це посилання. Перевірте його та спробуйте ще раз.".into()
+    }
+}
+
+fn friendly_conversion_error(message: &str) -> String {
+    let value = message.to_ascii_lowercase();
+    if value.contains("недостатньо вільного місця") || value.contains("no space left")
+    {
+        "Недостатньо вільного місця. Готові файли збережено, решту обробки зупинено.".into()
+    } else if value.contains("скасовано") {
+        "Обробку скасовано. Уже готові файли залишилися у вибраній папці.".into()
+    } else if value.contains("ffprobe") || value.contains("invalid data found") {
+        "Завантажений медіафайл пошкоджений або має формат, який не вдалося прочитати. Уже готові файли збережено.".into()
+    } else if value.contains("encoder")
+        || value.contains("videotoolbox")
+        || value.contains("libx264")
+    {
+        "Не вдалося запустити відеокодування. Уже готові файли збережено; спробуйте повторити проблемний матеріал.".into()
+    } else {
+        "Не вдалося завершити конвертацію одного з файлів. Уже готові результати збережено у вибраній папці.".into()
     }
 }
 
@@ -2470,15 +2623,38 @@ async fn cache_history_thumbnail(
         }
     }
 
-    let client = download_client()?;
-    let mut response = client
-        .get(parsed)
-        .header("User-Agent", "yt-dlp-desktop")
-        .send()
-        .await
-        .map_err(|error| format!("Не вдалося завантажити прев’ю: {error}"))?
-        .error_for_status()
-        .map_err(|error| format!("Сервер прев’ю повернув помилку: {error}"))?;
+    let mut current = parsed;
+    let mut redirect_count = 0_u8;
+    let mut response = loop {
+        let client = public_thumbnail_client(&current).await?;
+        let response = client
+            .get(current.clone())
+            .header("User-Agent", "yt-dlp-desktop")
+            .send()
+            .await
+            .map_err(|error| format!("Не вдалося завантажити прев’ю: {error}"))?;
+        if response.status().is_redirection() {
+            if redirect_count >= 10 {
+                return Err("Сервер прев’ю виконав забагато перенаправлень".into());
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| "Сервер прев’ю повернув некоректне перенаправлення".to_string())?;
+            current = current
+                .join(location)
+                .map_err(|_| "Сервер прев’ю повернув некоректну нову адресу".to_string())?;
+            if !matches!(current.scheme(), "http" | "https") || current.host_str().is_none() {
+                return Err("Перенаправлення прев’ю використовує непідтримувану адресу".into());
+            }
+            redirect_count += 1;
+            continue;
+        }
+        break response
+            .error_for_status()
+            .map_err(|error| format!("Сервер прев’ю повернув помилку: {error}"))?;
+    };
     if response
         .content_length()
         .is_some_and(|size| size > MAX_HISTORY_THUMBNAIL_BYTES)
@@ -2561,8 +2737,13 @@ async fn delete_history_thumbnail(
 fn start_download(
     app: AppHandle,
     manager: State<'_, DownloadManager>,
+    maintenance: State<'_, RuntimeMaintenance>,
     request: DownloadRequest,
 ) -> Result<(), String> {
+    let _maintenance_available = maintenance
+        .operation
+        .try_lock()
+        .map_err(|_| "Компоненти зараз оновлюються. Зачекайте завершення перевірки".to_string())?;
     let id = Uuid::parse_str(&request.id)
         .map_err(|_| "Некоректний ідентифікатор завантаження".to_string())?
         .to_string();
@@ -2867,18 +3048,18 @@ fn start_download(
                     .unwrap_or(false);
                 let mut conversion_error = None;
                 let mut completed_outputs = Vec::new();
-                if status.success() && !cancelled {
+                if !cancelled && !low_disk && !auth_required {
                     let files = downloaded_files
                         .lock()
                         .ok()
                         .map(|files| files.clone())
                         .unwrap_or_default();
-                    if files.is_empty() {
+                    if files.is_empty() && status.success() {
                         conversion_error = Some(
                             "yt-dlp завершився, але не повідомив шлях до завантаженого файла"
                                 .into(),
                         );
-                    } else {
+                    } else if !files.is_empty() {
                         for (index, file) in files.iter().enumerate() {
                             match convert_downloaded_media(
                                 &monitor_app,
@@ -2899,8 +3080,13 @@ fn start_download(
                                     });
                                 }
                                 Err(error) => {
-                                    conversion_error = Some(error);
-                                    break;
+                                    eprintln!(
+                                        "Не вдалося конвертувати {}: {error}",
+                                        file.display()
+                                    );
+                                    if conversion_error.is_none() {
+                                        conversion_error = Some(error);
+                                    }
                                 }
                             }
                         }
@@ -2937,7 +3123,9 @@ fn start_download(
                         .then(|| last_error.lock().ok().and_then(|error| error.clone()))
                         .flatten()
                 });
-                let message = if conversion_error.is_some() || low_disk {
+                let message = if conversion_error.is_some() {
+                    raw_error.as_deref().map(friendly_conversion_error)
+                } else if low_disk {
                     raw_error.clone()
                 } else {
                     raw_error.as_deref().map(friendly_download_error)
@@ -2958,7 +3146,7 @@ fn start_download(
                         eta: None,
                         message,
                         storage: None,
-                        outputs: (kind == "completed").then_some(completed_outputs),
+                        outputs: (!completed_outputs.is_empty()).then_some(completed_outputs),
                         title: None,
                         thumbnail: None,
                         uploader: None,
@@ -3137,6 +3325,7 @@ pub fn run() {
         .manage(DownloadManager::default())
         .manage(ProbeManager::default())
         .manage(HistoryThumbnailCache::default())
+        .manage(RuntimeMaintenance::default())
         .manage(SleepPrevention::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -3267,6 +3456,30 @@ mod tests {
     }
 
     #[test]
+    fn thumbnail_cache_rejects_private_and_special_network_addresses() {
+        for address in [
+            "127.0.0.1",
+            "10.0.0.4",
+            "169.254.1.1",
+            "192.168.1.4",
+            "100.64.0.1",
+            "::1",
+            "fe80::1",
+            "fd00::1",
+            "2001:db8::1",
+        ] {
+            assert!(
+                !is_public_thumbnail_ip(address.parse().unwrap()),
+                "{address}"
+            );
+        }
+        assert!(is_public_thumbnail_ip("1.1.1.1".parse().unwrap()));
+        assert!(is_public_thumbnail_ip(
+            "2606:4700:4700::1111".parse().unwrap()
+        ));
+    }
+
+    #[test]
     fn playlist_estimate_scales_only_sample_duration() {
         assert_eq!(scale_playlist_estimate(Some(100), 12, false), Some(1200));
         assert_eq!(scale_playlist_estimate(Some(1200), 12, true), Some(1200));
@@ -3354,6 +3567,11 @@ mod tests {
         );
         assert!(friendly_download_error("HTTP Error 403: Forbidden").contains("відхилив"));
         assert!(friendly_download_error("No space left on device").contains("вільного місця"));
+        let conversion = friendly_conversion_error(
+            "/Users/name/Downloads/private.mkv: Invalid data found when processing input",
+        );
+        assert!(conversion.contains("пошкоджений"));
+        assert!(!conversion.contains("/Users/name"));
     }
 
     #[test]

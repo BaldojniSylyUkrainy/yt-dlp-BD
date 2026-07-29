@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   appendQueueUrls,
   canEditQueueItem,
+  commitQueueInput,
   createQueueItem,
   nextPendingQueueItem,
   normalizeHttpUrl,
@@ -10,6 +11,7 @@ import {
   queueProgress,
   queueHasActiveProcess,
   queuePreventsOtherWork,
+  resetEntireQueueForReplay,
   resetQueueItemsForRetry,
   type QueueSettings,
 } from "./queue";
@@ -37,6 +39,18 @@ describe("batch queue input", () => {
     expect(result.items).toHaveLength(QUEUE_LIMIT);
     expect(result.rejected).toBe(3);
   });
+
+  it("commits the still-focused URL before the same Start action selects work", () => {
+    const committed = commitQueueInput(
+      null,
+      settings,
+      "https://example.org/first",
+      "2026-07-29T00:00:00.000Z",
+      () => "first",
+    );
+    expect(committed.queue?.items).toHaveLength(1);
+    expect(nextPendingQueueItem(committed.queue?.items || [])?.url).toBe("https://example.org/first");
+  });
 });
 
 describe("batch queue lifecycle", () => {
@@ -48,6 +62,12 @@ describe("batch queue lifecycle", () => {
     expect(nextPendingQueueItem([completed, failed, pending])?.id).toBe("three");
   });
 
+  it("includes the active row in the overall queue percentage", () => {
+    const completed = { ...createQueueItem("https://one.example", "one"), status: "completed" as const, percent: 100 };
+    const active = { ...createQueueItem("https://two.example", "two"), status: "downloading" as const, percent: 50 };
+    expect(queueProgress([completed, active])).toEqual({ done: 1, total: 2, percent: 75 });
+  });
+
   it("rebuilds only failed and interrupted rows for retry", () => {
     const completed = { ...createQueueItem("https://one.example", "one"), status: "completed" as const };
     const failed = { ...createQueueItem("https://two.example", "two"), status: "failed" as const, attempt: 2 };
@@ -56,6 +76,16 @@ describe("batch queue lifecycle", () => {
     expect(retry.map((item) => item.id)).toEqual(["two", "three"]);
     expect(retry.every((item) => item.status === "pending")).toBe(true);
     expect(retry[0].attempt).toBe(2);
+  });
+
+  it("rebuilds every row when the user repeats the whole queue", () => {
+    const completed = { ...createQueueItem("https://one.example", "one"), status: "completed" as const, finalSize: 42 };
+    const failed = { ...createQueueItem("https://two.example", "two"), status: "failed" as const, attempt: 2 };
+    const skipped = { ...createQueueItem("https://three.example", "three"), status: "skipped" as const };
+    const replay = resetEntireQueueForReplay([completed, failed, skipped]);
+    expect(replay.map((item) => item.id)).toEqual(["one", "two", "three"]);
+    expect(replay.every((item) => item.status === "pending" && item.finalSize === 0)).toBe(true);
+    expect(replay[1].attempt).toBe(2);
   });
 
   it("restores an active queue as paused and marks its active row interrupted", () => {
