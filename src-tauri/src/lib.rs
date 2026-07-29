@@ -706,11 +706,20 @@ fn macos_ffmpeg_release_asset(page: &str, filename: &str) -> Result<String, Stri
 fn checksum_value(checksum_file: &[u8], label: &str) -> Result<String, String> {
     let checksum = String::from_utf8(checksum_file.to_vec())
         .map_err(|_| format!("Контрольна сума {label} має неправильний формат"))?;
-    let expected = checksum
+    let mut candidates = checksum
         .split_whitespace()
+        .filter(|candidate| {
+            candidate.len() == 64 && candidate.chars().all(|value| value.is_ascii_hexdigit())
+        })
+        .map(str::to_ascii_lowercase);
+    let expected = candidates
         .next()
-        .ok_or_else(|| format!("Контрольна сума {label} порожня"))?
-        .to_ascii_lowercase();
+        .ok_or_else(|| format!("Контрольна сума {label} не містить SHA-256"))?;
+    if candidates.any(|candidate| candidate != expected) {
+        return Err(format!(
+            "Контрольна сума {label} містить кілька різних SHA-256"
+        ));
+    }
     Ok(expected)
 }
 
@@ -3499,6 +3508,27 @@ mod tests {
             "bbbbbbbb"
         );
         assert!(checksum_for_asset(checksums, "missing.zip").is_err());
+    }
+
+    #[test]
+    fn parses_gnu_and_windows_powershell_sha256_files() {
+        let expected = "68ed08b05c56cf887e9aa509947dc3f468f7e12f47a13e5c1abd51d46d1453ef";
+        let gnu = format!("{expected}  deno-x86_64-pc-windows-msvc.zip\n");
+        let powershell = format!(
+            "\r\nAlgorithm : SHA256\r\nHash      : {}\r\nPath      : C:\\a\\deno\\deno-x86_64-pc-windows-msvc.zip\r\n",
+            expected.to_ascii_uppercase()
+        );
+
+        assert_eq!(checksum_value(gnu.as_bytes(), "Deno").unwrap(), expected);
+        assert_eq!(
+            checksum_value(powershell.as_bytes(), "Deno").unwrap(),
+            expected
+        );
+        assert!(checksum_value(b"Algorithm : SHA256", "Deno").is_err());
+        let ambiguous = format!(
+            "{expected}\nffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n"
+        );
+        assert!(checksum_value(ambiguous.as_bytes(), "Deno").is_err());
     }
 
     #[test]

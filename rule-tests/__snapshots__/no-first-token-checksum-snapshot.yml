@@ -1,0 +1,9 @@
+id: no-first-token-checksum
+snapshots:
+  ? |
+    let expected = checksum.split_whitespace().next();
+  : labels:
+    - source: checksum.split_whitespace().next()
+      style: primary
+      start: 15
+      end: 49

@@ -23,7 +23,7 @@ test("uses the public product name and version for GitHub Release titles", async
   const workflow = await readFile(".github/workflows/release.yml", "utf8");
   const expectedTitle = '--title "BaldojnyiDownloader $RELEASE_VERSION"';
   assert.equal(workflow.match(new RegExp(expectedTitle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"))?.length, 2);
-  assert.match(workflow, /description: "Four-part release tag from package\.json, for example vX\.Y\.Z\.0"/);
+  assert.match(workflow, /description: "Four-part release tag from package\.json, for example vX\.Y\.Z\.H"/);
 });
 
 test("grants repository write access only to the final draft-release job", async () => {
@@ -43,7 +43,14 @@ test("keeps every current project and public release version in sync", async () 
   const internalVersionPattern = packageJson.version.replaceAll(".", "\\.");
   const publicVersionPattern = packageJson.releaseVersion.replaceAll(".", "\\.");
 
-  assert.equal(packageJson.releaseVersion, `${packageJson.version}.0`);
+  const internalParts = packageJson.version.split(".").map(Number);
+  const publicParts = packageJson.releaseVersion.split(".").map(Number);
+  assert.equal(internalParts.length, 3);
+  assert.equal(publicParts.length, 4);
+  assert.ok(internalParts.every(Number.isSafeInteger));
+  assert.ok(publicParts.every(Number.isSafeInteger));
+  assert.deepEqual(publicParts.slice(0, 2), internalParts.slice(0, 2));
+  assert.equal(internalParts[2], publicParts[2] + publicParts[3]);
   assert.equal(packageLock.version, packageJson.version);
   assert.equal(packageLock.packages[""].version, packageJson.version);
   assert.equal(tauriConfig.version, packageJson.version);

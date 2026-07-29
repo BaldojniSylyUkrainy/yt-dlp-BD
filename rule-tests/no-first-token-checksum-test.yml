@@ -1,0 +1,9 @@
+id: no-first-token-checksum
+valid:
+  - |
+    let expected = checksum
+      .split_whitespace()
+      .find(|candidate| candidate.len() == 64);
+invalid:
+  - |
+    let expected = checksum.split_whitespace().next();
