@@ -84,7 +84,9 @@ npm run build:mac
 Правило вибору наступного номера версії описане у
 [VERSIONING_UK.md](VERSIONING_UK.md). Коротко: лише виправлення збільшують PATCH,
 явно замовлений hotfix — четверту публічну компоненту та наступний внутрішній
-PATCH, а будь-яка нова функція збільшує MINOR і скидає PATCH до нуля.
+PATCH, а будь-яка нова функція збільшує MINOR і скидає публічний PATCH до нуля.
+Внутрішній Tauri PATCH кодує дві останні публічні компоненти:
+`PUBLIC_PATCH * 10 + HOTFIX` (`0.5.1.1` → `0.5.11`, `0.5.2.0` → `0.5.20`).
 
 Repository уже налаштований як `BaldojniSylyUkrainy/yt-dlp-BD`. macOS і Windows
 release збирає ручний GitHub-hosted workflow, а не локальний upload окремих
@@ -92,7 +94,7 @@ release збирає ручний GitHub-hosted workflow, а не локальн
 [GITHUB_RELEASE_HANDOFF_UK.md](GITHUB_RELEASE_HANDOFF_UK.md).
 
 Підготовлений public release tag — `v0.5.1.1`, а внутрішня Tauri/SemVer version —
-`0.5.2`. Workflow перевіряє public tag за `package.json.releaseVersion` і
+`0.5.11`. Workflow перевіряє public tag за `package.json.releaseVersion` і
 створює draft Release. Після
 ручної перевірки та публікації `latest.json` встановлені копії побачать нову
 версію, перевірять криптографічний підпис своєї платформи й запропонують

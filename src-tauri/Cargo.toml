@@ -1,6 +1,6 @@
 [package]
 name = "yt-dlp-desktop"
-version = "0.5.2"
+version = "0.5.11"
 description = "A friendly desktop shell for the official yt-dlp runtime"
 authors = ["yt-dlp Desktop contributors"]
 edition = "2021"

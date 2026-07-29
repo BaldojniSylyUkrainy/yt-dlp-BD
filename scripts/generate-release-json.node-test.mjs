@@ -50,7 +50,8 @@ test("keeps every current project and public release version in sync", async () 
   assert.ok(internalParts.every(Number.isSafeInteger));
   assert.ok(publicParts.every(Number.isSafeInteger));
   assert.deepEqual(publicParts.slice(0, 2), internalParts.slice(0, 2));
-  assert.equal(internalParts[2], publicParts[2] + publicParts[3]);
+  assert.ok(publicParts[3] >= 0 && publicParts[3] <= 9);
+  assert.equal(internalParts[2], publicParts[2] * 10 + publicParts[3]);
   assert.equal(packageLock.version, packageJson.version);
   assert.equal(packageLock.packages[""].version, packageJson.version);
   assert.equal(tauriConfig.version, packageJson.version);

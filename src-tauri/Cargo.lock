@@ -5453,7 +5453,7 @@ dependencies = [
 
 [[package]]
 name = "yt-dlp-desktop"
-version = "0.5.2"
+version = "0.5.11"
 dependencies = [
  "fs2",
  "libc",
