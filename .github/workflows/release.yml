@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Four-part release tag from package.json, for example vX.Y.Z.0"
-        default: "v0.5.1.0"
+        description: "Four-part release tag from package.json, for example vX.Y.Z.H"
+        default: "v0.5.1.1"
         required: true
         type: string
 

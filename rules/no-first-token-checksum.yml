@@ -1,0 +1,6 @@
+id: no-first-token-checksum
+language: Rust
+severity: error
+message: Parse and validate a complete SHA-256 instead of trusting the first checksum token.
+rule:
+  pattern: $CHECKSUM.split_whitespace().next()
