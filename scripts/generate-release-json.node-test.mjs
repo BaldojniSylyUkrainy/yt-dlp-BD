@@ -26,6 +26,13 @@ test("uses the public product name and version for GitHub Release titles", async
   assert.match(workflow, /description: "Four-part release tag from package\.json, for example vX\.Y\.Z\.0"/);
 });
 
+test("grants repository write access only to the final draft-release job", async () => {
+  const workflow = await readFile(".github/workflows/release.yml", "utf8");
+  assert.match(workflow, /^permissions:\r?\n  contents: read$/m);
+  assert.match(workflow, /publish-draft:[\s\S]*?permissions:\r?\n      contents: write/);
+  assert.equal(workflow.match(/contents: write/g)?.length, 1);
+});
+
 test("keeps every current project and public release version in sync", async () => {
   const packageJson = JSON.parse(await readFile("package.json", "utf8"));
   const packageLock = JSON.parse(await readFile("package-lock.json", "utf8"));

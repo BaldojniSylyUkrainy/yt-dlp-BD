@@ -132,6 +132,29 @@ export function appendQueueUrls(
   return { items: [...current, ...accepted], rejected: Math.max(0, urls.length - accepted.length) };
 }
 
+export function commitQueueInput(
+  current: DownloadQueue | null,
+  fallbackSettings: QueueSettings,
+  raw: string,
+  now: string = new Date().toISOString(),
+  idFactory: () => string = () => crypto.randomUUID(),
+): { queue: DownloadQueue | null; rejected: number } {
+  if (!raw.trim()) return { queue: current, rejected: 0 };
+  const result = appendQueueUrls(current?.items || [], raw, idFactory);
+  return {
+    queue: {
+      version: 1,
+      status: current?.status === "completed" ? "draft" : current?.status || "draft",
+      settings: current?.settings || fallbackSettings,
+      items: result.items,
+      activeItemId: current?.activeItemId || null,
+      createdAt: current?.createdAt || now,
+      updatedAt: now,
+    },
+    rejected: result.rejected,
+  };
+}
+
 export function retryableQueueItems(items: QueueItem[]): QueueItem[] {
   return items.filter((item) => item.status === "failed" || item.status === "interrupted");
 }
@@ -147,16 +170,31 @@ export function resetQueueItemsForRetry(items: QueueItem[]): QueueItem[] {
   }));
 }
 
+export function resetEntireQueueForReplay(items: QueueItem[]): QueueItem[] {
+  return items.map((item) => ({
+    ...createQueueItem(item.url, item.id),
+    title: item.title,
+    thumbnail: item.thumbnail,
+    uploader: item.uploader,
+    extractor: item.extractor,
+    attempt: item.attempt,
+  }));
+}
+
 export function nextPendingQueueItem(items: QueueItem[]): QueueItem | null {
   return items.find((item) => item.status === "pending" || item.status === "interrupted") || null;
 }
 
 export function queueProgress(items: QueueItem[]): { done: number; total: number; percent: number } {
   const done = items.filter((item) => ["completed", "failed", "skipped"].includes(item.status)).length;
+  const activeFraction = items.reduce((sum, item) => {
+    if (!["starting", "downloading", "postprocessing", "converting"].includes(item.status)) return sum;
+    return sum + Math.max(0, Math.min(100, item.percent)) / 100;
+  }, 0);
   return {
     done,
     total: items.length,
-    percent: items.length ? Math.round((done / items.length) * 100) : 0,
+    percent: items.length ? Math.round(((done + activeFraction) / items.length) * 100) : 0,
   };
 }
 
