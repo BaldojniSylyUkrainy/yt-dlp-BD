@@ -1242,6 +1242,10 @@ fn playlist_flag(multi_item: bool) -> &'static str {
     }
 }
 
+fn yt_dlp_output_encoding_args() -> [&'static str; 2] {
+    ["--encoding", "UTF-8"]
+}
+
 fn extraction_args(
     app: &AppHandle,
     mode: &str,
@@ -1350,6 +1354,8 @@ async fn probe_url_inner(
     configure_tokio_command(&mut command);
     command.args([
         "--ignore-config",
+        yt_dlp_output_encoding_args()[0],
+        yt_dlp_output_encoding_args()[1],
         "--simulate",
         "--no-warnings",
         "--no-ignore-no-formats-error",
@@ -1632,7 +1638,7 @@ fn emit_line(app: &AppHandle, id: &str, line: &str) {
                 message: message.map(str::to_string),
                 storage: None,
                 outputs: None,
-                title: message.map(str::to_string),
+                title: None,
                 thumbnail: None,
                 uploader: None,
                 extractor: None,
@@ -2145,6 +2151,20 @@ fn emit_storage_estimate(
     );
 }
 
+fn read_lossy_line<R: BufRead>(
+    reader: &mut R,
+    buffer: &mut Vec<u8>,
+) -> std::io::Result<Option<String>> {
+    buffer.clear();
+    if reader.read_until(b'\n', buffer)? == 0 {
+        return Ok(None);
+    }
+    while matches!(buffer.last(), Some(b'\n' | b'\r')) {
+        buffer.pop();
+    }
+    Ok(Some(String::from_utf8_lossy(buffer).into_owned()))
+}
+
 fn read_output<R: Read + Send + 'static>(
     app: AppHandle,
     manager: DownloadManager,
@@ -2153,7 +2173,9 @@ fn read_output<R: Read + Send + 'static>(
     state: OutputReaderState,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        for line in BufReader::new(reader).lines().map_while(Result::ok) {
+        let mut reader = BufReader::new(reader);
+        let mut buffer = Vec::new();
+        while let Ok(Some(line)) = read_lossy_line(&mut reader, &mut buffer) {
             if let Some(payload) = line.strip_prefix("__YTDLP_SIZE__") {
                 if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(payload) {
                     emit_download_metadata(&app, &id, &metadata);
@@ -2956,6 +2978,8 @@ fn start_download(
     configure_command(&mut command);
     command.args([
         "--ignore-config",
+        yt_dlp_output_encoding_args()[0],
+        yt_dlp_output_encoding_args()[1],
         "--no-simulate",
         "--newline",
         "--no-colors",
@@ -3809,6 +3833,7 @@ mod tests {
 
     #[test]
     fn retries_ambiguous_youtube_unavailable_with_browser_cookies_only_when_allowed() {
+        assert_eq!(yt_dlp_output_encoding_args(), ["--encoding", "UTF-8"]);
         let unavailable = "ERROR: [youtube] example: This video is unavailable";
 
         assert!(looks_like_auth_error(unavailable, true));
@@ -3824,6 +3849,19 @@ mod tests {
                 youtube_unavailable_may_need_cookies: false,
             }
         ));
+    }
+
+    #[test]
+    fn lossy_pipe_decoding_keeps_reading_after_invalid_windows_bytes() {
+        let mut reader = BufReader::new(&b"first\nsecond \x96 \x92\r\nthird\n"[..]);
+        let mut buffer = Vec::new();
+        let mut lines = Vec::new();
+
+        while let Some(line) = read_lossy_line(&mut reader, &mut buffer).unwrap() {
+            lines.push(line);
+        }
+
+        assert_eq!(lines, ["first", "second \u{fffd} \u{fffd}", "third"]);
     }
 
     #[test]

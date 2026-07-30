@@ -437,10 +437,7 @@ select:focus { border-color: var(--pink); }
 .job-stage small { margin-bottom: 5px; font-size: 12px; font-weight: 850; letter-spacing: .14em; }
 .job-stage strong { font-family: var(--font-poster); font-size: 54px; font-weight: 900; letter-spacing: -.04em; }
 .job-card.completed .job-icon { background: var(--success); }
-.job-icon-button { cursor: pointer; }
-.job-card.completed .job-icon-button:hover { background: #68d48e; }
-.job-card.failed .job-icon-button:hover { background: #cf89a6; }
-.job-icon-button:focus-visible { outline: 2px solid var(--ink); outline-offset: -6px; }
+.job-card.failed .job-icon { border-right-color: #9d6b25; color: #1c1004; background: var(--warning); }
 .job-body { min-width: 0; padding: 25px 24px; }
 .job-title { display: flex; align-items: stretch; justify-content: space-between; gap: 18px; }
 .job-title > div { min-width: 0; flex: 1; }

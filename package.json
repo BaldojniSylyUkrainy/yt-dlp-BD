@@ -1,8 +1,8 @@
 {
   "name": "yt-dlp-desktop",
   "private": true,
-  "version": "0.5.13",
-  "releaseVersion": "0.5.1.3",
+  "version": "0.5.14",
+  "releaseVersion": "0.5.1.4",
   "type": "module",
   "scripts": {
     "dev": "vite",
