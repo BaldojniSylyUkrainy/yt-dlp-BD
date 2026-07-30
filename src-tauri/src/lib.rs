@@ -211,6 +211,20 @@ struct DownloadedMedia {
     fps: Option<f64>,
 }
 
+#[derive(Clone, Copy)]
+struct AuthRetryPolicy {
+    allow_browser_retry: bool,
+    youtube_unavailable_may_need_cookies: bool,
+}
+
+#[derive(Clone)]
+struct OutputReaderState {
+    downloaded_files: Option<Arc<Mutex<Vec<DownloadedMedia>>>>,
+    storage_tracker: Option<StorageTracker>,
+    last_error: Arc<Mutex<Option<String>>>,
+    auth_retry: AuthRetryPolicy,
+}
+
 #[derive(Clone, Default)]
 struct DownloadManager {
     jobs: Arc<Mutex<HashMap<String, Arc<Mutex<Child>>>>>,
@@ -1118,9 +1132,14 @@ fn friendly_download_error(message: &str) -> String {
         .any(|pattern| value.contains(pattern))
     {
         "Відео недоступне у вашому регіоні.".into()
-    } else if ["video unavailable", "not available", "removed"]
-        .iter()
-        .any(|pattern| value.contains(pattern))
+    } else if [
+        "video unavailable",
+        "video is unavailable",
+        "not available",
+        "removed",
+    ]
+    .iter()
+    .any(|pattern| value.contains(pattern))
     {
         "Відео недоступне або було видалене.".into()
     } else if ["404", "not found"]
@@ -1687,9 +1706,9 @@ fn emit_line(app: &AppHandle, id: &str, line: &str) {
     }
 }
 
-fn looks_like_auth_error(line: &str) -> bool {
+fn looks_like_auth_error(line: &str, youtube_unavailable_may_need_cookies: bool) -> bool {
     let value = line.to_ascii_lowercase();
-    [
+    let explicit_auth_error = [
         "sign in to confirm",
         "login required",
         "log in to",
@@ -1702,7 +1721,17 @@ fn looks_like_auth_error(line: &str) -> bool {
         "this video is private",
     ]
     .iter()
-    .any(|pattern| value.contains(pattern))
+    .any(|pattern| value.contains(pattern));
+    let ambiguous_youtube_unavailable = youtube_unavailable_may_need_cookies
+        && ["video unavailable", "video is unavailable"]
+            .iter()
+            .any(|pattern| value.contains(pattern));
+    explicit_auth_error || ambiguous_youtube_unavailable
+}
+
+fn should_request_browser_auth(line: &str, policy: AuthRetryPolicy) -> bool {
+    policy.allow_browser_retry
+        && looks_like_auth_error(line, policy.youtube_unavailable_may_need_cookies)
 }
 
 fn json_number(value: Option<&serde_json::Value>) -> Option<f64> {
@@ -2121,24 +2150,23 @@ fn read_output<R: Read + Send + 'static>(
     manager: DownloadManager,
     id: String,
     reader: R,
-    downloaded_files: Option<Arc<Mutex<Vec<DownloadedMedia>>>>,
-    storage_tracker: Option<StorageTracker>,
-    last_error: Arc<Mutex<Option<String>>>,
+    state: OutputReaderState,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         for line in BufReader::new(reader).lines().map_while(Result::ok) {
             if let Some(payload) = line.strip_prefix("__YTDLP_SIZE__") {
                 if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(payload) {
                     emit_download_metadata(&app, &id, &metadata);
-                    if let (Some(tracker), Some(estimate)) =
-                        (storage_tracker.as_ref(), parse_size_estimate(&metadata))
-                    {
+                    if let (Some(tracker), Some(estimate)) = (
+                        state.storage_tracker.as_ref(),
+                        parse_size_estimate(&metadata),
+                    ) {
                         emit_storage_estimate(&app, &id, tracker, estimate);
                     }
                 }
                 continue;
             } else if let Some(path) = line.strip_prefix("__YTDLP_FILE__") {
-                if let Some(files) = downloaded_files.as_ref() {
+                if let Some(files) = state.downloaded_files.as_ref() {
                     if let (Some(media), Ok(mut files)) =
                         (downloaded_media_from_print(path), files.lock())
                     {
@@ -2149,7 +2177,7 @@ fn read_output<R: Read + Send + 'static>(
                 }
                 continue;
             }
-            if looks_like_auth_error(&line) {
+            if should_request_browser_auth(&line, state.auth_retry) {
                 if let Ok(mut jobs) = manager.auth_required.lock() {
                     jobs.insert(id.clone());
                 }
@@ -2159,7 +2187,7 @@ fn read_output<R: Read + Send + 'static>(
                 || normalized.contains("http error")
                 || normalized.contains("unable to download")
             {
-                if let Ok(mut error) = last_error.lock() {
+                if let Ok(mut error) = state.last_error.lock() {
                     *error = Some(line.trim().trim_start_matches("ERROR:").trim().to_string());
                 }
             }
@@ -2899,6 +2927,10 @@ fn start_download(
                 || host_matches(&host.to_ascii_lowercase(), "youtu.be")
         })
         .unwrap_or(false);
+    let auth_retry = AuthRetryPolicy {
+        allow_browser_retry: request.cookies_browser.is_none(),
+        youtube_unavailable_may_need_cookies: request.cookies_browser.is_none() && is_youtube,
+    };
     let output_dir = PathBuf::from(&request.output_dir);
     if !output_dir.is_dir() {
         return Err(
@@ -3005,6 +3037,12 @@ fn start_download(
         audio_format: request.audio_format.clone(),
     };
     let last_error = Arc::new(Mutex::new(None::<String>));
+    let output_reader_state = OutputReaderState {
+        downloaded_files: Some(downloaded_files.clone()),
+        storage_tracker: Some(storage_tracker.clone()),
+        last_error: last_error.clone(),
+        auth_retry,
+    };
     manager
         .jobs
         .lock()
@@ -3017,9 +3055,7 @@ fn start_download(
             manager.inner().clone(),
             id.clone(),
             stdout,
-            Some(downloaded_files.clone()),
-            Some(storage_tracker.clone()),
-            last_error.clone(),
+            output_reader_state.clone(),
         )
     });
     let stderr_reader = stderr.map(|stderr| {
@@ -3028,9 +3064,7 @@ fn start_download(
             manager.inner().clone(),
             id.clone(),
             stderr,
-            Some(downloaded_files.clone()),
-            Some(storage_tracker.clone()),
-            last_error.clone(),
+            output_reader_state.clone(),
         )
     });
 
@@ -3146,9 +3180,7 @@ fn start_download(
                                     manager.clone(),
                                     monitor_id.clone(),
                                     stdout,
-                                    Some(downloaded_files.clone()),
-                                    Some(storage_tracker.clone()),
-                                    last_error.clone(),
+                                    output_reader_state.clone(),
                                 )
                             });
                             stderr_reader = retry_stderr.map(|stderr| {
@@ -3157,9 +3189,7 @@ fn start_download(
                                     manager.clone(),
                                     monitor_id.clone(),
                                     stderr,
-                                    Some(downloaded_files.clone()),
-                                    Some(storage_tracker.clone()),
-                                    last_error.clone(),
+                                    output_reader_state.clone(),
                                 )
                             });
                             continue;
@@ -3766,11 +3796,34 @@ mod tests {
         );
         assert!(friendly_download_error("HTTP Error 403: Forbidden").contains("відхилив"));
         assert!(friendly_download_error("No space left on device").contains("вільного місця"));
+        assert!(
+            friendly_download_error("[youtube] example: This video is unavailable")
+                .contains("недоступне")
+        );
         let conversion = friendly_conversion_error(
             "/Users/name/Downloads/private.mkv: Invalid data found when processing input",
         );
         assert!(conversion.contains("пошкоджений"));
         assert!(!conversion.contains("/Users/name"));
+    }
+
+    #[test]
+    fn retries_ambiguous_youtube_unavailable_with_browser_cookies_only_when_allowed() {
+        let unavailable = "ERROR: [youtube] example: This video is unavailable";
+
+        assert!(looks_like_auth_error(unavailable, true));
+        assert!(!looks_like_auth_error(unavailable, false));
+        assert!(looks_like_auth_error(
+            "ERROR: Sign in to confirm your age",
+            false
+        ));
+        assert!(!should_request_browser_auth(
+            "ERROR: Sign in to confirm your age",
+            AuthRetryPolicy {
+                allow_browser_retry: false,
+                youtube_unavailable_may_need_cookies: false,
+            }
+        ));
     }
 
     #[test]
