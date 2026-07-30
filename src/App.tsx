@@ -233,7 +233,7 @@ export function applyDownloadEvent(current: Job, payload: DownloadEvent): Job | 
       percent: payload.percent ?? current.percent,
       speed: payload.speed ?? current.speed,
       eta: payload.eta ?? current.eta,
-      title: payload.title || payload.message || current.title,
+      title: payload.title || current.title,
     };
   }
   if (payload.kind === "postprocess") {
@@ -294,6 +294,7 @@ type IconName =
   | "folder"
   | "link"
   | "shield"
+  | "warning"
   | "check"
   | "x"
   | "refresh"
@@ -309,6 +310,7 @@ function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
     folder: <path d="M3 6.5A1.5 1.5 0 0 1 4.5 5H9l2 2h8.5A1.5 1.5 0 0 1 21 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5Z"/>,
     link: <><path d="M10 13a5 5 0 0 0 7.1.1l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1"/><path d="M14 11a5 5 0 0 0-7.1-.1l-2 2A5 5 0 0 0 12 20l1.1-1.1"/></>,
     shield: <><path d="M12 3 5 6v5c0 4.6 2.8 8 7 10 4.2-2 7-5.4 7-10V6Z"/><path d="m9 12 2 2 4-4"/></>,
+    warning: <><path d="M10.3 4.3 2.7 17.5A2 2 0 0 0 4.4 20h15.2a2 2 0 0 0 1.7-2.5L13.7 4.3a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></>,
     check: <path d="m5 12 4 4L19 6"/>,
     x: <><path d="m7 7 10 10"/><path d="M17 7 7 17"/></>,
     refresh: <><path d="M20 7v5h-5"/><path d="M4 17v-5h5"/><path d="M6.1 8A7 7 0 0 1 18 6l2 6M4 12l2 6a7 7 0 0 0 11.9-2"/></>,
@@ -2139,9 +2141,9 @@ function App() {
       {job && job.status !== "auth_required" && <div className="download-progress-backdrop" role="presentation">
         <DialogSurface className={`job-card ${job.status}`} labelledBy="download-progress-title" onEscape={!active ? () => setJob(null) : undefined}>
           {job.status === "completed" ? (
-            <button type="button" className="job-icon job-icon-button" aria-label="Закрити повідомлення про завершення" onClick={() => setJob(null)}><Icon name="check"/></button>
+            <div className="job-icon" aria-hidden="true"><Icon name="check"/></div>
           ) : job.status === "failed" ? (
-            <button type="button" className="job-icon job-icon-button" aria-label="Закрити повідомлення про помилку" onClick={() => setJob(null)}><Icon name="x" size={24}/></button>
+            <div className="job-icon" aria-hidden="true"><Icon name="warning" size={28}/></div>
           ) : (
             <div className="job-icon" aria-label={`Етап ${jobStageNumber(job.status)}`}><span className="job-stage"><small>ЕТАП</small><strong>{jobStageNumber(job.status)}</strong></span></div>
           )}

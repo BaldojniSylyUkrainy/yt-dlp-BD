@@ -70,19 +70,19 @@ describe("download event state", () => {
     ])).toBe(true);
   });
 
-  it("applies progress even when it is the first event after job creation", () => {
+  it("applies early progress without replacing a valid title with a lossy log line", () => {
     const next = applyDownloadEvent(startingJob, event("progress", {
       percent: 12.5,
       speed: "2 MiB/s",
       eta: "00:42",
-      message: "Назва відео",
+      message: "/ / � | . �",
     }));
     expect(next).toMatchObject({
       status: "downloading",
       percent: 12.5,
       speed: "2 MiB/s",
       eta: "00:42",
-      title: "Назва відео",
+      title: "youtube.com",
     });
   });
 
