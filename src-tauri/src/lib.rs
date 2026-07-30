@@ -196,10 +196,19 @@ struct SelectedMediaEstimate {
     total_bitrate_kbps: Option<f64>,
 }
 
+#[derive(Clone)]
 struct MediaInfo {
     duration: f64,
     height: u64,
     fps: f64,
+}
+
+#[derive(Clone)]
+struct DownloadedMedia {
+    path: PathBuf,
+    duration: Option<f64>,
+    height: Option<u64>,
+    fps: Option<f64>,
 }
 
 #[derive(Clone, Default)]
@@ -1704,6 +1713,36 @@ fn json_number(value: Option<&serde_json::Value>) -> Option<f64> {
     })
 }
 
+fn positive_finite_number(value: Option<&serde_json::Value>) -> Option<f64> {
+    json_number(value).filter(|value| value.is_finite() && *value > 0.0)
+}
+
+fn downloaded_media_from_print(payload: &str) -> Option<DownloadedMedia> {
+    let metadata = serde_json::from_str::<serde_json::Value>(payload).ok();
+    if let Some(metadata) = metadata {
+        let path = metadata
+            .get("filepath")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        return Some(DownloadedMedia {
+            path: PathBuf::from(path),
+            duration: positive_finite_number(metadata.get("duration")),
+            height: positive_finite_number(metadata.get("height"))
+                .map(|value| value.round() as u64),
+            fps: positive_finite_number(metadata.get("fps")),
+        });
+    }
+
+    let path = payload.trim();
+    (!path.is_empty()).then(|| DownloadedMedia {
+        path: PathBuf::from(path),
+        duration: None,
+        height: None,
+        fps: None,
+    })
+}
+
 fn parse_size_estimate(metadata: &serde_json::Value) -> Option<SelectedMediaEstimate> {
     let media_id = metadata
         .get("id")
@@ -2082,7 +2121,7 @@ fn read_output<R: Read + Send + 'static>(
     manager: DownloadManager,
     id: String,
     reader: R,
-    downloaded_files: Option<Arc<Mutex<Vec<PathBuf>>>>,
+    downloaded_files: Option<Arc<Mutex<Vec<DownloadedMedia>>>>,
     storage_tracker: Option<StorageTracker>,
     last_error: Arc<Mutex<Option<String>>>,
 ) -> thread::JoinHandle<()> {
@@ -2100,10 +2139,11 @@ fn read_output<R: Read + Send + 'static>(
                 continue;
             } else if let Some(path) = line.strip_prefix("__YTDLP_FILE__") {
                 if let Some(files) = downloaded_files.as_ref() {
-                    if let Ok(mut files) = files.lock() {
-                        let path = PathBuf::from(path.trim());
-                        if !files.contains(&path) {
-                            files.push(path);
+                    if let (Some(media), Ok(mut files)) =
+                        (downloaded_media_from_print(path), files.lock())
+                    {
+                        if !files.iter().any(|file| file.path == media.path) {
+                            files.push(media);
                         }
                     }
                 }
@@ -2354,11 +2394,12 @@ fn convert_downloaded_media(
     manager: &DownloadManager,
     id: &str,
     ffmpeg_path: &Path,
-    input: &Path,
+    downloaded: &DownloadedMedia,
     file_position: (usize, usize),
     output_format: &str,
 ) -> Result<PathBuf, String> {
     let (file_index, file_count) = file_position;
+    let input = &downloaded.path;
     if download_was_cancelled(manager, id) {
         return Err("Завантаження скасовано".into());
     }
@@ -2366,10 +2407,22 @@ fn convert_downloaded_media(
     let is_video = output_format == "mp4";
     let use_videotoolbox = is_video && videotoolbox_encoder_available(ffmpeg_path);
     let media = is_video
-        .then(|| media_info(ffmpeg_path, input))
+        .then(|| {
+            downloaded
+                .duration
+                .map(|duration| MediaInfo {
+                    duration,
+                    height: downloaded.height.unwrap_or(1080),
+                    fps: downloaded.fps.unwrap_or(30.0),
+                })
+                .map(Ok)
+                .unwrap_or_else(|| media_info(ffmpeg_path, input))
+        })
         .transpose()?;
     let duration = if let Some(media) = media.as_ref() {
         media.duration
+    } else if let Some(duration) = downloaded.duration {
+        duration
     } else {
         media_duration(ffmpeg_path, input)?
     };
@@ -2918,7 +2971,10 @@ fn start_download(
         ]);
     }
 
-    command.args(["--print", "after_move:__YTDLP_FILE__%(filepath)s"]);
+    command.args([
+        "--print",
+        "after_move:__YTDLP_FILE__%(.{filepath,duration,height,fps})j",
+    ]);
     if request.mode != "audio" {
         command.args(["--merge-output-format", "mkv", "--remux-video", "mkv"]);
     }
@@ -2941,7 +2997,7 @@ fn start_download(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let child = Arc::new(Mutex::new(child));
-    let downloaded_files = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
+    let downloaded_files = Arc::new(Mutex::new(Vec::<DownloadedMedia>::new()));
     let storage_tracker = StorageTracker {
         output_dir,
         estimates: Arc::new(Mutex::new(HashMap::new())),
@@ -3158,7 +3214,7 @@ fn start_download(
                                 Err(error) => {
                                     eprintln!(
                                         "Не вдалося конвертувати {}: {error}",
-                                        file.display()
+                                        file.path.display()
                                     );
                                     if conversion_error.is_none() {
                                         conversion_error = Some(error);
@@ -3529,6 +3585,40 @@ mod tests {
             "{expected}\nffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n"
         );
         assert!(checksum_value(ambiguous.as_bytes(), "Deno").is_err());
+    }
+
+    #[test]
+    fn parses_structured_windows_download_handoff() {
+        let payload = serde_json::json!({
+            "filepath": r"C:\Users\Влад\Downloads\AGE OF KINGDOMS [x-2wmD5Pc1E].mkv",
+            "duration": 5470.0,
+            "height": 2160,
+            "fps": 24.0
+        })
+        .to_string();
+        let media = downloaded_media_from_print(&payload).unwrap();
+
+        assert_eq!(
+            media.path,
+            PathBuf::from(r"C:\Users\Влад\Downloads\AGE OF KINGDOMS [x-2wmD5Pc1E].mkv")
+        );
+        assert_eq!(media.duration, Some(5470.0));
+        assert_eq!(media.height, Some(2160));
+        assert_eq!(media.fps, Some(24.0));
+    }
+
+    #[test]
+    fn download_handoff_keeps_raw_path_fallback_and_rejects_bad_duration() {
+        let raw = downloaded_media_from_print("/tmp/video.mkv").unwrap();
+        assert_eq!(raw.path, PathBuf::from("/tmp/video.mkv"));
+        assert_eq!(raw.duration, None);
+
+        let payload = r#"{"filepath":"video.mkv","duration":"N/A","height":0,"fps":null}"#;
+        let media = downloaded_media_from_print(payload).unwrap();
+        assert_eq!(media.path, PathBuf::from("video.mkv"));
+        assert_eq!(media.duration, None);
+        assert_eq!(media.height, None);
+        assert_eq!(media.fps, None);
     }
 
     #[test]
