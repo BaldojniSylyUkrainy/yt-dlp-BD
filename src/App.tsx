@@ -15,6 +15,7 @@ import {
   canEditQueueItem,
   commitQueueInput,
   nextPendingQueueItem,
+  normalizeCookieBrowser,
   normalizeHttpUrl,
   parseQueueStorage,
   QUEUE_LIMIT,
@@ -162,12 +163,9 @@ export function runtimeInstallCommand(stage: Exclude<RuntimeStage, null>): strin
 }
 
 export function defaultCookieBrowser(platform: string, stored: string | null): string {
-  if (stored && !(platform === "windows" && stored === "safari")) return stored;
-  return platform === "windows" ? "edge" : "safari";
-}
-
-export function isCurrentProbe(currentSequence: number, responseSequence: number): boolean {
-  return currentSequence === responseSequence;
+  const normalized = normalizeCookieBrowser(stored);
+  if (normalized) return normalized;
+  return platform === "windows" ? "edge" : "chrome";
 }
 
 export type Job = {
@@ -274,19 +272,6 @@ type RuntimeInstallProgress = {
   total: number | null;
 };
 
-type MediaPreview = {
-  title: string;
-  thumbnail: string | null;
-  duration: number | null;
-  durationIsTotal: boolean;
-  uploader: string | null;
-  extractor: string | null;
-  webpageUrl: string | null;
-  itemCount: number | null;
-};
-
-type ProbeState = "idle" | "checking" | "valid" | "unverified" | "invalid";
-
 type IconName =
   | "download"
   | "clock"
@@ -382,11 +367,12 @@ function hostFromInput(value: string): string | null {
 }
 
 function normalizeInputUrl(value: string): string | null {
-  try {
-    return new URL(/^https?:\/\//i.test(value.trim()) ? value.trim() : `https://${value.trim()}`).toString();
-  } catch {
-    return null;
-  }
+  return normalizeHttpUrl(value);
+}
+
+export function inputUrlState(value: string): "idle" | "valid" | "invalid" {
+  if (!value.trim()) return "idle";
+  return normalizeInputUrl(value) ? "valid" : "invalid";
 }
 
 function isRussianDomain(host: string): boolean {
@@ -407,20 +393,13 @@ export function isLikelyMultiItemUrl(value: string): boolean {
   }
 }
 
+export function shouldShowMultiItemIntent(value: string, itemCount?: number | null): boolean {
+  return isLikelyMultiItemUrl(value) || Boolean(itemCount && itemCount > 1);
+}
+
 function shortVersion(value: string | null): string {
   if (!value) return "Не встановлено";
   return value.replace(/^nightly@/, "").split("\n")[0];
-}
-
-function formatDuration(value: number | null): string | null {
-  if (value === null || !Number.isFinite(value)) return null;
-  const seconds = Math.max(0, Math.round(value));
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
-  const remainder = seconds % 60;
-  return hours
-    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`
-    : `${minutes}:${String(remainder).padStart(2, "0")}`;
 }
 
 function formatByteSize(value: number): string {
@@ -623,7 +602,6 @@ function youtubeThumbnailFromInput(value: string): string | null {
 
 function App() {
   const maintenanceStarted = useRef(false);
-  const probeSequence = useRef(0);
   const approvedVpnUrls = useRef(new Set<string>());
   const cancelledDownloadRestore = useRef<{ url: string; playlist: boolean } | null>(null);
   const mainContentRef = useRef<HTMLElement>(null);
@@ -653,7 +631,6 @@ function App() {
   const [job, setJob] = useState<Job | null>(null);
   const [formError, setFormError] = useState("");
   const [vpnWarning, setVpnWarning] = useState<{ host: string; url: string; status: VpnStatus; queueItemId: string | null } | null>(null);
-  const [vpnDecisionVersion, setVpnDecisionVersion] = useState(0);
   const [pendingStart, setPendingStart] = useState(false);
   const [update, setUpdate] = useState<Update | null>(null);
   const updateAvailableRef = useRef(false);
@@ -666,9 +643,6 @@ function App() {
   const [updateProgress, setUpdateProgress] = useState(0);
   const initialPlatform = navigator.userAgent.includes("Windows") ? "windows" : "macos";
   const [cookieBrowser, setCookieBrowser] = useState(defaultCookieBrowser(initialPlatform, null));
-  const [probeState, setProbeState] = useState<ProbeState>("idle");
-  const [preview, setPreview] = useState<MediaPreview | null>(null);
-  const [probeError, setProbeError] = useState("");
   const [startupBusy, setStartupBusy] = useState(true);
   const [startupProgress, setStartupProgress] = useState(10);
   const [startupMessage, setStartupMessage] = useState("Відкриваємо застосунок…");
@@ -697,14 +671,15 @@ function App() {
   const anyProcessActive = Boolean(active || queueProcessActive);
   const runtimeReady = Boolean(runtime?.ytDlp.installed && runtime?.ffmpeg.installed && runtime?.deno.installed);
   const isWindows = runtime?.platform === "windows";
-  const quickThumbnail = youtubeThumbnailFromInput(url);
-  const multiItemCandidate = isLikelyMultiItemUrl(url);
+  const normalizedInputUrl = normalizeInputUrl(url);
+  const urlState = inputUrlState(url);
+  const multiItemCandidate = shouldShowMultiItemIntent(url);
   const closeActivities = appCloseActivityLabels({
     singleStage: active ? job?.status || null : null,
     batchDownload: Boolean(queueProcessActive || downloadQueue?.status === "running"),
     runtimeMaintenance: runtimeBusy,
     appUpdate: updateBusy,
-    linkCheck: pendingStart || probeState === "checking",
+    linkCheck: pendingStart,
     backendDownloads: closeRequest?.activeDownloads || 0,
   });
 
@@ -768,7 +743,11 @@ function App() {
             multiItem: false,
             cookiesBrowser: null,
           };
-          const restoredQueue = parseQueueStorage(localStorage.getItem(QUEUE_STORAGE_KEY), fallbackSettings);
+          const storedQueue = parseQueueStorage(localStorage.getItem(QUEUE_STORAGE_KEY), fallbackSettings);
+          const restoredQueue = storedQueue?.settings.cookiesBrowser === "safari" ? {
+            ...storedQueue,
+            settings: { ...storedQueue.settings, cookiesBrowser: null },
+          } : storedQueue;
           downloadQueueRef.current = restoredQueue;
           setDownloadQueue(restoredQueue);
           setQueueHydrated(true);
@@ -819,9 +798,10 @@ function App() {
   }, [downloadQueue, outputDir, updateQueue]);
 
   useEffect(() => {
-    if (!isWindows || cookieBrowser !== "safari") return;
-    setCookieBrowser("edge");
-    localStorage.setItem("cookieBrowser", "edge");
+    if (cookieBrowser !== "safari") return;
+    const fallback = isWindows ? "edge" : "chrome";
+    setCookieBrowser(fallback);
+    localStorage.setItem("cookieBrowser", fallback);
   }, [cookieBrowser, isWindows]);
 
   useEffect(() => {
@@ -1185,85 +1165,15 @@ function App() {
   }, [startupBusy]);
 
   useEffect(() => {
-    const value = url.trim();
-    const sequence = ++probeSequence.current;
-    setPreview(null);
-    setProbeError("");
-    if (!value) {
-      setProbeState("idle");
-      return;
-    }
-    if (!runtime?.ytDlp.installed) {
-      setProbeState("idle");
-      return;
-    }
-    const parsedHost = hostFromInput(value);
-    const normalized = normalizeInputUrl(value);
-    if (!parsedHost || !normalized) {
-      setProbeState("invalid");
-      setProbeError("Це не схоже на посилання");
-      return;
-    }
-    setProbeState("checking");
-    let softDeadline = 0;
-    const timer = window.setTimeout(async () => {
-      if (isRussianDomain(parsedHost) && !approvedVpnUrls.current.has(normalized)) {
-        try {
-          const vpn = await invoke<VpnStatus>("check_vpn", { host: parsedHost });
-          if (!isCurrentProbe(probeSequence.current, sequence)) return;
-          if (!vpn.detected) {
-            setProbeState("idle");
-            setVpnWarning({ host: parsedHost, url: normalized, status: vpn, queueItemId: null });
-            return;
-          }
-          approvedVpnUrls.current.add(normalized);
-        } catch {
-          if (!isCurrentProbe(probeSequence.current, sequence)) return;
-          setProbeState("idle");
-          setVpnWarning({
-            host: parsedHost,
-            url: normalized,
-            status: { detected: false, interfaceName: null, confidence: "unknown", detail: "Не вдалося перевірити стан VPN" },
-            queueItemId: null,
-          });
-          return;
-        }
-      }
-      softDeadline = window.setTimeout(() => {
-        if (!isCurrentProbe(probeSequence.current, sequence)) return;
-        setProbeError("Не вдалося швидко визначити доступність. Можна спробувати завантажити");
-        setProbeState("unverified");
-      }, 4_000);
-      try {
-        const result = await invoke<MediaPreview>("probe_url", { probeId: crypto.randomUUID(), url: normalized, playlist: playlistIntent === "playlist" });
-        if (!isCurrentProbe(probeSequence.current, sequence)) return;
-        setPreview(result);
-        setProbeState("valid");
-      } catch (error) {
-        if (!isCurrentProbe(probeSequence.current, sequence)) return;
-        setProbeError(String(error));
-        setProbeState("unverified");
-      } finally {
-        window.clearTimeout(softDeadline);
-      }
-    }, 450);
-    return () => {
-      window.clearTimeout(timer);
-      window.clearTimeout(softDeadline);
-    };
-  }, [url, runtime?.ytDlp.installed, playlistIntent, vpnDecisionVersion]);
-
-  useEffect(() => {
     if (!historyRetryPending || active || pendingStart) return;
-    if (probeState === "invalid") {
+    if (!normalizeInputUrl(url)) {
       setHistoryRetryPending(null);
       setFormError("Збережене посилання більше не схоже на коректне");
       return;
     }
-    if (probeState !== "valid" && probeState !== "unverified") return;
     setHistoryRetryPending(null);
     void beginDownload();
-  }, [historyRetryPending, probeState, active, pendingStart]);
+  }, [historyRetryPending, url, active, pendingStart]);
 
   useEffect(() => {
     const unlisten = listen<DownloadEvent>("download-event", ({ payload }) => {
@@ -1431,13 +1341,13 @@ function App() {
   async function launchDownload(downloadUrl: string, parsedHost: string, preflightResult: PreflightResult, cookiesBrowser?: string, playlist = playlistIntent === "playlist") {
     const id = crypto.randomUUID();
     const normalizedDownloadUrl = normalizeInputUrl(downloadUrl) || downloadUrl;
-    const thumbnail = preview?.thumbnail || quickThumbnail;
+    const thumbnail = youtubeThumbnailFromInput(normalizedDownloadUrl);
     const context: HistoryContext = {
       sourceUrl: normalizedDownloadUrl,
-      title: preview?.title || parsedHost,
+      title: parsedHost,
       thumbnail,
-      uploader: preview?.uploader || null,
-      extractor: preview?.extractor || parsedHost,
+      uploader: null,
+      extractor: parsedHost,
       settings: {
         outputDir,
         mode,
@@ -1450,7 +1360,7 @@ function App() {
     historyContexts.current.set(id, context);
     const initialJob: Job = {
       id,
-      url: downloadUrl,
+      url: normalizedDownloadUrl,
       title: parsedHost,
       status: "starting",
       percent: 0,
@@ -1473,7 +1383,7 @@ function App() {
       await invoke<void>("start_download", {
         request: {
           id,
-          url: /^https?:\/\//i.test(downloadUrl.trim()) ? downloadUrl.trim() : `https://${downloadUrl.trim()}`,
+          url: normalizedDownloadUrl,
           outputDir,
           mode,
           quality,
@@ -1506,10 +1416,10 @@ function App() {
           quality,
           audioFormat,
           multiItem: playlist,
-          title: preview?.title || null,
-          duration: preview?.duration || null,
-          itemCount: preview?.itemCount || null,
-          durationIsTotal: preview?.durationIsTotal ?? null,
+          title: null,
+          duration: null,
+          itemCount: null,
+          durationIsTotal: null,
         },
       });
       setOutputFreeSpace(result.availableSpace);
@@ -1533,8 +1443,9 @@ function App() {
       setFormError("Дочекайтеся завершення пакетного завантаження або зупиніть його");
       return;
     }
-    const parsedHost = hostFromInput(url);
-    if (!parsedHost) {
+    const normalized = normalizedInputUrl;
+    const parsedHost = normalized ? hostFromInput(normalized) : null;
+    if (!normalized || !parsedHost) {
       setFormError("Вставте коректне посилання на відео або аудіо");
       return;
     }
@@ -1546,30 +1457,33 @@ function App() {
       setFormError("Компоненти ще готуються. Зачекайте кілька секунд");
       return;
     }
-    if (probeState !== "valid" && probeState !== "unverified") {
-      setFormError(probeState === "checking" ? "Зачекайте кілька секунд, поки триває швидка перевірка" : "Вставте коректне посилання");
-      return;
-    }
-
-    const normalized = normalizeInputUrl(url);
-    if (!normalized) {
-      setFormError("Вставте коректне посилання");
-      return;
-    }
     if (isRussianDomain(parsedHost) && !approvedVpnUrls.current.has(normalized)) {
-      setFormError("Спочатку завершіть перевірку VPN для цього посилання");
-      return;
+      setPendingStart(true);
+      try {
+        const vpn = await invoke<VpnStatus>("check_vpn", { host: parsedHost });
+        if (!vpn.detected) {
+          setVpnWarning({ host: parsedHost, url: normalized, status: vpn, queueItemId: null });
+          return;
+        }
+        approvedVpnUrls.current.add(normalized);
+      } catch {
+        setVpnWarning({
+          host: parsedHost,
+          url: normalized,
+          status: { detected: false, interfaceName: null, confidence: "unknown", detail: "Не вдалося перевірити стан VPN" },
+          queueItemId: null,
+        });
+        return;
+      } finally {
+        setPendingStart(false);
+      }
     }
 
-    await runPreflight(url, parsedHost);
+    await runPreflight(normalized, parsedHost);
   }
 
   function clearUrl() {
-    probeSequence.current += 1;
     setUrl("");
-    setPreview(null);
-    setProbeState("idle");
-    setProbeError("");
     setFormError("");
     window.requestAnimationFrame(() => urlInputRef.current?.focus());
   }
@@ -1600,10 +1514,7 @@ function App() {
     setSubtitles(entry.settings.subtitles);
     setPlaylistIntent(entry.settings.playlist ? "playlist" : "single");
     cancelledDownloadRestore.current = { url: entry.sourceUrl, playlist: entry.settings.playlist };
-    setPreview(null);
-    setProbeState("idle");
     setUrl(entry.sourceUrl);
-    setVpnDecisionVersion((current) => current + 1);
     setActiveView("download");
   }
 
@@ -1613,8 +1524,7 @@ function App() {
     if (queueItemId) {
       setQueueNotice("Пакетне завантаження призупинено: для цього посилання не підтверджено VPN.");
     } else {
-      setProbeState("invalid");
-      setProbeError("Перевірку посилання скасовано");
+      setFormError("Завантаження скасовано: VPN не підтверджено");
     }
   }
 
@@ -1628,7 +1538,7 @@ function App() {
       updateQueue((current) => current ? { ...current, status: "running", updatedAt: new Date().toISOString() } : current);
       setActiveView("queue");
     } else {
-      setVpnDecisionVersion((current) => current + 1);
+      window.requestAnimationFrame(() => void beginDownload());
     }
   }
 
@@ -2037,25 +1947,14 @@ function App() {
         {activeView === "download" && <section className="download-card" aria-busy={runtimeBusy}>
           <div className="download-card-content" inert={runtimeBusy ? true : undefined}>
           <label className="field-label" htmlFor="media-url">Посилання</label>
-          <div className={`url-field ${probeState}`}>
+          <div className={`url-field ${urlState}`}>
             <Icon name="link" />
             <input ref={urlInputRef} id="media-url" value={url} onChange={(event) => setUrl(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !active) beginDownload(); }} placeholder="https://youtube.com/watch?v=…" autoFocus />
             {url && <button type="button" className="url-clear" aria-label="Очистити посилання" title="Очистити посилання" onClick={clearUrl}><Icon name="x" size={17}/></button>}
-            {probeState === "checking" && <span className="url-checking" aria-label="Перевіряємо посилання"><i/></span>}
-            {probeState === "valid" && <span className="valid-check" aria-label="Відео доступне"><Icon name="check" size={15}/></span>}
-            {probeState === "unverified" && <span className="unverified-check" aria-label="Не вдалося підтвердити посилання">!</span>}
-            {probeState === "invalid" && <span className="invalid-check" aria-label="Посилання недоступне"><Icon name="x" size={15}/></span>}
+            {urlState === "valid" && <span className="valid-check" aria-label="Коректне посилання"><Icon name="check" size={15}/></span>}
+            {urlState === "invalid" && <span className="invalid-check" aria-label="Некоректне посилання"><Icon name="x" size={15}/></span>}
           </div>
-          {probeState === "checking" && quickThumbnail && <div className="media-preview checking">
-            <img src={quickThumbnail} alt="" />
-            <div><strong>Зчитуємо назву відео…</strong><p>YouTube</p><small><span className="inline-spinner"/>Швидко перевіряємо доступність</small></div>
-          </div>}
-          {preview && probeState === "valid" && <div className="media-preview">
-            {preview.thumbnail ? <img src={preview.thumbnail} alt="" /> : <div className="media-preview-placeholder"><Icon name="check"/></div>}
-            <div><strong>{preview.title}</strong><p>{[preview.uploader, preview.duration ? `${formatDuration(preview.duration)}${preview.durationIsTotal ? "" : " на елемент"}` : null, preview.itemCount && preview.itemCount > 1 ? `${preview.itemCount} елементів` : null, preview.extractor].filter(Boolean).join(" · ")}</p><small><Icon name="check" size={13}/>Посилання доступне; формати перевіримо перед стартом</small></div>
-          </div>}
-          {probeState === "unverified" && <div className="url-warning" title={probeError}><span aria-hidden="true">!</span><span>Не вдалося швидко підтвердити посилання. yt-dlp все одно може спробувати його завантажити.</span></div>}
-          {probeState === "invalid" && <div className="url-error"><Icon name="x" size={14}/><span>{probeError || "yt-dlp не може завантажити це посилання"}</span></div>}
+          {urlState === "invalid" && <div className="url-error"><Icon name="x" size={14}/><span>Вставте повне HTTP або HTTPS посилання</span></div>}
 
           {multiItemCandidate && <div className="collection-intent">
             <span className="field-label">Що взяти з добірки</span>
@@ -2092,7 +1991,7 @@ function App() {
           </div>
 
           {formError && <div className="inline-error">{formError}</div>}
-          <button className="primary-button" disabled={(probeState !== "valid" && probeState !== "unverified") || anyProcessActive || queueBusy || pendingStart || runtimeBusy || !runtimeReady} onClick={() => beginDownload()}><Icon name="download" />{runtimeBusy ? "Встановлюємо компоненти…" : probeState === "checking" ? "Перевіряємо посилання…" : pendingStart ? "Починаємо…" : anyProcessActive || queueBusy ? "Інше завантаження триває" : "Завантажити"}</button>
+          <button className="primary-button" disabled={urlState !== "valid" || anyProcessActive || queueBusy || pendingStart || runtimeBusy || !runtimeReady} onClick={() => beginDownload()}><Icon name="download" />{runtimeBusy ? "Встановлюємо компоненти…" : pendingStart ? "Починаємо…" : anyProcessActive || queueBusy ? "Інше завантаження триває" : "Завантажити"}</button>
           <p className="legal-note">Завантажуйте лише матеріали, на які маєте відповідні права.</p>
           </div>
         </section>}
@@ -2103,7 +2002,6 @@ function App() {
           notice={queueNotice}
           runtimeReady={runtimeReady && !runtimeBusy}
           singleDownloadActive={Boolean(active)}
-          isWindows={isWindows}
           onInput={setQueueInput}
           onPaste={handleQueuePaste}
           onAdd={() => addQueueText()}
@@ -2141,9 +2039,9 @@ function App() {
       {job && job.status !== "auth_required" && <div className="download-progress-backdrop" role="presentation">
         <DialogSurface className={`job-card ${job.status}`} labelledBy="download-progress-title" onEscape={!active ? () => setJob(null) : undefined}>
           {job.status === "completed" ? (
-            <div className="job-icon" aria-hidden="true"><Icon name="check"/></div>
+            <button type="button" className="job-icon status-action" aria-label="Закрити повідомлення про завершення" onClick={() => setJob(null)}><Icon name="check"/></button>
           ) : job.status === "failed" ? (
-            <div className="job-icon" aria-hidden="true"><Icon name="warning" size={28}/></div>
+            <button type="button" className="job-icon status-action" aria-label="Закрити повідомлення про помилку" onClick={() => setJob(null)}><Icon name="x" size={24}/></button>
           ) : (
             <div className="job-icon" aria-label={`Етап ${jobStageNumber(job.status)}`}><span className="job-stage"><small>ЕТАП</small><strong>{jobStageNumber(job.status)}</strong></span></div>
           )}
@@ -2219,8 +2117,8 @@ function App() {
           <p className="eyebrow">ПОТРІБНА АВТОРИЗАЦІЯ</p>
           <h2 id="auth-title">Увійдіть через браузер</h2>
           <p id="auth-description">Сайт просить підтвердити вік, акаунт або що ви не бот. Увійдіть на цей сайт у браузері та виберіть його нижче.</p>
-          <label className="browser-picker">Ваш браузер<select value={cookieBrowser} onChange={(event) => setCookieBrowser(event.target.value)}>{!isWindows && <option value="safari">Safari</option>}<option value="edge">Microsoft Edge</option><option value="chrome">Google Chrome</option><option value="firefox">Firefox</option><option value="brave">Brave</option><option value="vivaldi">Vivaldi</option></select></label>
-          <div className="modal-detail">yt-dlp прочитає cookies безпосередньо з обраного браузера лише для повторної спроби. yt-dlp BD не експортує їх у файл і не зберігає.</div>
+          <label className="browser-picker">Ваш браузер<select value={cookieBrowser} onChange={(event) => setCookieBrowser(event.target.value)}><option value="edge">Microsoft Edge</option><option value="chrome">Google Chrome</option><option value="firefox">Firefox</option><option value="brave">Brave</option><option value="vivaldi">Vivaldi</option></select></label>
+          <div className="modal-detail">yt-dlp прочитає cookies безпосередньо з обраного браузера лише для повторної спроби. yt-dlp BD не експортує їх у файл і не зберігає.{isWindows && " На Windows Firefox зазвичай читається надійніше; оберіть саме той браузер, де ви вже увійшли на сайт."}</div>
           <div className="modal-actions"><button className="secondary-button" onClick={() => setJob(null)}>Скасувати</button><button className="warning-button auth" disabled={pendingStart} onClick={retryWithCookies}>{pendingStart ? "Перевіряємо…" : "Повторити з cookies"}</button></div>
         </DialogSurface>
       </div>}
@@ -2264,13 +2162,12 @@ function queueStorageLabel(item: QueueItem): string | null {
   return `${available} · потрібно до ${formatByteSize(item.storage.requiredSpace)}`;
 }
 
-function QueueView({ queue, input, notice, runtimeReady, singleDownloadActive, isWindows, onInput, onPaste, onAdd, onChangeItem, onRemoveItem, onSettings, onChooseFolder, onStart, onPause, onResume, onSkip, onStop, onRetry, onReplay, onNew }: {
+function QueueView({ queue, input, notice, runtimeReady, singleDownloadActive, onInput, onPaste, onAdd, onChangeItem, onRemoveItem, onSettings, onChooseFolder, onStart, onPause, onResume, onSkip, onStop, onRetry, onReplay, onNew }: {
   queue: DownloadQueue | null;
   input: string;
   notice: string;
   runtimeReady: boolean;
   singleDownloadActive: boolean;
-  isWindows: boolean;
   onInput: (value: string) => void;
   onPaste: (event: ClipboardEvent<HTMLInputElement | HTMLTextAreaElement>) => void;
   onAdd: () => void;
@@ -2311,7 +2208,7 @@ function QueueView({ queue, input, notice, runtimeReady, singleDownloadActive, i
           <label><input type="checkbox" disabled={!settingsEditable} checked={settings.subtitles} onChange={(event) => onSettings({ subtitles: event.target.checked })}/> Субтитри, якщо доступні</label>
           <label><input type="checkbox" disabled={!settingsEditable} checked={settings.multiItem} onChange={(event) => onSettings({ multiItem: event.target.checked })}/> Завантажувати всю добірку за кожним посиланням</label>
         </div>
-        <label className="queue-browser-picker">Авторизація через браузер<select disabled={!settingsEditable} value={settings.cookiesBrowser || ""} onChange={(event) => onSettings({ cookiesBrowser: event.target.value || null })}><option value="">Не використовувати cookies</option>{!isWindows && <option value="safari">Safari</option>}<option value="edge">Microsoft Edge</option><option value="chrome">Google Chrome</option><option value="firefox">Firefox</option><option value="brave">Brave</option><option value="vivaldi">Vivaldi</option></select><small>Потрібно лише для сайтів, які просять увійти або підтвердити вік.</small></label>
+        <label className="queue-browser-picker">Авторизація через браузер<select disabled={!settingsEditable} value={settings.cookiesBrowser || ""} onChange={(event) => onSettings({ cookiesBrowser: event.target.value || null })}><option value="">Не використовувати cookies</option><option value="edge">Microsoft Edge</option><option value="chrome">Google Chrome</option><option value="firefox">Firefox</option><option value="brave">Brave</option><option value="vivaldi">Vivaldi</option></select><small>Потрібно лише для сайтів, які просять увійти або підтвердити вік.</small></label>
         <div className="folder-row"><div className="folder-copy"><span className="field-label">Зберегти все у</span><div className="folder-value"><Icon name="folder" size={18}/><span>{settings.outputDir || "Папку не обрано"}</span></div></div><button className="secondary-button" disabled={!settingsEditable} onClick={onChooseFolder}>Змінити</button></div>
       </div>
     </details>}

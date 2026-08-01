@@ -41,8 +41,8 @@ fi
 
 cd "$PROJECT_DIR"
 
-if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
-  echo "Release-build заборонено: tracked-файли мають незакомічені зміни."
+if [[ -n "$(git status --porcelain)" ]]; then
+  echo "Release-build заборонено: репозиторій має незакомічені або незатрекані файли."
   exit 1
 fi
 
@@ -50,8 +50,8 @@ npm run tauri build -- --bundles app --target aarch64-apple-darwin
 
 VERSION="$(node -p "JSON.parse(require('fs').readFileSync('src-tauri/tauri.conf.json')).version")"
 BUNDLE_DIR="$PROJECT_DIR/src-tauri/target/aarch64-apple-darwin/release/bundle"
-APP_PATH="$BUNDLE_DIR/macos/yt-dlp BD.app"
-DMG_PATH="$BUNDLE_DIR/dmg/yt-dlp BD_${VERSION}_aarch64.dmg"
+APP_PATH="$BUNDLE_DIR/macos/Baldojnyi Downloader.app"
+DMG_PATH="$BUNDLE_DIR/dmg/Baldojnyi Downloader_${VERSION}_aarch64.dmg"
 BUILD_STAGING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/yt-dlp-bd-dmg.XXXXXX")"
 
 case "$BUILD_STAGING_DIR" in
@@ -89,9 +89,9 @@ fi
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 
 mkdir -p "$BUNDLE_DIR/dmg"
-ditto "$APP_PATH" "$BUILD_STAGING_DIR/yt-dlp BD.app"
+ditto "$APP_PATH" "$BUILD_STAGING_DIR/Baldojnyi Downloader.app"
 ln -s /Applications "$BUILD_STAGING_DIR/Applications"
-hdiutil create -volname "yt-dlp BD" -srcfolder "$BUILD_STAGING_DIR" -ov -format UDZO "$DMG_PATH"
+hdiutil create -volname "Baldojnyi Downloader" -srcfolder "$BUILD_STAGING_DIR" -ov -format UDZO "$DMG_PATH"
 
 codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$DMG_PATH"
 codesign --verify --strict --verbose=2 "$DMG_PATH"

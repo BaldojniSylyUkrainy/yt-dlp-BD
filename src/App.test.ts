@@ -7,12 +7,13 @@ import {
   defaultCookieBrowser,
   groupHistoryEntries,
   historyPaths,
-  isCurrentProbe,
+  inputUrlState,
   isLikelyMultiItemUrl,
   parseHistoryStorage,
   preflightAllowsStart,
   preflightConfidenceLabel,
   runtimeInstallCommand,
+  shouldShowMultiItemIntent,
   shouldPlayCompletionSound,
   shouldPlayQueueCompletionSound,
   shouldCacheHistoryThumbnail,
@@ -259,6 +260,11 @@ describe("playlist intent detection", () => {
   it("does not treat an ordinary watch URL as a collection", () => {
     expect(isLikelyMultiItemUrl("https://youtube.com/watch?v=VIDEO")).toBe(false);
   });
+
+  it("reveals collection controls when an extractor reports multiple media items", () => {
+    expect(shouldShowMultiItemIntent("https://www.threads.com/@author/post/POST", 3)).toBe(true);
+    expect(shouldShowMultiItemIntent("https://www.threads.com/@author/post/POST", 1)).toBe(false);
+  });
 });
 
 describe("preflight and retry guards", () => {
@@ -286,9 +292,10 @@ describe("preflight and retry guards", () => {
     expect(runtimeInstallCommand("deno")).toBe("install_deno");
   });
 
-  it("rejects a stale probe response", () => {
-    expect(isCurrentProbe(8, 7)).toBe(false);
-    expect(isCurrentProbe(8, 8)).toBe(true);
+  it("validates link syntax without waiting for a network availability probe", () => {
+    expect(inputUrlState("")).toBe("idle");
+    expect(inputUrlState("https://www.instagram.com/reel/example/")).toBe("valid");
+    expect(inputUrlState("not a link")).toBe("invalid");
   });
 
   it("preserves the selected output format during audio conversion", () => {
@@ -303,10 +310,13 @@ describe("platform defaults", () => {
     expect(defaultCookieBrowser("windows", null)).toBe("edge");
     expect(defaultCookieBrowser("windows", "safari")).toBe("edge");
     expect(defaultCookieBrowser("windows", "chrome")).toBe("chrome");
+    expect(defaultCookieBrowser("windows", "old-browser")).toBe("edge");
   });
 
-  it("keeps Safari as the macOS default", () => {
-    expect(defaultCookieBrowser("macos", null)).toBe("safari");
+  it("uses Chrome on macOS because app-level Safari cookie access is restricted", () => {
+    expect(defaultCookieBrowser("macos", null)).toBe("chrome");
+    expect(defaultCookieBrowser("macos", "safari")).toBe("chrome");
+    expect(defaultCookieBrowser("macos", "corrupted")).toBe("chrome");
   });
 });
 

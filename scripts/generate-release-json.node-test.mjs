@@ -26,11 +26,31 @@ test("uses the public product name and version for GitHub Release titles", async
   assert.match(workflow, /description: "Four-part release tag from package\.json, for example vX\.Y\.Z\.H"/);
 });
 
+test("uses the branded installed app name and Windows installer icons", async () => {
+  const tauriConfig = JSON.parse(await readFile("src-tauri/tauri.conf.json", "utf8"));
+  const macBuild = await readFile("scripts/build-macos.sh", "utf8");
+  const releaseGenerator = await readFile("scripts/generate-release-json.mjs", "utf8");
+  assert.equal(tauriConfig.productName, "Baldojnyi Downloader");
+  assert.equal(tauriConfig.bundle.windows.nsis.installerIcon, "icons/icon.ico");
+  assert.equal(tauriConfig.bundle.windows.nsis.uninstallerIcon, "icons/icon.ico");
+  assert.match(macBuild, /Baldojnyi Downloader\.app/);
+  assert.match(macBuild, /git status --porcelain\)/);
+  assert.doesNotMatch(macBuild, /--untracked-files=no/);
+  assert.match(releaseGenerator, /Baldojnyi Downloader\.app\.tar\.gz/);
+});
+
 test("grants repository write access only to the final draft-release job", async () => {
   const workflow = await readFile(".github/workflows/release.yml", "utf8");
   assert.match(workflow, /^permissions:\r?\n  contents: read$/m);
   assert.match(workflow, /publish-draft:[\s\S]*?permissions:\r?\n      contents: write/);
   assert.equal(workflow.match(/contents: write/g)?.length, 1);
+});
+
+test("uses Node 24 artifact actions in both platform release jobs", async () => {
+  const workflow = await readFile(".github/workflows/release.yml", "utf8");
+  assert.equal(workflow.match(/actions\/upload-artifact@v7/g)?.length, 2);
+  assert.equal(workflow.match(/actions\/download-artifact@v7/g)?.length, 1);
+  assert.doesNotMatch(workflow, /actions\/(?:upload|download)-artifact@v4/);
 });
 
 test("keeps every current project and public release version in sync", async () => {

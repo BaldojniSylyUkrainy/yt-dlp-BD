@@ -1,5 +1,6 @@
 export const QUEUE_LIMIT = 50;
 export const QUEUE_STORAGE_KEY = "downloadQueue.v1";
+export const SUPPORTED_COOKIE_BROWSERS = ["edge", "chrome", "firefox", "brave", "vivaldi"] as const;
 
 export type QueueItemStatus =
   | "pending"
@@ -65,6 +66,12 @@ export type DownloadQueue = {
   updatedAt: string;
 };
 
+export function normalizeCookieBrowser(value: unknown): string | null {
+  return typeof value === "string" && (SUPPORTED_COOKIE_BROWSERS as readonly string[]).includes(value)
+    ? value
+    : null;
+}
+
 const ITEM_STATUSES = new Set<QueueItemStatus>([
   "pending",
   "starting",
@@ -86,6 +93,12 @@ export function normalizeHttpUrl(value: string): string | null {
   try {
     const parsed = new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`);
     if (!(["http:", "https:"] as string[]).includes(parsed.protocol) || !parsed.hostname) return null;
+    const host = parsed.hostname.toLowerCase();
+    if ((host === "tiktok.com" || host.endsWith(".tiktok.com")) && /^\/@[^/]+\/video\/\d+\/?$/i.test(parsed.pathname)) {
+      parsed.pathname = parsed.pathname.replace(/\/$/, "");
+      parsed.search = "";
+      parsed.hash = "";
+    }
     return parsed.toString();
   } catch {
     return null;
@@ -274,7 +287,7 @@ function normalizeQueueSettings(value: unknown, fallback: QueueSettings): QueueS
     audioFormat: safeString(settings.audioFormat, fallback.audioFormat),
     subtitles: typeof settings.subtitles === "boolean" ? settings.subtitles : fallback.subtitles,
     multiItem: typeof settings.multiItem === "boolean" ? settings.multiItem : fallback.multiItem,
-    cookiesBrowser: safeNullableString(settings.cookiesBrowser),
+    cookiesBrowser: normalizeCookieBrowser(settings.cookiesBrowser),
   };
 }
 
