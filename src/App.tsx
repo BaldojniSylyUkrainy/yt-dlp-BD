@@ -1450,7 +1450,7 @@ function App() {
     historyContexts.current.set(id, context);
     const initialJob: Job = {
       id,
-      url: downloadUrl,
+      url: normalizedDownloadUrl,
       title: parsedHost,
       status: "starting",
       percent: 0,
@@ -1473,7 +1473,7 @@ function App() {
       await invoke<void>("start_download", {
         request: {
           id,
-          url: /^https?:\/\//i.test(downloadUrl.trim()) ? downloadUrl.trim() : `https://${downloadUrl.trim()}`,
+          url: normalizedDownloadUrl,
           outputDir,
           mode,
           quality,

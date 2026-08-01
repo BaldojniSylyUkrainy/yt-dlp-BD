@@ -263,6 +263,7 @@ enum ConversionAttemptError {
 struct AuthRetryPolicy {
     allow_browser_retry: bool,
     youtube_unavailable_may_need_cookies: bool,
+    forbidden_may_need_cookies: bool,
 }
 
 #[derive(Clone)]
@@ -1306,13 +1307,17 @@ fn is_threads_host(host: &str) -> bool {
     host_matches(host, "threads.com") || host_matches(host, "threads.net")
 }
 
+fn is_tiktok_host(host: &str) -> bool {
+    host_matches(host, "tiktok.com")
+}
+
 fn normalize_media_url(value: &str) -> Result<Url, String> {
     let mut parsed = Url::parse(value).map_err(|_| "Вставте повне посилання".to_string())?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
         return Err("Підтримуються лише HTTP та HTTPS посилання".into());
     }
     let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
-    let canonical_tiktok_path = if host_matches(&host, "tiktok.com") {
+    let canonical_tiktok_path = if is_tiktok_host(&host) {
         parsed
             .path_segments()
             .map(|segments| {
@@ -1370,7 +1375,7 @@ fn extraction_args(
     quality: &str,
     multi_item: bool,
     cookies_browser: Option<&str>,
-    threads: bool,
+    impersonate_chrome: bool,
 ) -> Result<Vec<OsString>, String> {
     let mut args = vec![
         OsString::from("--plugin-dirs"),
@@ -1379,7 +1384,7 @@ fn extraction_args(
         OsString::from("-f"),
         OsString::from(format_selector(mode, quality)),
     ];
-    if threads {
+    if impersonate_chrome {
         args.extend([OsString::from("--impersonate"), OsString::from("chrome")]);
     }
     if let Some(browser) = cookies_browser {
@@ -1461,6 +1466,7 @@ async fn probe_url_inner(
     let url = parsed.to_string();
     let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
     let is_threads = is_threads_host(&host);
+    let impersonate_chrome = is_threads || is_tiktok_host(&host);
     if !playlist && (host_matches(&host, "youtube.com") || host_matches(&host, "youtu.be")) {
         return probe_oembed(&url, "https://www.youtube.com/oembed", "YouTube").await;
     }
@@ -1489,7 +1495,7 @@ async fn probe_url_inner(
         "1",
     ]);
     command.args(["--plugin-dirs", plugin_directory.to_string_lossy().as_ref()]);
-    if is_threads {
+    if impersonate_chrome {
         command.args(["--impersonate", "chrome"]);
     }
     if playlist {
@@ -1842,7 +1848,11 @@ fn emit_line(app: &AppHandle, id: &str, line: &str) {
     }
 }
 
-fn looks_like_auth_error(line: &str, youtube_unavailable_may_need_cookies: bool) -> bool {
+fn looks_like_auth_error(
+    line: &str,
+    youtube_unavailable_may_need_cookies: bool,
+    forbidden_may_need_cookies: bool,
+) -> bool {
     let value = line.to_ascii_lowercase();
     let explicit_auth_error = [
         "sign in to confirm",
@@ -1862,12 +1872,18 @@ fn looks_like_auth_error(line: &str, youtube_unavailable_may_need_cookies: bool)
         && ["video unavailable", "video is unavailable"]
             .iter()
             .any(|pattern| value.contains(pattern));
-    explicit_auth_error || ambiguous_youtube_unavailable
+    let ambiguous_forbidden =
+        forbidden_may_need_cookies && (value.contains("403") || value.contains("forbidden"));
+    explicit_auth_error || ambiguous_youtube_unavailable || ambiguous_forbidden
 }
 
 fn should_request_browser_auth(line: &str, policy: AuthRetryPolicy) -> bool {
     policy.allow_browser_retry
-        && looks_like_auth_error(line, policy.youtube_unavailable_may_need_cookies)
+        && looks_like_auth_error(
+            line,
+            policy.youtube_unavailable_may_need_cookies,
+            policy.forbidden_may_need_cookies,
+        )
 }
 
 fn json_number(value: Option<&serde_json::Value>) -> Option<f64> {
@@ -3315,9 +3331,14 @@ fn start_download(
         .host_str()
         .map(|host| is_threads_host(&host.to_ascii_lowercase()))
         .unwrap_or(false);
+    let is_tiktok = parsed
+        .host_str()
+        .map(|host| is_tiktok_host(&host.to_ascii_lowercase()))
+        .unwrap_or(false);
     let auth_retry = AuthRetryPolicy {
         allow_browser_retry: request.cookies_browser.is_none(),
         youtube_unavailable_may_need_cookies: request.cookies_browser.is_none() && is_youtube,
+        forbidden_may_need_cookies: request.cookies_browser.is_none() && is_tiktok,
     };
     let output_dir = PathBuf::from(&request.output_dir);
     if !output_dir.is_dir() {
@@ -3368,7 +3389,7 @@ fn start_download(
         &request.quality,
         request.multi_item,
         request.cookies_browser.as_deref(),
-        is_threads,
+        is_threads || is_tiktok,
     )?);
     if request.multi_item {
         command.args([
@@ -4430,10 +4451,11 @@ mod tests {
         assert_eq!(yt_dlp_output_encoding_args(), ["--encoding", "UTF-8"]);
         let unavailable = "ERROR: [youtube] example: This video is unavailable";
 
-        assert!(looks_like_auth_error(unavailable, true));
-        assert!(!looks_like_auth_error(unavailable, false));
+        assert!(looks_like_auth_error(unavailable, true, false));
+        assert!(!looks_like_auth_error(unavailable, false, false));
         assert!(looks_like_auth_error(
             "ERROR: Sign in to confirm your age",
+            false,
             false
         ));
         assert!(!should_request_browser_auth(
@@ -4441,6 +4463,31 @@ mod tests {
             AuthRetryPolicy {
                 allow_browser_retry: false,
                 youtube_unavailable_may_need_cookies: false,
+                forbidden_may_need_cookies: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn retries_tiktok_forbidden_with_browser_cookies_only_when_allowed() {
+        let forbidden = "ERROR: [TikTok] HTTP Error 403: Forbidden";
+
+        assert!(looks_like_auth_error(forbidden, false, true));
+        assert!(!looks_like_auth_error(forbidden, false, false));
+        assert!(should_request_browser_auth(
+            forbidden,
+            AuthRetryPolicy {
+                allow_browser_retry: true,
+                youtube_unavailable_may_need_cookies: false,
+                forbidden_may_need_cookies: true,
+            }
+        ));
+        assert!(!should_request_browser_auth(
+            forbidden,
+            AuthRetryPolicy {
+                allow_browser_retry: false,
+                youtube_unavailable_may_need_cookies: false,
+                forbidden_may_need_cookies: true,
             }
         ));
     }
