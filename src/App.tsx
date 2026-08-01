@@ -387,6 +387,9 @@ export function isLikelyMultiItemUrl(value: string): boolean {
     if (host === "youtu.be" || host.endsWith(".youtu.be") || host === "youtube.com" || host.endsWith(".youtube.com")) {
       return path === "/playlist" || parsed.searchParams.has("list");
     }
+    if (host === "threads.com" || host.endsWith(".threads.com") || host === "threads.net" || host.endsWith(".threads.net")) {
+      return /^\/(?:share\/[^/]+|@[^/]+\/(?:post|t)\/[^/]+)\/?$/i.test(parsed.pathname);
+    }
     return ["/playlist/", "/playlists/", "/sets/", "/album/", "/albums/", "/collection/", "/collections/", "/showcase/"].some((segment) => path.includes(segment));
   } catch {
     return false;
@@ -395,6 +398,26 @@ export function isLikelyMultiItemUrl(value: string): boolean {
 
 export function shouldShowMultiItemIntent(value: string, itemCount?: number | null): boolean {
   return isLikelyMultiItemUrl(value) || Boolean(itemCount && itemCount > 1);
+}
+
+export function playlistIntentToMultiItem(intent: "single" | "playlist"): boolean {
+  return intent === "playlist";
+}
+
+export function DownloadCollectionIntent({ url, intent, onIntentChange }: {
+  url: string;
+  intent: "single" | "playlist";
+  onIntentChange: (intent: "single" | "playlist") => void;
+}) {
+  if (!shouldShowMultiItemIntent(url)) return null;
+  return <div className="collection-intent">
+    <span className="field-label">Що взяти з добірки</span>
+    <div className="segmented">
+      <button type="button" className={intent === "single" ? "selected" : ""} onClick={() => onIntentChange("single")}>Лише це відео</button>
+      <button type="button" className={intent === "playlist" ? "selected" : ""} onClick={() => onIntentChange("playlist")}>Уся добірка</button>
+    </div>
+    <small>{intent === "single" ? "За замовчуванням завантажиться лише поточний ролик." : "Завантажаться всі доступні елементи з безпечними паузами між ними."}</small>
+  </div>;
 }
 
 function shortVersion(value: string | null): string {
@@ -673,7 +696,6 @@ function App() {
   const isWindows = runtime?.platform === "windows";
   const normalizedInputUrl = normalizeInputUrl(url);
   const urlState = inputUrlState(url);
-  const multiItemCandidate = shouldShowMultiItemIntent(url);
   const closeActivities = appCloseActivityLabels({
     singleStage: active ? job?.status || null : null,
     batchDownload: Boolean(queueProcessActive || downloadQueue?.status === "running"),
@@ -1338,7 +1360,7 @@ function App() {
     }
   }
 
-  async function launchDownload(downloadUrl: string, parsedHost: string, preflightResult: PreflightResult, cookiesBrowser?: string, playlist = playlistIntent === "playlist") {
+  async function launchDownload(downloadUrl: string, parsedHost: string, preflightResult: PreflightResult, cookiesBrowser?: string, playlist = playlistIntentToMultiItem(playlistIntent)) {
     const id = crypto.randomUUID();
     const normalizedDownloadUrl = normalizeInputUrl(downloadUrl) || downloadUrl;
     const thumbnail = youtubeThumbnailFromInput(normalizedDownloadUrl);
@@ -1402,7 +1424,7 @@ function App() {
     }
   }
 
-  async function runPreflight(downloadUrl: string, parsedHost: string, cookiesBrowser?: string, playlist = playlistIntent === "playlist") {
+  async function runPreflight(downloadUrl: string, parsedHost: string, cookiesBrowser?: string, playlist = playlistIntentToMultiItem(playlistIntent)) {
     setPendingStart(true);
     setFormError("");
     try {
@@ -1956,14 +1978,7 @@ function App() {
           </div>
           {urlState === "invalid" && <div className="url-error"><Icon name="x" size={14}/><span>Вставте повне HTTP або HTTPS посилання</span></div>}
 
-          {multiItemCandidate && <div className="collection-intent">
-            <span className="field-label">Що взяти з добірки</span>
-            <div className="segmented">
-              <button type="button" className={playlistIntent === "single" ? "selected" : ""} onClick={() => setPlaylistIntent("single")}>Лише це відео</button>
-              <button type="button" className={playlistIntent === "playlist" ? "selected" : ""} onClick={() => setPlaylistIntent("playlist")}>Уся добірка</button>
-            </div>
-            <small>{playlistIntent === "single" ? "За замовчуванням завантажиться лише поточний ролик." : "Завантажаться всі доступні елементи з безпечними паузами між ними."}</small>
-          </div>}
+          <DownloadCollectionIntent url={url} intent={playlistIntent} onIntentChange={setPlaylistIntent} />
 
           <div className="choice-grid">
             <div>
