@@ -46,6 +46,13 @@ test("grants repository write access only to the final draft-release job", async
   assert.equal(workflow.match(/contents: write/g)?.length, 1);
 });
 
+test("uses Node 24 artifact actions in both platform release jobs", async () => {
+  const workflow = await readFile(".github/workflows/release.yml", "utf8");
+  assert.equal(workflow.match(/actions\/upload-artifact@v7/g)?.length, 2);
+  assert.equal(workflow.match(/actions\/download-artifact@v7/g)?.length, 1);
+  assert.doesNotMatch(workflow, /actions\/(?:upload|download)-artifact@v4/);
+});
+
 test("keeps every current project and public release version in sync", async () => {
   const packageJson = JSON.parse(await readFile("package.json", "utf8"));
   const packageLock = JSON.parse(await readFile("package-lock.json", "utf8"));

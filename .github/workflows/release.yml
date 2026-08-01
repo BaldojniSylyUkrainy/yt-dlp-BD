@@ -79,7 +79,7 @@ jobs:
           Copy-Item -LiteralPath $installers[0].FullName -Destination "release-assets/$target"
           Copy-Item -LiteralPath $signature -Destination "release-assets/$target.sig"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-windows
           path: release-assets/
@@ -188,7 +188,7 @@ jobs:
             }
           done
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-macos
           path: |

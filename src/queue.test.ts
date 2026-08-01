@@ -5,6 +5,7 @@ import {
   commitQueueInput,
   createQueueItem,
   nextPendingQueueItem,
+  normalizeCookieBrowser,
   normalizeHttpUrl,
   parseQueueStorage,
   QUEUE_LIMIT,
@@ -27,6 +28,11 @@ const settings: QueueSettings = {
 };
 
 describe("batch queue input", () => {
+  it("accepts only browser identifiers exposed by the UI", () => {
+    expect(normalizeCookieBrowser("firefox")).toBe("firefox");
+    expect(normalizeCookieBrowser("safari")).toBeNull();
+    expect(normalizeCookieBrowser("corrupted-browser")).toBeNull();
+  });
   it("accepts arbitrary HTTP and HTTPS hosts without a service allowlist", () => {
     expect(normalizeHttpUrl("example.org/media/1")).toBe("https://example.org/media/1");
     expect(normalizeHttpUrl("ftp://example.org/file")).toBeNull();
@@ -123,6 +129,19 @@ describe("batch queue lifecycle", () => {
     }), settings);
     expect(restored?.items).toEqual([]);
     expect(restored?.settings.outputDir).toBe("/Volumes/Archive");
+  });
+
+  it("drops an unsupported persisted cookie browser instead of failing the queue", () => {
+    const restored = parseQueueStorage(JSON.stringify({
+      version: 1,
+      status: "draft",
+      settings: { ...settings, cookiesBrowser: "old-browser" },
+      items: [],
+      activeItemId: null,
+      createdAt: "2026-07-28T00:00:00.000Z",
+      updatedAt: "2026-07-28T00:01:00.000Z",
+    }), settings);
+    expect(restored?.settings.cookiesBrowser).toBeNull();
   });
 
   it("treats pause-after-current as an active process and blocks competing work", () => {

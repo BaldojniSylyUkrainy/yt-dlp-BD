@@ -15,6 +15,7 @@ import {
   canEditQueueItem,
   commitQueueInput,
   nextPendingQueueItem,
+  normalizeCookieBrowser,
   normalizeHttpUrl,
   parseQueueStorage,
   QUEUE_LIMIT,
@@ -162,7 +163,8 @@ export function runtimeInstallCommand(stage: Exclude<RuntimeStage, null>): strin
 }
 
 export function defaultCookieBrowser(platform: string, stored: string | null): string {
-  if (stored && stored !== "safari") return stored;
+  const normalized = normalizeCookieBrowser(stored);
+  if (normalized) return normalized;
   return platform === "windows" ? "edge" : "chrome";
 }
 
@@ -2116,7 +2118,7 @@ function App() {
           <h2 id="auth-title">Увійдіть через браузер</h2>
           <p id="auth-description">Сайт просить підтвердити вік, акаунт або що ви не бот. Увійдіть на цей сайт у браузері та виберіть його нижче.</p>
           <label className="browser-picker">Ваш браузер<select value={cookieBrowser} onChange={(event) => setCookieBrowser(event.target.value)}><option value="edge">Microsoft Edge</option><option value="chrome">Google Chrome</option><option value="firefox">Firefox</option><option value="brave">Brave</option><option value="vivaldi">Vivaldi</option></select></label>
-          <div className="modal-detail">yt-dlp прочитає cookies безпосередньо з обраного браузера лише для повторної спроби. yt-dlp BD не експортує їх у файл і не зберігає.</div>
+          <div className="modal-detail">yt-dlp прочитає cookies безпосередньо з обраного браузера лише для повторної спроби. yt-dlp BD не експортує їх у файл і не зберігає.{isWindows && " На Windows Firefox зазвичай читається надійніше; оберіть саме той браузер, де ви вже увійшли на сайт."}</div>
           <div className="modal-actions"><button className="secondary-button" onClick={() => setJob(null)}>Скасувати</button><button className="warning-button auth" disabled={pendingStart} onClick={retryWithCookies}>{pendingStart ? "Перевіряємо…" : "Повторити з cookies"}</button></div>
         </DialogSurface>
       </div>}

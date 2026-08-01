@@ -34,6 +34,9 @@ const THREADS_EXTRACTOR_SOURCE: &str = include_str!("../resources/threads_extrac
 const YTDLP_OUTPUT_TEMPLATE: &str = "%(title).140B [%(id).40B].%(ext)s";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_POWERSHELL_UTF8_PREFIX: &str =
+    "$OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); ";
 
 #[cfg(target_os = "windows")]
 #[link(name = "kernel32")]
@@ -449,6 +452,11 @@ fn configure_tokio_command(command: &mut tokio::process::Command) {
     command.creation_flags(CREATE_NO_WINDOW);
     #[cfg(not(target_os = "windows"))]
     let _ = command;
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_powershell_script(script: &str) -> String {
+    format!("{WINDOWS_POWERSHELL_UTF8_PREFIX}{script}")
 }
 
 fn command_version(path: &Path, args: &[&str]) -> Option<String> {
@@ -1192,6 +1200,29 @@ fn friendly_download_error(message: &str) -> String {
     {
         "Відео приватне. Для завантаження потрібен доступ через ваш браузер.".into()
     } else if [
+        "failed to decrypt with dpapi",
+        "failed to decrypt cookie",
+        "app-bound encryption",
+    ]
+    .iter()
+    .any(|pattern| value.contains(pattern))
+    {
+        "Windows не зміг розшифрувати cookies цього браузера. Увійдіть на сайт у Firefox і повторіть через Firefox або виберіть інший доступний браузер."
+            .into()
+    } else if [
+        "could not copy chrome cookie database",
+        "could not copy edge cookie database",
+        "database is locked",
+    ]
+    .iter()
+    .any(|pattern| value.contains(pattern))
+    {
+        "Браузер заблокував свою базу cookies. Повністю закрийте його, відкрийте знову, увійдіть на сайт і повторіть завантаження."
+            .into()
+    } else if value.contains("could not find") && value.contains("cookies database") {
+        "Cookies обраного браузера не знайдено. Оберіть браузер, у якому ви вже увійшли на цей сайт."
+            .into()
+    } else if [
         "sign in",
         "login required",
         "log in",
@@ -1291,6 +1322,17 @@ fn download_error_code(message: &str) -> &'static str {
         .any(|pattern| value.contains(pattern))
     {
         "unsupported"
+    } else if [
+        "failed to decrypt with dpapi",
+        "failed to decrypt cookie",
+        "app-bound encryption",
+        "cookie database",
+        "cookies database",
+    ]
+    .iter()
+    .any(|pattern| value.contains(pattern))
+    {
+        "auth_required"
     } else if ["404", "not found", "removed", "unavailable"]
         .iter()
         .any(|pattern| value.contains(pattern))
@@ -1483,7 +1525,7 @@ async fn probe_url_inner(
     let url = parsed.to_string();
     let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
     let is_threads = is_threads_host(&host);
-    let impersonate_chrome = is_threads || is_tiktok_host(&host);
+    let is_tiktok = is_tiktok_host(&host);
     if !playlist && (host_matches(&host, "youtube.com") || host_matches(&host, "youtu.be")) {
         return probe_oembed(&url, "https://www.youtube.com/oembed", "YouTube").await;
     }
@@ -1512,8 +1554,8 @@ async fn probe_url_inner(
         "1",
     ]);
     command.args(["--plugin-dirs", plugin_directory.to_string_lossy().as_ref()]);
-    if impersonate_chrome {
-        command.args(["--impersonate", "chrome"]);
+    if let Some(target) = impersonation_target(is_threads, is_tiktok) {
+        command.args(["--impersonate", target]);
     }
     if playlist {
         command.args(["--yes-playlist", "--flat-playlist", "--dump-single-json"]);
@@ -1715,9 +1757,11 @@ fn check_vpn(host: String) -> Result<VpnStatus, String> {
                     "-NoLogo",
                     "-NoProfile",
                     "-NonInteractive",
-                    "-Command",
-                    "$route = Find-NetRoute -RemoteIPAddress $env:YTDLP_ROUTE_IP -ErrorAction Stop | Select-Object -First 1; $route.InterfaceAlias",
                 ])
+                .arg("-Command")
+                .arg(windows_powershell_script(
+                    "$route = Find-NetRoute -RemoteIPAddress $env:YTDLP_ROUTE_IP -ErrorAction Stop | Select-Object -First 1; $route.InterfaceAlias",
+                ))
                 .env("YTDLP_ROUTE_IP", ip)
                 .output()
                 .ok()
@@ -2339,6 +2383,12 @@ fn read_lossy_line<R: BufRead>(
     Ok(Some(String::from_utf8_lossy(buffer).into_owned()))
 }
 
+fn read_lossy_to_string<R: Read>(mut reader: R) -> std::io::Result<String> {
+    let mut buffer = Vec::new();
+    reader.read_to_end(&mut buffer)?;
+    Ok(String::from_utf8_lossy(&buffer).into_owned())
+}
+
 fn read_output<R: Read + Send + 'static>(
     app: AppHandle,
     manager: DownloadManager,
@@ -2930,8 +2980,7 @@ fn run_conversion_attempt(
     let error_reader = stderr.map(|stderr| {
         let errors = errors.clone();
         thread::spawn(move || {
-            let mut text = String::new();
-            let _ = BufReader::new(stderr).read_to_string(&mut text);
+            let text = read_lossy_to_string(BufReader::new(stderr)).unwrap_or_default();
             if let Ok(mut target) = errors.lock() {
                 *target = text;
             }
@@ -4608,6 +4657,17 @@ mod tests {
         );
         assert!(friendly_download_error("No space left on device").contains("вільного місця"));
         assert!(
+            friendly_download_error("WARNING: failed to decrypt with DPAPI").contains("Firefox")
+        );
+        assert!(
+            friendly_download_error("ERROR: Could not copy Chrome cookie database")
+                .contains("закрийте")
+        );
+        assert!(
+            friendly_download_error("ERROR: could not find chrome cookies database")
+                .contains("не знайдено")
+        );
+        assert!(
             friendly_download_error("[youtube] example: This video is unavailable")
                 .contains("недоступне")
         );
@@ -4675,6 +4735,20 @@ mod tests {
         }
 
         assert_eq!(lines, ["first", "second \u{fffd} \u{fffd}", "third"]);
+        let mut ffmpeg_error = "Помилка ".as_bytes().to_vec();
+        ffmpeg_error.extend_from_slice(&[0x96]);
+        ffmpeg_error.extend_from_slice(" шлях".as_bytes());
+        assert_eq!(
+            read_lossy_to_string(ffmpeg_error.as_slice()).unwrap(),
+            "Помилка \u{fffd} шлях"
+        );
+    }
+
+    #[test]
+    fn windows_powershell_commands_force_utf8_output() {
+        let script = windows_powershell_script("Write-Output 'Мережа'");
+        assert!(script.starts_with(WINDOWS_POWERSHELL_UTF8_PREFIX));
+        assert!(script.ends_with("Write-Output 'Мережа'"));
     }
 
     #[test]

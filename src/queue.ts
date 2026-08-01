@@ -1,5 +1,6 @@
 export const QUEUE_LIMIT = 50;
 export const QUEUE_STORAGE_KEY = "downloadQueue.v1";
+export const SUPPORTED_COOKIE_BROWSERS = ["edge", "chrome", "firefox", "brave", "vivaldi"] as const;
 
 export type QueueItemStatus =
   | "pending"
@@ -64,6 +65,12 @@ export type DownloadQueue = {
   createdAt: string;
   updatedAt: string;
 };
+
+export function normalizeCookieBrowser(value: unknown): string | null {
+  return typeof value === "string" && (SUPPORTED_COOKIE_BROWSERS as readonly string[]).includes(value)
+    ? value
+    : null;
+}
 
 const ITEM_STATUSES = new Set<QueueItemStatus>([
   "pending",
@@ -280,7 +287,7 @@ function normalizeQueueSettings(value: unknown, fallback: QueueSettings): QueueS
     audioFormat: safeString(settings.audioFormat, fallback.audioFormat),
     subtitles: typeof settings.subtitles === "boolean" ? settings.subtitles : fallback.subtitles,
     multiItem: typeof settings.multiItem === "boolean" ? settings.multiItem : fallback.multiItem,
-    cookiesBrowser: safeNullableString(settings.cookiesBrowser),
+    cookiesBrowser: normalizeCookieBrowser(settings.cookiesBrowser),
   };
 }
 

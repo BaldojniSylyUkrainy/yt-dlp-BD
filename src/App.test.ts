@@ -310,11 +310,13 @@ describe("platform defaults", () => {
     expect(defaultCookieBrowser("windows", null)).toBe("edge");
     expect(defaultCookieBrowser("windows", "safari")).toBe("edge");
     expect(defaultCookieBrowser("windows", "chrome")).toBe("chrome");
+    expect(defaultCookieBrowser("windows", "old-browser")).toBe("edge");
   });
 
   it("uses Chrome on macOS because app-level Safari cookie access is restricted", () => {
     expect(defaultCookieBrowser("macos", null)).toBe("chrome");
     expect(defaultCookieBrowser("macos", "safari")).toBe("chrome");
+    expect(defaultCookieBrowser("macos", "corrupted")).toBe("chrome");
   });
 });
 
