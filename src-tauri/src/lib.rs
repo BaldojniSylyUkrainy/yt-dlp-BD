@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs,
     io::{BufRead, BufReader, Read},
     net::{IpAddr, SocketAddr, ToSocketAddrs},
@@ -1469,6 +1469,17 @@ fn extraction_args(
         ]);
     }
     Ok(args)
+}
+
+fn replace_option_value(args: &[OsString], option: &str, value: &str) -> Vec<OsString> {
+    let mut replaced = args.to_vec();
+    for index in 0..replaced.len().saturating_sub(1) {
+        if replaced[index] == OsStr::new(option) {
+            replaced[index + 1] = OsString::from(value);
+            break;
+        }
+    }
+    replaced
 }
 
 async fn probe_oembed(url: &str, endpoint: &str, extractor: &str) -> Result<MediaPreview, String> {
@@ -3592,6 +3603,7 @@ fn start_download(
 
     let retry_program: OsString = command.get_program().to_os_string();
     let retry_args: Vec<OsString> = command.get_args().map(OsString::from).collect();
+    let tiktok_retry_args = replace_option_value(&retry_args, "--impersonate", "chrome");
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -3663,6 +3675,7 @@ fn start_download(
         let mut stdout_reader = stdout_reader;
         let mut stderr_reader = stderr_reader;
         let mut retry_attempt = 0_u8;
+        let mut tiktok_retry_used = false;
         let mut last_disk_check = Instant::now();
         let mut low_disk = false;
         loop {
@@ -3693,6 +3706,101 @@ fn start_download(
                 }
                 let mut cancelled = download_was_cancelled(&manager, &monitor_id);
                 let failure_message = last_error.lock().ok().and_then(|error| error.clone());
+                let tiktok_403 = is_tiktok
+                    && !status.success()
+                    && !low_disk
+                    && failure_message
+                        .as_deref()
+                        .map(|message| message.contains("403"))
+                        .unwrap_or(false);
+                let tiktok_retry_ready = if tiktok_403 && !cancelled && !tiktok_retry_used {
+                    match reset_download_temp_dir(&job_temp_dir) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            if let Ok(mut last_error) = last_error.lock() {
+                                *last_error = Some(error);
+                            }
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                if tiktok_retry_ready {
+                    tiktok_retry_used = true;
+                    manager
+                        .auth_required
+                        .lock()
+                        .ok()
+                        .map(|mut jobs| jobs.remove(&monitor_id));
+                    let retry_message =
+                        "TikTok відхилив запит. Перемикаємо профіль з’єднання й повторюємо…";
+                    let _ = monitor_app.emit(
+                        "download-event",
+                        DownloadEvent {
+                            id: monitor_id.clone(),
+                            kind: "retrying".into(),
+                            percent: None,
+                            speed: None,
+                            eta: None,
+                            message: Some(retry_message.into()),
+                            storage: None,
+                            outputs: None,
+                            title: None,
+                            thumbnail: None,
+                            uploader: None,
+                            extractor: None,
+                            error_code: None,
+                        },
+                    );
+                    if let Ok(mut error) = last_error.lock() {
+                        *error = None;
+                    }
+                    let mut retry_command = Command::new(&retry_program);
+                    configure_command(&mut retry_command);
+                    retry_command
+                        .args(&tiktok_retry_args)
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped());
+                    #[cfg(unix)]
+                    retry_command.process_group(0);
+
+                    match retry_command.spawn() {
+                        Ok(mut retry_child) => {
+                            let retry_stdout = retry_child.stdout.take();
+                            let retry_stderr = retry_child.stderr.take();
+                            active_child = Arc::new(Mutex::new(retry_child));
+                            manager.jobs.lock().ok().map(|mut jobs| {
+                                jobs.insert(monitor_id.clone(), active_child.clone())
+                            });
+                            stdout_reader = retry_stdout.map(|stdout| {
+                                read_output(
+                                    monitor_app.clone(),
+                                    manager.clone(),
+                                    monitor_id.clone(),
+                                    stdout,
+                                    output_reader_state.clone(),
+                                )
+                            });
+                            stderr_reader = retry_stderr.map(|stderr| {
+                                read_output(
+                                    monitor_app.clone(),
+                                    manager.clone(),
+                                    monitor_id.clone(),
+                                    stderr,
+                                    output_reader_state.clone(),
+                                )
+                            });
+                            continue;
+                        }
+                        Err(error) => {
+                            if let Ok(mut last_error) = last_error.lock() {
+                                *last_error =
+                                    Some(format!("Не вдалося повторно запустити yt-dlp: {error}"));
+                            }
+                        }
+                    }
+                }
                 let youtube_403 = is_youtube
                     && !status.success()
                     && !low_disk
@@ -4624,6 +4732,25 @@ mod tests {
         assert_eq!(playlist_flag(false), "--no-playlist");
         assert_eq!(playlist_flag(true), "--yes-playlist");
         assert_eq!(YTDLP_OUTPUT_TEMPLATE, "%(title).140B [%(id).40B].%(ext)s");
+    }
+
+    #[test]
+    fn impersonation_can_be_replaced_for_tiktok_fallback() {
+        let args = vec![
+            OsString::from("--no-playlist"),
+            OsString::from("--impersonate"),
+            OsString::from("Chrome-99:Android-12"),
+            OsString::from("https://www.tiktok.com/@user/video/123"),
+        ];
+        assert_eq!(
+            replace_option_value(&args, "--impersonate", "chrome"),
+            vec![
+                OsString::from("--no-playlist"),
+                OsString::from("--impersonate"),
+                OsString::from("chrome"),
+                OsString::from("https://www.tiktok.com/@user/video/123")
+            ]
+        );
     }
 
     #[test]
