@@ -10,10 +10,10 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use url::Url;
@@ -30,6 +30,8 @@ const MIN_FREE_SPACE_RESERVE: u64 = 500 * 1024 * 1024;
 const DISK_GUARD_TRIGGER: u64 = MIN_FREE_SPACE_RESERVE + 128 * 1024 * 1024;
 const MAX_HISTORY_THUMBNAIL_BYTES: u64 = 8 * 1024 * 1024;
 const HISTORY_THUMBNAIL_CACHE_LIMIT: usize = 550;
+const THREADS_EXTRACTOR_SOURCE: &str = include_str!("../resources/threads_extractor.py");
+const YTDLP_OUTPUT_TEMPLATE: &str = "%(title).140B [%(id).40B].%(ext)s";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -221,6 +223,13 @@ enum VideoEncoder {
     Software,
 }
 
+type EncoderSelectionCache = Option<(PathBuf, Option<SystemTime>, VideoEncoder)>;
+
+fn encoder_selection_cache() -> &'static Mutex<EncoderSelectionCache> {
+    static CACHE: OnceLock<Mutex<EncoderSelectionCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
 impl VideoEncoder {
     fn codec(self) -> &'static str {
         match self {
@@ -240,10 +249,6 @@ impl VideoEncoder {
             Self::Amf => "AMF",
             Self::Software => "H.264 software",
         }
-    }
-
-    fn is_windows_hardware(self) -> bool {
-        matches!(self, Self::Nvenc | Self::QuickSync | Self::Amf)
     }
 }
 
@@ -391,6 +396,39 @@ fn yt_dlp_path(app: &AppHandle) -> Result<PathBuf, String> {
     #[cfg(not(target_os = "windows"))]
     let filename = "yt-dlp";
     Ok(runtime_dir(app)?.join(filename))
+}
+
+fn install_threads_plugin_at(plugin_root: &Path) -> Result<PathBuf, String> {
+    let extractor_directory = plugin_root
+        .join("baldojnyi")
+        .join("yt_dlp_plugins")
+        .join("extractor");
+    fs::create_dir_all(&extractor_directory)
+        .map_err(|error| format!("Не вдалося підготувати Threads-модуль: {error}"))?;
+    let destination = extractor_directory.join("threads_baldojnyi.py");
+    if fs::read(&destination)
+        .map(|content| content == THREADS_EXTRACTOR_SOURCE.as_bytes())
+        .unwrap_or(false)
+    {
+        return Ok(plugin_root.to_path_buf());
+    }
+    let temporary = extractor_directory.join(format!(".threads_baldojnyi-{}.tmp", Uuid::new_v4()));
+    fs::write(&temporary, THREADS_EXTRACTOR_SOURCE)
+        .map_err(|error| format!("Не вдалося записати Threads-модуль: {error}"))?;
+    if let Err(error) = replace_runtime_file(&temporary, &destination, "Threads-модуль") {
+        let _ = fs::remove_file(temporary);
+        return Err(error);
+    }
+    Ok(plugin_root.to_path_buf())
+}
+
+fn threads_plugin_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    static INSTALL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = INSTALL_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "Не вдалося підготувати Threads-модуль".to_string())?;
+    install_threads_plugin_at(&runtime_dir(app)?.join("plugins"))
 }
 
 fn configure_command(command: &mut Command) {
@@ -1264,6 +1302,10 @@ fn host_matches(host: &str, domain: &str) -> bool {
     host == domain || host.ends_with(&format!(".{domain}"))
 }
 
+fn is_threads_host(host: &str) -> bool {
+    host_matches(host, "threads.com") || host_matches(host, "threads.net")
+}
+
 fn normalize_media_url(value: &str) -> Result<Url, String> {
     let mut parsed = Url::parse(value).map_err(|_| "Вставте повне посилання".to_string())?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
@@ -1328,12 +1370,18 @@ fn extraction_args(
     quality: &str,
     multi_item: bool,
     cookies_browser: Option<&str>,
+    threads: bool,
 ) -> Result<Vec<OsString>, String> {
     let mut args = vec![
+        OsString::from("--plugin-dirs"),
+        threads_plugin_dir(app)?.into_os_string(),
         OsString::from(playlist_flag(multi_item)),
         OsString::from("-f"),
         OsString::from(format_selector(mode, quality)),
     ];
+    if threads {
+        args.extend([OsString::from("--impersonate"), OsString::from("chrome")]);
+    }
     if let Some(browser) = cookies_browser {
         let supported = [
             "brave", "chrome", "chromium", "edge", "firefox", "opera", "safari", "vivaldi",
@@ -1412,6 +1460,7 @@ async fn probe_url_inner(
     let parsed = normalize_media_url(&url)?;
     let url = parsed.to_string();
     let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    let is_threads = is_threads_host(&host);
     if !playlist && (host_matches(&host, "youtube.com") || host_matches(&host, "youtu.be")) {
         return probe_oembed(&url, "https://www.youtube.com/oembed", "YouTube").await;
     }
@@ -1426,6 +1475,7 @@ async fn probe_url_inner(
 
     let mut command = tokio::process::Command::new(yt_dlp);
     configure_tokio_command(&mut command);
+    let plugin_directory = threads_plugin_dir(&app)?;
     command.args([
         "--ignore-config",
         yt_dlp_output_encoding_args()[0],
@@ -1438,13 +1488,17 @@ async fn probe_url_inner(
         "--extractor-retries",
         "1",
     ]);
+    command.args(["--plugin-dirs", plugin_directory.to_string_lossy().as_ref()]);
+    if is_threads {
+        command.args(["--impersonate", "chrome"]);
+    }
     if playlist {
         command.args(["--yes-playlist", "--flat-playlist", "--dump-single-json"]);
     } else {
         command.args([
             "--no-playlist",
             "--print",
-            "%(.{title,thumbnail,duration,uploader,channel,extractor,extractor_key,webpage_url})#j",
+            "%(.{title,thumbnail,duration,uploader,channel,extractor,extractor_key,webpage_url,playlist_count})#j",
         ]);
     }
     if let Some(path) = find_deno(&app)?.path {
@@ -1519,7 +1573,9 @@ async fn probe_url_inner(
                 .map(|value| value.round() as u64)
                 .or_else(|| entries.map(|entries| entries.len() as u64))
         } else {
-            Some(1)
+            json_number(metadata.get("playlist_count"))
+                .map(|value| value.round() as u64)
+                .or(Some(1))
         },
     })
 }
@@ -2549,7 +2605,7 @@ fn windows_encoder_candidates() -> [VideoEncoder; 3] {
     ]
 }
 
-fn select_video_encoder(ffmpeg_path: &Path) -> VideoEncoder {
+fn select_video_encoder_uncached(ffmpeg_path: &Path) -> VideoEncoder {
     #[cfg(target_os = "macos")]
     {
         return first_available_encoder(&[VideoEncoder::VideoToolbox], |encoder| {
@@ -2566,12 +2622,49 @@ fn select_video_encoder(ffmpeg_path: &Path) -> VideoEncoder {
     VideoEncoder::Software
 }
 
+fn cached_video_encoder_selection<F>(
+    cache: &Mutex<EncoderSelectionCache>,
+    ffmpeg_path: &Path,
+    modified: Option<SystemTime>,
+    select: F,
+) -> VideoEncoder
+where
+    F: FnOnce() -> VideoEncoder,
+{
+    if let Ok(cache) = cache.lock() {
+        if let Some((cached_path, cached_modified, cached_encoder)) = cache.as_ref() {
+            if cached_path == ffmpeg_path && *cached_modified == modified {
+                return *cached_encoder;
+            }
+        }
+    }
+
+    let selected = select();
+    if let Ok(mut cache) = cache.lock() {
+        *cache = Some((ffmpeg_path.to_path_buf(), modified, selected));
+    }
+    selected
+}
+
+fn select_video_encoder(ffmpeg_path: &Path) -> VideoEncoder {
+    let modified = fs::metadata(ffmpeg_path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    cached_video_encoder_selection(encoder_selection_cache(), ffmpeg_path, modified, || {
+        select_video_encoder_uncached(ffmpeg_path)
+    })
+}
+
 fn conversion_attempt_encoders(selected: VideoEncoder) -> Vec<VideoEncoder> {
-    if selected.is_windows_hardware() {
+    if selected != VideoEncoder::Software {
         vec![selected, VideoEncoder::Software]
     } else {
         vec![selected]
     }
+}
+
+fn requires_app_conversion(is_threads: bool, output_format: &str) -> bool {
+    !(is_threads && output_format == "mp4")
 }
 
 fn video_encoding_args(
@@ -2595,6 +2688,8 @@ fn video_encoding_args(
         maxrate.to_string(),
         "-bufsize".into(),
         bufsize.to_string(),
+        "-pix_fmt".into(),
+        "yuv420p".into(),
         "-c:a".into(),
         "aac".into(),
         "-profile:a".into(),
@@ -3216,6 +3311,10 @@ fn start_download(
                 || host_matches(&host.to_ascii_lowercase(), "youtu.be")
         })
         .unwrap_or(false);
+    let is_threads = parsed
+        .host_str()
+        .map(|host| is_threads_host(&host.to_ascii_lowercase()))
+        .unwrap_or(false);
     let auth_retry = AuthRetryPolicy {
         allow_browser_retry: request.cookies_browser.is_none(),
         youtube_unavailable_may_need_cookies: request.cookies_browser.is_none() && is_youtube,
@@ -3258,6 +3357,8 @@ fn start_download(
         "__YTDLP_PROGRESS__%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(info.title)s",
         "--progress-template",
         "postprocess:__YTDLP_POSTPROCESS__%(progress.status)s|%(progress.postprocessor)s|%(info.title)s",
+        "-o",
+        YTDLP_OUTPUT_TEMPLATE,
         "-P",
         &request.output_dir,
     ]);
@@ -3267,6 +3368,7 @@ fn start_download(
         &request.quality,
         request.multi_item,
         request.cookies_browser.as_deref(),
+        is_threads,
     )?);
     if request.multi_item {
         command.args([
@@ -3297,7 +3399,7 @@ fn start_download(
         "--print",
         "after_move:__YTDLP_FILE__%(.{filepath,duration,height,fps})j",
     ]);
-    if request.mode != "audio" {
+    if request.mode != "audio" && requires_app_conversion(is_threads, "mp4") {
         command.args(["--merge-output-format", "mkv", "--remux-video", "mkv"]);
     }
     if request.subtitles {
@@ -3536,6 +3638,16 @@ fn start_download(
                         );
                     } else if !files.is_empty() {
                         for (index, file) in files.iter().enumerate() {
+                            if !requires_app_conversion(is_threads, &output_format) {
+                                let size = fs::metadata(&file.path)
+                                    .map(|metadata| metadata.len())
+                                    .unwrap_or(0);
+                                completed_outputs.push(DownloadOutput {
+                                    path: file.path.to_string_lossy().into_owned(),
+                                    size,
+                                });
+                                continue;
+                            }
                             match convert_downloaded_media(
                                 &monitor_app,
                                 &manager,
@@ -4124,8 +4236,45 @@ mod tests {
         );
         assert_eq!(
             conversion_attempt_encoders(VideoEncoder::VideoToolbox),
-            vec![VideoEncoder::VideoToolbox]
+            vec![VideoEncoder::VideoToolbox, VideoEncoder::Software]
         );
+    }
+
+    #[test]
+    fn encoder_selection_is_cached_until_the_ffmpeg_binary_changes() {
+        use std::cell::Cell;
+
+        let cache = Mutex::new(None);
+        let path = Path::new("managed-ffmpeg");
+        let first_version = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        let second_version = SystemTime::UNIX_EPOCH + Duration::from_secs(2);
+        let probes = Cell::new(0_u8);
+        let select = || {
+            probes.set(probes.get() + 1);
+            VideoEncoder::Nvenc
+        };
+
+        assert_eq!(
+            cached_video_encoder_selection(&cache, path, Some(first_version), select),
+            VideoEncoder::Nvenc
+        );
+        assert_eq!(
+            cached_video_encoder_selection(&cache, path, Some(first_version), select),
+            VideoEncoder::Nvenc
+        );
+        assert_eq!(probes.get(), 1);
+        assert_eq!(
+            cached_video_encoder_selection(&cache, path, Some(second_version), select),
+            VideoEncoder::Nvenc
+        );
+        assert_eq!(probes.get(), 2);
+    }
+
+    #[test]
+    fn threads_mp4_bypasses_merge_and_app_conversion() {
+        assert!(!requires_app_conversion(true, "mp4"));
+        assert!(requires_app_conversion(true, "mp3"));
+        assert!(requires_app_conversion(false, "mp4"));
     }
 
     #[test]
@@ -4169,6 +4318,35 @@ mod tests {
     }
 
     #[test]
+    fn threads_plugin_install_is_scoped_and_idempotent() {
+        let root = std::env::temp_dir().join(format!("yt-dlp-bd-plugin-test-{}", Uuid::new_v4()));
+        let unrelated = root.join("keep.txt");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&unrelated, b"keep").unwrap();
+
+        let installed_root = install_threads_plugin_at(&root).unwrap();
+        let installed = installed_root
+            .join("baldojnyi")
+            .join("yt_dlp_plugins")
+            .join("extractor")
+            .join("threads_baldojnyi.py");
+        assert_eq!(
+            fs::read(&installed).unwrap(),
+            THREADS_EXTRACTOR_SOURCE.as_bytes()
+        );
+
+        fs::write(&installed, b"outdated").unwrap();
+        install_threads_plugin_at(&root).unwrap();
+        assert_eq!(
+            fs::read(&installed).unwrap(),
+            THREADS_EXTRACTOR_SOURCE.as_bytes()
+        );
+        assert_eq!(fs::read(&unrelated).unwrap(), b"keep");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn hardware_and_software_video_args_preserve_output_contract() {
         for encoder in [
             VideoEncoder::Nvenc,
@@ -4181,6 +4359,7 @@ mod tests {
             assert!(joined.contains(&format!("-c:v {}", encoder.codec())));
             assert!(joined.contains("-map 0:v:0 -map 0:a:0? -map_metadata 0"));
             assert!(joined.contains("-b:v 8000000 -maxrate 8800000 -bufsize 16000000"));
+            assert!(joined.contains("-pix_fmt yuv420p"));
             assert!(joined.contains("-c:a aac -profile:a aac_low -b:a 192k"));
             assert!(joined.contains("-tag:v avc1 -movflags +faststart"));
         }
@@ -4206,6 +4385,7 @@ mod tests {
         assert_eq!(format_selector("audio", "best"), "bestaudio/best");
         assert_eq!(playlist_flag(false), "--no-playlist");
         assert_eq!(playlist_flag(true), "--yes-playlist");
+        assert_eq!(YTDLP_OUTPUT_TEMPLATE, "%(title).140B [%(id).40B].%(ext)s");
     }
 
     #[test]

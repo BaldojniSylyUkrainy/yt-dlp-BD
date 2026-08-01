@@ -41,8 +41,8 @@ fi
 
 cd "$PROJECT_DIR"
 
-if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
-  echo "Release-build заборонено: tracked-файли мають незакомічені зміни."
+if [[ -n "$(git status --porcelain)" ]]; then
+  echo "Release-build заборонено: репозиторій має незакомічені або незатрекані файли."
   exit 1
 fi
 

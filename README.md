@@ -26,7 +26,7 @@
 Підтримуються Mac із процесорами M1, M2, M3, M4 та новішими, macOS 12.3 або новіша.
 
 1. Завантажте файл із назвою `BaldojnyiDownloader-…-Mac-Apple-Silicon.dmg`.
-2. Відкрийте `.dmg` і перенесіть **yt-dlp BD** у папку **Applications**.
+2. Відкрийте `.dmg` і перенесіть **Baldojnyi Downloader** у папку **Applications**.
 3. Запустіть застосунок із папки **Applications**.
 
 Збірка підписана Developer ID і нотаризована Apple. Версії для Intel Mac поки немає.
@@ -35,7 +35,7 @@
 
 1. Завантажте файл із назвою `BaldojnyiDownloader-…-Windows-x64-Setup.exe`.
 2. Запустіть інсталятор і завершіть встановлення.
-3. Відкрийте **yt-dlp BD** через меню Start.
+3. Відкрийте **Baldojnyi Downloader** через меню Start.
 
 Windows SmartScreen може вперше показати попередження про невідомого видавця. Інсталятор перевіряється вбудованим ключем оновлення застосунку, але окремого Windows Authenticode-сертифіката поки немає.
 
@@ -76,4 +76,4 @@ npm run build
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-Runtime-компоненти завантажуються лише з офіційних джерел: [yt-dlp releases](https://github.com/yt-dlp/yt-dlp/releases), [Deno releases](https://github.com/denoland/deno/releases), [Martin Riedl’s FFmpeg Build Server](https://ffmpeg.martin-riedl.de/) для macOS та [yt-dlp/FFmpeg-Builds](https://github.com/yt-dlp/FFmpeg-Builds) для Windows. Контрольні суми перевіряються перед встановленням.
+yt-dlp і Deno завантажуються з їхніх офіційних GitHub Releases. FFmpeg надходить із публічних спеціалізованих збірок: [Martin Riedl’s FFmpeg Build Server](https://ffmpeg.martin-riedl.de/) для macOS та [yt-dlp/FFmpeg-Builds](https://github.com/yt-dlp/FFmpeg-Builds) для Windows. Застосунок приймає лише HTTPS-джерела з дозволених доменів і перевіряє опубліковані SHA-256 перед встановленням.

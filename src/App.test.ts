@@ -13,6 +13,7 @@ import {
   preflightAllowsStart,
   preflightConfidenceLabel,
   runtimeInstallCommand,
+  shouldShowMultiItemIntent,
   shouldPlayCompletionSound,
   shouldPlayQueueCompletionSound,
   shouldCacheHistoryThumbnail,
@@ -258,6 +259,11 @@ describe("playlist intent detection", () => {
 
   it("does not treat an ordinary watch URL as a collection", () => {
     expect(isLikelyMultiItemUrl("https://youtube.com/watch?v=VIDEO")).toBe(false);
+  });
+
+  it("reveals collection controls when an extractor reports multiple media items", () => {
+    expect(shouldShowMultiItemIntent("https://www.threads.com/@author/post/POST", 3)).toBe(true);
+    expect(shouldShowMultiItemIntent("https://www.threads.com/@author/post/POST", 1)).toBe(false);
   });
 });
 

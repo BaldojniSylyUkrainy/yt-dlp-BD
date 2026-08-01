@@ -34,6 +34,8 @@ test("uses the branded installed app name and Windows installer icons", async ()
   assert.equal(tauriConfig.bundle.windows.nsis.installerIcon, "icons/icon.ico");
   assert.equal(tauriConfig.bundle.windows.nsis.uninstallerIcon, "icons/icon.ico");
   assert.match(macBuild, /Baldojnyi Downloader\.app/);
+  assert.match(macBuild, /git status --porcelain\)/);
+  assert.doesNotMatch(macBuild, /--untracked-files=no/);
   assert.match(releaseGenerator, /Baldojnyi Downloader\.app\.tar\.gz/);
 });
 

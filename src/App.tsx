@@ -403,6 +403,10 @@ export function isLikelyMultiItemUrl(value: string): boolean {
   }
 }
 
+export function shouldShowMultiItemIntent(value: string, itemCount?: number | null): boolean {
+  return isLikelyMultiItemUrl(value) || Boolean(itemCount && itemCount > 1);
+}
+
 function shortVersion(value: string | null): string {
   if (!value) return "Не встановлено";
   return value.replace(/^nightly@/, "").split("\n")[0];
@@ -694,7 +698,7 @@ function App() {
   const runtimeReady = Boolean(runtime?.ytDlp.installed && runtime?.ffmpeg.installed && runtime?.deno.installed);
   const isWindows = runtime?.platform === "windows";
   const quickThumbnail = youtubeThumbnailFromInput(url);
-  const multiItemCandidate = isLikelyMultiItemUrl(url);
+  const multiItemCandidate = shouldShowMultiItemIntent(url, preview?.itemCount);
   const closeActivities = appCloseActivityLabels({
     singleStage: active ? job?.status || null : null,
     batchDownload: Boolean(queueProcessActive || downloadQueue?.status === "running"),
