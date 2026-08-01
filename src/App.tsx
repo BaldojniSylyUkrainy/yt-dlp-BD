@@ -162,8 +162,8 @@ export function runtimeInstallCommand(stage: Exclude<RuntimeStage, null>): strin
 }
 
 export function defaultCookieBrowser(platform: string, stored: string | null): string {
-  if (stored && stored !== "safari") return stored;
-  return platform === "windows" ? "edge" : "chrome";
+  if (stored && !(platform === "windows" && stored === "safari")) return stored;
+  return platform === "windows" ? "edge" : "safari";
 }
 
 export type Job = {
@@ -741,11 +741,7 @@ function App() {
             multiItem: false,
             cookiesBrowser: null,
           };
-          const storedQueue = parseQueueStorage(localStorage.getItem(QUEUE_STORAGE_KEY), fallbackSettings);
-          const restoredQueue = storedQueue?.settings.cookiesBrowser === "safari" ? {
-            ...storedQueue,
-            settings: { ...storedQueue.settings, cookiesBrowser: null },
-          } : storedQueue;
+          const restoredQueue = parseQueueStorage(localStorage.getItem(QUEUE_STORAGE_KEY), fallbackSettings);
           downloadQueueRef.current = restoredQueue;
           setDownloadQueue(restoredQueue);
           setQueueHydrated(true);
@@ -796,10 +792,9 @@ function App() {
   }, [downloadQueue, outputDir, updateQueue]);
 
   useEffect(() => {
-    if (cookieBrowser !== "safari") return;
-    const fallback = isWindows ? "edge" : "chrome";
-    setCookieBrowser(fallback);
-    localStorage.setItem("cookieBrowser", fallback);
+    if (!isWindows || cookieBrowser !== "safari") return;
+    setCookieBrowser("edge");
+    localStorage.setItem("cookieBrowser", "edge");
   }, [cookieBrowser, isWindows]);
 
   useEffect(() => {
@@ -2000,6 +1995,7 @@ function App() {
           notice={queueNotice}
           runtimeReady={runtimeReady && !runtimeBusy}
           singleDownloadActive={Boolean(active)}
+          isWindows={isWindows}
           onInput={setQueueInput}
           onPaste={handleQueuePaste}
           onAdd={() => addQueueText()}
@@ -2115,7 +2111,7 @@ function App() {
           <p className="eyebrow">ПОТРІБНА АВТОРИЗАЦІЯ</p>
           <h2 id="auth-title">Увійдіть через браузер</h2>
           <p id="auth-description">Сайт просить підтвердити вік, акаунт або що ви не бот. Увійдіть на цей сайт у браузері та виберіть його нижче.</p>
-          <label className="browser-picker">Ваш браузер<select value={cookieBrowser} onChange={(event) => setCookieBrowser(event.target.value)}><option value="edge">Microsoft Edge</option><option value="chrome">Google Chrome</option><option value="firefox">Firefox</option><option value="brave">Brave</option><option value="vivaldi">Vivaldi</option></select></label>
+          <label className="browser-picker">Ваш браузер<select value={cookieBrowser} onChange={(event) => setCookieBrowser(event.target.value)}>{!isWindows && <option value="safari">Safari</option>}<option value="edge">Microsoft Edge</option><option value="chrome">Google Chrome</option><option value="firefox">Firefox</option><option value="brave">Brave</option><option value="vivaldi">Vivaldi</option></select></label>
           <div className="modal-detail">yt-dlp прочитає cookies безпосередньо з обраного браузера лише для повторної спроби. yt-dlp BD не експортує їх у файл і не зберігає.</div>
           <div className="modal-actions"><button className="secondary-button" onClick={() => setJob(null)}>Скасувати</button><button className="warning-button auth" disabled={pendingStart} onClick={retryWithCookies}>{pendingStart ? "Перевіряємо…" : "Повторити з cookies"}</button></div>
         </DialogSurface>
@@ -2160,12 +2156,13 @@ function queueStorageLabel(item: QueueItem): string | null {
   return `${available} · потрібно до ${formatByteSize(item.storage.requiredSpace)}`;
 }
 
-function QueueView({ queue, input, notice, runtimeReady, singleDownloadActive, onInput, onPaste, onAdd, onChangeItem, onRemoveItem, onSettings, onChooseFolder, onStart, onPause, onResume, onSkip, onStop, onRetry, onReplay, onNew }: {
+function QueueView({ queue, input, notice, runtimeReady, singleDownloadActive, isWindows, onInput, onPaste, onAdd, onChangeItem, onRemoveItem, onSettings, onChooseFolder, onStart, onPause, onResume, onSkip, onStop, onRetry, onReplay, onNew }: {
   queue: DownloadQueue | null;
   input: string;
   notice: string;
   runtimeReady: boolean;
   singleDownloadActive: boolean;
+  isWindows: boolean;
   onInput: (value: string) => void;
   onPaste: (event: ClipboardEvent<HTMLInputElement | HTMLTextAreaElement>) => void;
   onAdd: () => void;
@@ -2206,7 +2203,7 @@ function QueueView({ queue, input, notice, runtimeReady, singleDownloadActive, o
           <label><input type="checkbox" disabled={!settingsEditable} checked={settings.subtitles} onChange={(event) => onSettings({ subtitles: event.target.checked })}/> Субтитри, якщо доступні</label>
           <label><input type="checkbox" disabled={!settingsEditable} checked={settings.multiItem} onChange={(event) => onSettings({ multiItem: event.target.checked })}/> Завантажувати всю добірку за кожним посиланням</label>
         </div>
-        <label className="queue-browser-picker">Авторизація через браузер<select disabled={!settingsEditable} value={settings.cookiesBrowser || ""} onChange={(event) => onSettings({ cookiesBrowser: event.target.value || null })}><option value="">Не використовувати cookies</option><option value="edge">Microsoft Edge</option><option value="chrome">Google Chrome</option><option value="firefox">Firefox</option><option value="brave">Brave</option><option value="vivaldi">Vivaldi</option></select><small>Потрібно лише для сайтів, які просять увійти або підтвердити вік.</small></label>
+        <label className="queue-browser-picker">Авторизація через браузер<select disabled={!settingsEditable} value={settings.cookiesBrowser || ""} onChange={(event) => onSettings({ cookiesBrowser: event.target.value || null })}><option value="">Не використовувати cookies</option>{!isWindows && <option value="safari">Safari</option>}<option value="edge">Microsoft Edge</option><option value="chrome">Google Chrome</option><option value="firefox">Firefox</option><option value="brave">Brave</option><option value="vivaldi">Vivaldi</option></select><small>Потрібно лише для сайтів, які просять увійти або підтвердити вік.</small></label>
         <div className="folder-row"><div className="folder-copy"><span className="field-label">Зберегти все у</span><div className="folder-value"><Icon name="folder" size={18}/><span>{settings.outputDir || "Папку не обрано"}</span></div></div><button className="secondary-button" disabled={!settingsEditable} onClick={onChooseFolder}>Змінити</button></div>
       </div>
     </details>}
