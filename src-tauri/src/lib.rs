@@ -1313,10 +1313,6 @@ fn is_tiktok_host(host: &str) -> bool {
     host_matches(host, "tiktok.com")
 }
 
-fn is_instagram_host(host: &str) -> bool {
-    host_matches(host, "instagram.com")
-}
-
 fn normalize_media_url(value: &str) -> Result<Url, String> {
     let mut parsed = Url::parse(value).map_err(|_| "Вставте повне посилання".to_string())?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
@@ -1350,12 +1346,9 @@ fn normalize_media_url(value: &str) -> Result<Url, String> {
     Ok(parsed)
 }
 
-fn format_selector(mode: &str, quality: &str, prefer_ready_single_file: bool) -> &'static str {
+fn format_selector(mode: &str, quality: &str) -> &'static str {
     if mode == "audio" {
         return "bestaudio/best";
-    }
-    if prefer_ready_single_file {
-        return "best[ext=mp4]/best";
     }
     match quality {
         "2160" => "bestvideo[height<=2160]+bestaudio/best[height<=2160]",
@@ -1385,14 +1378,13 @@ fn extraction_args(
     multi_item: bool,
     cookies_browser: Option<&str>,
     impersonate_chrome: bool,
-    prefer_ready_single_file: bool,
 ) -> Result<Vec<OsString>, String> {
     let mut args = vec![
         OsString::from("--plugin-dirs"),
         threads_plugin_dir(app)?.into_os_string(),
         OsString::from(playlist_flag(multi_item)),
         OsString::from("-f"),
-        OsString::from(format_selector(mode, quality, prefer_ready_single_file)),
+        OsString::from(format_selector(mode, quality)),
     ];
     if impersonate_chrome {
         args.extend([OsString::from("--impersonate"), OsString::from("chrome")]);
@@ -3433,10 +3425,6 @@ fn start_download(
         .host_str()
         .map(|host| is_tiktok_host(&host.to_ascii_lowercase()))
         .unwrap_or(false);
-    let is_instagram = parsed
-        .host_str()
-        .map(|host| is_instagram_host(&host.to_ascii_lowercase()))
-        .unwrap_or(false);
     let auth_retry = AuthRetryPolicy {
         allow_browser_retry: request.cookies_browser.is_none(),
         youtube_unavailable_may_need_cookies: request.cookies_browser.is_none() && is_youtube,
@@ -3492,7 +3480,6 @@ fn start_download(
         request.multi_item,
         request.cookies_browser.as_deref(),
         is_threads || is_tiktok,
-        is_instagram,
     )?);
     if request.multi_item {
         command.args([
@@ -4560,13 +4547,10 @@ mod tests {
     #[test]
     fn selector_and_playlist_intent_are_explicit() {
         assert_eq!(
-            format_selector("video", "1080", false),
+            format_selector("video", "1080"),
             "bestvideo[height<=1080]+bestaudio/best[height<=1080]"
         );
-        assert_eq!(format_selector("video", "best", true), "best[ext=mp4]/best");
-        assert_eq!(format_selector("audio", "best", true), "bestaudio/best");
-        assert!(is_instagram_host("www.instagram.com"));
-        assert!(!is_instagram_host("instagram.com.example.org"));
+        assert_eq!(format_selector("audio", "best"), "bestaudio/best");
         assert_eq!(playlist_flag(false), "--no-playlist");
         assert_eq!(playlist_flag(true), "--yes-playlist");
         assert_eq!(YTDLP_OUTPUT_TEMPLATE, "%(title).140B [%(id).40B].%(ext)s");
