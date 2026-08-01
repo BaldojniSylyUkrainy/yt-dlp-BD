@@ -1204,6 +1204,11 @@ fn friendly_download_error(message: &str) -> String {
     .any(|pattern| value.contains(pattern))
     {
         "Сервіс просить увійти в обліковий запис. Спробуйте завантаження з cookies браузера.".into()
+    } else if value.contains("cookies.binarycookies")
+        || (value.contains("safari") && value.contains("operation not permitted"))
+    {
+        "macOS не дозволив застосунку прочитати cookies Safari. Використайте Chrome, Firefox, Edge або Brave."
+            .into()
     } else if ["unsupported url", "no suitable extractor"]
         .iter()
         .any(|pattern| value.contains(pattern))
@@ -1313,6 +1318,16 @@ fn is_tiktok_host(host: &str) -> bool {
     host_matches(host, "tiktok.com")
 }
 
+fn impersonation_target(is_threads: bool, is_tiktok: bool) -> Option<&'static str> {
+    if is_tiktok {
+        Some("Chrome-99:Android-12")
+    } else if is_threads {
+        Some("chrome")
+    } else {
+        None
+    }
+}
+
 fn normalize_media_url(value: &str) -> Result<Url, String> {
     let mut parsed = Url::parse(value).map_err(|_| "Вставте повне посилання".to_string())?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
@@ -1377,7 +1392,7 @@ fn extraction_args(
     quality: &str,
     multi_item: bool,
     cookies_browser: Option<&str>,
-    impersonate_chrome: bool,
+    impersonation: Option<&str>,
 ) -> Result<Vec<OsString>, String> {
     let mut args = vec![
         OsString::from("--plugin-dirs"),
@@ -1386,12 +1401,12 @@ fn extraction_args(
         OsString::from("-f"),
         OsString::from(format_selector(mode, quality)),
     ];
-    if impersonate_chrome {
-        args.extend([OsString::from("--impersonate"), OsString::from("chrome")]);
+    if let Some(target) = impersonation {
+        args.extend([OsString::from("--impersonate"), OsString::from(target)]);
     }
     if let Some(browser) = cookies_browser {
         let supported = [
-            "brave", "chrome", "chromium", "edge", "firefox", "opera", "safari", "vivaldi",
+            "brave", "chrome", "chromium", "edge", "firefox", "opera", "vivaldi",
         ];
         if !supported.contains(&browser) {
             return Err("Непідтримуваний браузер для cookies".into());
@@ -3479,7 +3494,7 @@ fn start_download(
         &request.quality,
         request.multi_item,
         request.cookies_browser.as_deref(),
-        is_threads || is_tiktok,
+        impersonation_target(is_threads, is_tiktok),
     )?);
     if request.multi_item {
         command.args([
@@ -4551,6 +4566,12 @@ mod tests {
             "bestvideo[height<=1080]+bestaudio/best[height<=1080]"
         );
         assert_eq!(format_selector("audio", "best"), "bestaudio/best");
+        assert_eq!(
+            impersonation_target(false, true),
+            Some("Chrome-99:Android-12")
+        );
+        assert_eq!(impersonation_target(true, false), Some("chrome"));
+        assert_eq!(impersonation_target(false, false), None);
         assert_eq!(playlist_flag(false), "--no-playlist");
         assert_eq!(playlist_flag(true), "--yes-playlist");
         assert_eq!(YTDLP_OUTPUT_TEMPLATE, "%(title).140B [%(id).40B].%(ext)s");
@@ -4581,6 +4602,10 @@ mod tests {
                 .contains("неповне")
         );
         assert!(friendly_download_error("HTTP Error 403: Forbidden").contains("відхилив"));
+        assert!(
+            friendly_download_error("Operation not permitted: Safari/Cookies.binarycookies")
+                .contains("macOS")
+        );
         assert!(friendly_download_error("No space left on device").contains("вільного місця"));
         assert!(
             friendly_download_error("[youtube] example: This video is unavailable")
