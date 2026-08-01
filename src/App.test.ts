@@ -312,8 +312,9 @@ describe("platform defaults", () => {
     expect(defaultCookieBrowser("windows", "chrome")).toBe("chrome");
   });
 
-  it("keeps Safari as the macOS default", () => {
-    expect(defaultCookieBrowser("macos", null)).toBe("safari");
+  it("uses Chrome on macOS because app-level Safari cookie access is restricted", () => {
+    expect(defaultCookieBrowser("macos", null)).toBe("chrome");
+    expect(defaultCookieBrowser("macos", "safari")).toBe("chrome");
   });
 });
 
