@@ -7,7 +7,7 @@ import {
   defaultCookieBrowser,
   groupHistoryEntries,
   historyPaths,
-  isCurrentProbe,
+  inputUrlState,
   isLikelyMultiItemUrl,
   parseHistoryStorage,
   preflightAllowsStart,
@@ -292,9 +292,10 @@ describe("preflight and retry guards", () => {
     expect(runtimeInstallCommand("deno")).toBe("install_deno");
   });
 
-  it("rejects a stale probe response", () => {
-    expect(isCurrentProbe(8, 7)).toBe(false);
-    expect(isCurrentProbe(8, 8)).toBe(true);
+  it("validates link syntax without waiting for a network availability probe", () => {
+    expect(inputUrlState("")).toBe("idle");
+    expect(inputUrlState("https://www.instagram.com/reel/example/")).toBe("valid");
+    expect(inputUrlState("not a link")).toBe("invalid");
   });
 
   it("preserves the selected output format during audio conversion", () => {

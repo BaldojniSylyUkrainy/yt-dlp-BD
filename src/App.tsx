@@ -166,10 +166,6 @@ export function defaultCookieBrowser(platform: string, stored: string | null): s
   return platform === "windows" ? "edge" : "safari";
 }
 
-export function isCurrentProbe(currentSequence: number, responseSequence: number): boolean {
-  return currentSequence === responseSequence;
-}
-
 export type Job = {
   id: string;
   url: string;
@@ -274,19 +270,6 @@ type RuntimeInstallProgress = {
   total: number | null;
 };
 
-type MediaPreview = {
-  title: string;
-  thumbnail: string | null;
-  duration: number | null;
-  durationIsTotal: boolean;
-  uploader: string | null;
-  extractor: string | null;
-  webpageUrl: string | null;
-  itemCount: number | null;
-};
-
-type ProbeState = "idle" | "checking" | "valid" | "unverified" | "invalid";
-
 type IconName =
   | "download"
   | "clock"
@@ -385,6 +368,11 @@ function normalizeInputUrl(value: string): string | null {
   return normalizeHttpUrl(value);
 }
 
+export function inputUrlState(value: string): "idle" | "valid" | "invalid" {
+  if (!value.trim()) return "idle";
+  return normalizeInputUrl(value) ? "valid" : "invalid";
+}
+
 function isRussianDomain(host: string): boolean {
   return host === "ru" || host.endsWith(".ru") || host === "xn--p1ai" || host.endsWith(".xn--p1ai");
 }
@@ -410,17 +398,6 @@ export function shouldShowMultiItemIntent(value: string, itemCount?: number | nu
 function shortVersion(value: string | null): string {
   if (!value) return "Не встановлено";
   return value.replace(/^nightly@/, "").split("\n")[0];
-}
-
-function formatDuration(value: number | null): string | null {
-  if (value === null || !Number.isFinite(value)) return null;
-  const seconds = Math.max(0, Math.round(value));
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
-  const remainder = seconds % 60;
-  return hours
-    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`
-    : `${minutes}:${String(remainder).padStart(2, "0")}`;
 }
 
 function formatByteSize(value: number): string {
@@ -623,7 +600,6 @@ function youtubeThumbnailFromInput(value: string): string | null {
 
 function App() {
   const maintenanceStarted = useRef(false);
-  const probeSequence = useRef(0);
   const approvedVpnUrls = useRef(new Set<string>());
   const cancelledDownloadRestore = useRef<{ url: string; playlist: boolean } | null>(null);
   const mainContentRef = useRef<HTMLElement>(null);
@@ -653,7 +629,6 @@ function App() {
   const [job, setJob] = useState<Job | null>(null);
   const [formError, setFormError] = useState("");
   const [vpnWarning, setVpnWarning] = useState<{ host: string; url: string; status: VpnStatus; queueItemId: string | null } | null>(null);
-  const [vpnDecisionVersion, setVpnDecisionVersion] = useState(0);
   const [pendingStart, setPendingStart] = useState(false);
   const [update, setUpdate] = useState<Update | null>(null);
   const updateAvailableRef = useRef(false);
@@ -666,9 +641,6 @@ function App() {
   const [updateProgress, setUpdateProgress] = useState(0);
   const initialPlatform = navigator.userAgent.includes("Windows") ? "windows" : "macos";
   const [cookieBrowser, setCookieBrowser] = useState(defaultCookieBrowser(initialPlatform, null));
-  const [probeState, setProbeState] = useState<ProbeState>("idle");
-  const [preview, setPreview] = useState<MediaPreview | null>(null);
-  const [probeError, setProbeError] = useState("");
   const [startupBusy, setStartupBusy] = useState(true);
   const [startupProgress, setStartupProgress] = useState(10);
   const [startupMessage, setStartupMessage] = useState("Відкриваємо застосунок…");
@@ -697,14 +669,15 @@ function App() {
   const anyProcessActive = Boolean(active || queueProcessActive);
   const runtimeReady = Boolean(runtime?.ytDlp.installed && runtime?.ffmpeg.installed && runtime?.deno.installed);
   const isWindows = runtime?.platform === "windows";
-  const quickThumbnail = youtubeThumbnailFromInput(url);
-  const multiItemCandidate = shouldShowMultiItemIntent(url, preview?.itemCount);
+  const normalizedInputUrl = normalizeInputUrl(url);
+  const urlState = inputUrlState(url);
+  const multiItemCandidate = shouldShowMultiItemIntent(url);
   const closeActivities = appCloseActivityLabels({
     singleStage: active ? job?.status || null : null,
     batchDownload: Boolean(queueProcessActive || downloadQueue?.status === "running"),
     runtimeMaintenance: runtimeBusy,
     appUpdate: updateBusy,
-    linkCheck: pendingStart || probeState === "checking",
+    linkCheck: pendingStart,
     backendDownloads: closeRequest?.activeDownloads || 0,
   });
 
@@ -1185,85 +1158,15 @@ function App() {
   }, [startupBusy]);
 
   useEffect(() => {
-    const value = url.trim();
-    const sequence = ++probeSequence.current;
-    setPreview(null);
-    setProbeError("");
-    if (!value) {
-      setProbeState("idle");
-      return;
-    }
-    if (!runtime?.ytDlp.installed) {
-      setProbeState("idle");
-      return;
-    }
-    const parsedHost = hostFromInput(value);
-    const normalized = normalizeInputUrl(value);
-    if (!parsedHost || !normalized) {
-      setProbeState("invalid");
-      setProbeError("Це не схоже на посилання");
-      return;
-    }
-    setProbeState("checking");
-    let softDeadline = 0;
-    const timer = window.setTimeout(async () => {
-      if (isRussianDomain(parsedHost) && !approvedVpnUrls.current.has(normalized)) {
-        try {
-          const vpn = await invoke<VpnStatus>("check_vpn", { host: parsedHost });
-          if (!isCurrentProbe(probeSequence.current, sequence)) return;
-          if (!vpn.detected) {
-            setProbeState("idle");
-            setVpnWarning({ host: parsedHost, url: normalized, status: vpn, queueItemId: null });
-            return;
-          }
-          approvedVpnUrls.current.add(normalized);
-        } catch {
-          if (!isCurrentProbe(probeSequence.current, sequence)) return;
-          setProbeState("idle");
-          setVpnWarning({
-            host: parsedHost,
-            url: normalized,
-            status: { detected: false, interfaceName: null, confidence: "unknown", detail: "Не вдалося перевірити стан VPN" },
-            queueItemId: null,
-          });
-          return;
-        }
-      }
-      softDeadline = window.setTimeout(() => {
-        if (!isCurrentProbe(probeSequence.current, sequence)) return;
-        setProbeError("Не вдалося швидко визначити доступність. Можна спробувати завантажити");
-        setProbeState("unverified");
-      }, 4_000);
-      try {
-        const result = await invoke<MediaPreview>("probe_url", { probeId: crypto.randomUUID(), url: normalized, playlist: playlistIntent === "playlist" });
-        if (!isCurrentProbe(probeSequence.current, sequence)) return;
-        setPreview(result);
-        setProbeState("valid");
-      } catch (error) {
-        if (!isCurrentProbe(probeSequence.current, sequence)) return;
-        setProbeError(String(error));
-        setProbeState("unverified");
-      } finally {
-        window.clearTimeout(softDeadline);
-      }
-    }, 450);
-    return () => {
-      window.clearTimeout(timer);
-      window.clearTimeout(softDeadline);
-    };
-  }, [url, runtime?.ytDlp.installed, playlistIntent, vpnDecisionVersion]);
-
-  useEffect(() => {
     if (!historyRetryPending || active || pendingStart) return;
-    if (probeState === "invalid") {
+    if (!normalizeInputUrl(url)) {
       setHistoryRetryPending(null);
       setFormError("Збережене посилання більше не схоже на коректне");
       return;
     }
-    if (probeState !== "valid" && probeState !== "unverified") return;
     setHistoryRetryPending(null);
     void beginDownload();
-  }, [historyRetryPending, probeState, active, pendingStart]);
+  }, [historyRetryPending, url, active, pendingStart]);
 
   useEffect(() => {
     const unlisten = listen<DownloadEvent>("download-event", ({ payload }) => {
@@ -1431,13 +1334,13 @@ function App() {
   async function launchDownload(downloadUrl: string, parsedHost: string, preflightResult: PreflightResult, cookiesBrowser?: string, playlist = playlistIntent === "playlist") {
     const id = crypto.randomUUID();
     const normalizedDownloadUrl = normalizeInputUrl(downloadUrl) || downloadUrl;
-    const thumbnail = preview?.thumbnail || quickThumbnail;
+    const thumbnail = youtubeThumbnailFromInput(normalizedDownloadUrl);
     const context: HistoryContext = {
       sourceUrl: normalizedDownloadUrl,
-      title: preview?.title || parsedHost,
+      title: parsedHost,
       thumbnail,
-      uploader: preview?.uploader || null,
-      extractor: preview?.extractor || parsedHost,
+      uploader: null,
+      extractor: parsedHost,
       settings: {
         outputDir,
         mode,
@@ -1506,10 +1409,10 @@ function App() {
           quality,
           audioFormat,
           multiItem: playlist,
-          title: preview?.title || null,
-          duration: preview?.duration || null,
-          itemCount: preview?.itemCount || null,
-          durationIsTotal: preview?.durationIsTotal ?? null,
+          title: null,
+          duration: null,
+          itemCount: null,
+          durationIsTotal: null,
         },
       });
       setOutputFreeSpace(result.availableSpace);
@@ -1533,8 +1436,9 @@ function App() {
       setFormError("Дочекайтеся завершення пакетного завантаження або зупиніть його");
       return;
     }
-    const parsedHost = hostFromInput(url);
-    if (!parsedHost) {
+    const normalized = normalizedInputUrl;
+    const parsedHost = normalized ? hostFromInput(normalized) : null;
+    if (!normalized || !parsedHost) {
       setFormError("Вставте коректне посилання на відео або аудіо");
       return;
     }
@@ -1546,30 +1450,33 @@ function App() {
       setFormError("Компоненти ще готуються. Зачекайте кілька секунд");
       return;
     }
-    if (probeState !== "valid" && probeState !== "unverified") {
-      setFormError(probeState === "checking" ? "Зачекайте кілька секунд, поки триває швидка перевірка" : "Вставте коректне посилання");
-      return;
-    }
-
-    const normalized = normalizeInputUrl(url);
-    if (!normalized) {
-      setFormError("Вставте коректне посилання");
-      return;
-    }
     if (isRussianDomain(parsedHost) && !approvedVpnUrls.current.has(normalized)) {
-      setFormError("Спочатку завершіть перевірку VPN для цього посилання");
-      return;
+      setPendingStart(true);
+      try {
+        const vpn = await invoke<VpnStatus>("check_vpn", { host: parsedHost });
+        if (!vpn.detected) {
+          setVpnWarning({ host: parsedHost, url: normalized, status: vpn, queueItemId: null });
+          return;
+        }
+        approvedVpnUrls.current.add(normalized);
+      } catch {
+        setVpnWarning({
+          host: parsedHost,
+          url: normalized,
+          status: { detected: false, interfaceName: null, confidence: "unknown", detail: "Не вдалося перевірити стан VPN" },
+          queueItemId: null,
+        });
+        return;
+      } finally {
+        setPendingStart(false);
+      }
     }
 
-    await runPreflight(url, parsedHost);
+    await runPreflight(normalized, parsedHost);
   }
 
   function clearUrl() {
-    probeSequence.current += 1;
     setUrl("");
-    setPreview(null);
-    setProbeState("idle");
-    setProbeError("");
     setFormError("");
     window.requestAnimationFrame(() => urlInputRef.current?.focus());
   }
@@ -1600,10 +1507,7 @@ function App() {
     setSubtitles(entry.settings.subtitles);
     setPlaylistIntent(entry.settings.playlist ? "playlist" : "single");
     cancelledDownloadRestore.current = { url: entry.sourceUrl, playlist: entry.settings.playlist };
-    setPreview(null);
-    setProbeState("idle");
     setUrl(entry.sourceUrl);
-    setVpnDecisionVersion((current) => current + 1);
     setActiveView("download");
   }
 
@@ -1613,8 +1517,7 @@ function App() {
     if (queueItemId) {
       setQueueNotice("Пакетне завантаження призупинено: для цього посилання не підтверджено VPN.");
     } else {
-      setProbeState("invalid");
-      setProbeError("Перевірку посилання скасовано");
+      setFormError("Завантаження скасовано: VPN не підтверджено");
     }
   }
 
@@ -1628,7 +1531,7 @@ function App() {
       updateQueue((current) => current ? { ...current, status: "running", updatedAt: new Date().toISOString() } : current);
       setActiveView("queue");
     } else {
-      setVpnDecisionVersion((current) => current + 1);
+      window.requestAnimationFrame(() => void beginDownload());
     }
   }
 
@@ -2037,25 +1940,14 @@ function App() {
         {activeView === "download" && <section className="download-card" aria-busy={runtimeBusy}>
           <div className="download-card-content" inert={runtimeBusy ? true : undefined}>
           <label className="field-label" htmlFor="media-url">Посилання</label>
-          <div className={`url-field ${probeState}`}>
+          <div className={`url-field ${urlState}`}>
             <Icon name="link" />
             <input ref={urlInputRef} id="media-url" value={url} onChange={(event) => setUrl(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !active) beginDownload(); }} placeholder="https://youtube.com/watch?v=…" autoFocus />
             {url && <button type="button" className="url-clear" aria-label="Очистити посилання" title="Очистити посилання" onClick={clearUrl}><Icon name="x" size={17}/></button>}
-            {probeState === "checking" && <span className="url-checking" aria-label="Перевіряємо посилання"><i/></span>}
-            {probeState === "valid" && <span className="valid-check" aria-label="Відео доступне"><Icon name="check" size={15}/></span>}
-            {probeState === "unverified" && <span className="unverified-check" aria-label="Не вдалося підтвердити посилання">!</span>}
-            {probeState === "invalid" && <span className="invalid-check" aria-label="Посилання недоступне"><Icon name="x" size={15}/></span>}
+            {urlState === "valid" && <span className="valid-check" aria-label="Коректне посилання"><Icon name="check" size={15}/></span>}
+            {urlState === "invalid" && <span className="invalid-check" aria-label="Некоректне посилання"><Icon name="x" size={15}/></span>}
           </div>
-          {probeState === "checking" && quickThumbnail && <div className="media-preview checking">
-            <img src={quickThumbnail} alt="" />
-            <div><strong>Зчитуємо назву відео…</strong><p>YouTube</p><small><span className="inline-spinner"/>Швидко перевіряємо доступність</small></div>
-          </div>}
-          {preview && probeState === "valid" && <div className="media-preview">
-            {preview.thumbnail ? <img src={preview.thumbnail} alt="" /> : <div className="media-preview-placeholder"><Icon name="check"/></div>}
-            <div><strong>{preview.title}</strong><p>{[preview.uploader, preview.duration ? `${formatDuration(preview.duration)}${preview.durationIsTotal ? "" : " на елемент"}` : null, preview.itemCount && preview.itemCount > 1 ? `${preview.itemCount} елементів` : null, preview.extractor].filter(Boolean).join(" · ")}</p><small><Icon name="check" size={13}/>Посилання доступне; формати перевіримо перед стартом</small></div>
-          </div>}
-          {probeState === "unverified" && <div className="url-warning" title={probeError}><span aria-hidden="true">!</span><span>Не вдалося швидко підтвердити посилання. yt-dlp все одно може спробувати його завантажити.</span></div>}
-          {probeState === "invalid" && <div className="url-error"><Icon name="x" size={14}/><span>{probeError || "yt-dlp не може завантажити це посилання"}</span></div>}
+          {urlState === "invalid" && <div className="url-error"><Icon name="x" size={14}/><span>Вставте повне HTTP або HTTPS посилання</span></div>}
 
           {multiItemCandidate && <div className="collection-intent">
             <span className="field-label">Що взяти з добірки</span>
@@ -2092,7 +1984,7 @@ function App() {
           </div>
 
           {formError && <div className="inline-error">{formError}</div>}
-          <button className="primary-button" disabled={(probeState !== "valid" && probeState !== "unverified") || anyProcessActive || queueBusy || pendingStart || runtimeBusy || !runtimeReady} onClick={() => beginDownload()}><Icon name="download" />{runtimeBusy ? "Встановлюємо компоненти…" : probeState === "checking" ? "Перевіряємо посилання…" : pendingStart ? "Починаємо…" : anyProcessActive || queueBusy ? "Інше завантаження триває" : "Завантажити"}</button>
+          <button className="primary-button" disabled={urlState !== "valid" || anyProcessActive || queueBusy || pendingStart || runtimeBusy || !runtimeReady} onClick={() => beginDownload()}><Icon name="download" />{runtimeBusy ? "Встановлюємо компоненти…" : pendingStart ? "Починаємо…" : anyProcessActive || queueBusy ? "Інше завантаження триває" : "Завантажити"}</button>
           <p className="legal-note">Завантажуйте лише матеріали, на які маєте відповідні права.</p>
           </div>
         </section>}
