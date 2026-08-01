@@ -211,6 +211,49 @@ struct DownloadedMedia {
     fps: Option<f64>,
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VideoEncoder {
+    VideoToolbox,
+    Nvenc,
+    QuickSync,
+    Amf,
+    Software,
+}
+
+impl VideoEncoder {
+    fn codec(self) -> &'static str {
+        match self {
+            Self::VideoToolbox => "h264_videotoolbox",
+            Self::Nvenc => "h264_nvenc",
+            Self::QuickSync => "h264_qsv",
+            Self::Amf => "h264_amf",
+            Self::Software => "libx264",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::VideoToolbox => "VideoToolbox",
+            Self::Nvenc => "NVENC",
+            Self::QuickSync => "Quick Sync",
+            Self::Amf => "AMF",
+            Self::Software => "H.264 software",
+        }
+    }
+
+    fn is_windows_hardware(self) -> bool {
+        matches!(self, Self::Nvenc | Self::QuickSync | Self::Amf)
+    }
+}
+
+#[derive(Debug)]
+enum ConversionAttemptError {
+    Cancelled,
+    LowDisk,
+    Failed(String),
+}
+
 #[derive(Clone, Copy)]
 struct AuthRetryPolicy {
     allow_browser_retry: bool,
@@ -1221,6 +1264,39 @@ fn host_matches(host: &str, domain: &str) -> bool {
     host == domain || host.ends_with(&format!(".{domain}"))
 }
 
+fn normalize_media_url(value: &str) -> Result<Url, String> {
+    let mut parsed = Url::parse(value).map_err(|_| "Вставте повне посилання".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err("Підтримуються лише HTTP та HTTPS посилання".into());
+    }
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    let canonical_tiktok_path = if host_matches(&host, "tiktok.com") {
+        parsed
+            .path_segments()
+            .map(|segments| {
+                segments
+                    .filter(|segment| !segment.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|segments| {
+                segments.len() == 3
+                    && segments[0].starts_with('@')
+                    && segments[1].eq_ignore_ascii_case("video")
+                    && !segments[2].is_empty()
+                    && segments[2].bytes().all(|value| value.is_ascii_digit())
+            })
+            .map(|segments| format!("/{}/{}/{}", segments[0], segments[1], segments[2]))
+    } else {
+        None
+    };
+    if let Some(path) = canonical_tiktok_path {
+        parsed.set_path(&path);
+        parsed.set_query(None);
+        parsed.set_fragment(None);
+    }
+    Ok(parsed)
+}
+
 fn format_selector(mode: &str, quality: &str) -> &'static str {
     if mode == "audio" {
         return "bestaudio/best";
@@ -1333,10 +1409,8 @@ async fn probe_url_inner(
     url: String,
     playlist: bool,
 ) -> Result<MediaPreview, String> {
-    let parsed = Url::parse(&url).map_err(|_| "Вставте повне посилання".to_string())?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-        return Err("Підтримуються лише HTTP та HTTPS посилання".into());
-    }
+    let parsed = normalize_media_url(&url)?;
+    let url = parsed.to_string();
     let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
     if !playlist && (host_matches(&host, "youtube.com") || host_matches(&host, "youtu.be")) {
         return probe_oembed(&url, "https://www.youtube.com/oembed", "YouTube").await;
@@ -2020,10 +2094,7 @@ fn folder_free_space(path: String) -> Result<u64, String> {
 
 #[tauri::command]
 fn preflight_download(request: PreflightRequest) -> Result<PreflightResult, String> {
-    let parsed = Url::parse(&request.url).map_err(|_| "Вставте повне посилання".to_string())?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-        return Err("Підтримуються лише HTTP та HTTPS посилання".into());
-    }
+    normalize_media_url(&request.url)?;
     let output_dir = PathBuf::from(&request.output_dir);
     if !output_dir.is_dir() {
         return Err("Обрана папка для завантаження недоступна".into());
@@ -2409,95 +2480,178 @@ fn conversion_percent(elapsed: f64, duration: f64, file_index: usize, file_count
         .clamp(0.0, 100.0) as f32
 }
 
-fn videotoolbox_encoder_available(ffmpeg_path: &Path) -> bool {
+fn encoder_probe_args(encoder: VideoEncoder) -> Vec<&'static str> {
+    vec![
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=size=128x128:rate=30",
+        "-frames:v",
+        "1",
+        "-an",
+        "-c:v",
+        encoder.codec(),
+        "-f",
+        "null",
+        "-",
+    ]
+}
+
+fn probe_video_encoder(ffmpeg_path: &Path, encoder: VideoEncoder) -> bool {
     let mut command = Command::new(ffmpeg_path);
     configure_command(&mut command);
     command
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-f",
-            "lavfi",
-            "-i",
-            "color=size=64x64:rate=1",
-            "-frames:v",
-            "1",
-            "-an",
-            "-c:v",
-            "h264_videotoolbox",
-            "-f",
-            "null",
-            "-",
-        ])
+        .args(encoder_probe_args(encoder))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
-fn convert_downloaded_media(
+fn first_available_encoder<F>(candidates: &[VideoEncoder], mut probe: F) -> VideoEncoder
+where
+    F: FnMut(VideoEncoder) -> bool,
+{
+    candidates
+        .iter()
+        .copied()
+        .find(|encoder| probe(*encoder))
+        .unwrap_or(VideoEncoder::Software)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_encoder_candidates() -> [VideoEncoder; 3] {
+    [
+        VideoEncoder::Nvenc,
+        VideoEncoder::QuickSync,
+        VideoEncoder::Amf,
+    ]
+}
+
+fn select_video_encoder(ffmpeg_path: &Path) -> VideoEncoder {
+    #[cfg(target_os = "macos")]
+    {
+        return first_available_encoder(&[VideoEncoder::VideoToolbox], |encoder| {
+            probe_video_encoder(ffmpeg_path, encoder)
+        });
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return first_available_encoder(&windows_encoder_candidates(), |encoder| {
+            probe_video_encoder(ffmpeg_path, encoder)
+        });
+    }
+    #[allow(unreachable_code)]
+    VideoEncoder::Software
+}
+
+fn conversion_attempt_encoders(selected: VideoEncoder) -> Vec<VideoEncoder> {
+    if selected.is_windows_hardware() {
+        vec![selected, VideoEncoder::Software]
+    } else {
+        vec![selected]
+    }
+}
+
+fn video_encoding_args(
+    encoder: VideoEncoder,
+    bitrate: u64,
+    maxrate: u64,
+    bufsize: u64,
+) -> Vec<String> {
+    vec![
+        "-map".into(),
+        "0:v:0".into(),
+        "-map".into(),
+        "0:a:0?".into(),
+        "-map_metadata".into(),
+        "0".into(),
+        "-c:v".into(),
+        encoder.codec().into(),
+        "-b:v".into(),
+        bitrate.to_string(),
+        "-maxrate".into(),
+        maxrate.to_string(),
+        "-bufsize".into(),
+        bufsize.to_string(),
+        "-c:a".into(),
+        "aac".into(),
+        "-profile:a".into(),
+        "aac_low".into(),
+        "-b:a".into(),
+        "192k".into(),
+        "-tag:v".into(),
+        "avc1".into(),
+        "-movflags".into(),
+        "+faststart".into(),
+    ]
+}
+
+fn cleanup_failed_conversion(temporary: &Path) {
+    let _ = fs::remove_file(temporary);
+}
+
+fn create_download_temp_dir(output_dir: &Path, id: &str) -> Result<PathBuf, String> {
+    Uuid::parse_str(id).map_err(|_| "Некоректний ідентифікатор завантаження".to_string())?;
+    let directory = output_dir.join(format!(".yt-dlp-bd-{id}.tmp"));
+    fs::create_dir(&directory)
+        .map_err(|error| format!("Не вдалося створити тимчасову папку завантаження: {error}"))?;
+    Ok(directory)
+}
+
+fn cleanup_download_temp_dir(directory: &Path) {
+    let owned = directory
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|name| name.starts_with(".yt-dlp-bd-") && name.ends_with(".tmp"));
+    if owned {
+        let _ = fs::remove_dir_all(directory);
+    }
+}
+
+fn reset_download_temp_dir(directory: &Path) -> Result<(), String> {
+    cleanup_download_temp_dir(directory);
+    fs::create_dir(directory)
+        .map_err(|error| format!("Не вдалося очистити тимчасові файли перед повтором: {error}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_conversion_attempt(
     app: &AppHandle,
     manager: &DownloadManager,
     id: &str,
     ffmpeg_path: &Path,
-    downloaded: &DownloadedMedia,
+    input: &Path,
+    temporary: &Path,
+    output_dir: &Path,
+    media: Option<&MediaInfo>,
+    duration: f64,
     file_position: (usize, usize),
     output_format: &str,
-) -> Result<PathBuf, String> {
+    encoder: VideoEncoder,
+) -> Result<(), ConversionAttemptError> {
     let (file_index, file_count) = file_position;
-    let input = &downloaded.path;
-    if download_was_cancelled(manager, id) {
-        return Err("Завантаження скасовано".into());
-    }
-
-    let is_video = output_format == "mp4";
-    let use_videotoolbox = is_video && videotoolbox_encoder_available(ffmpeg_path);
-    let media = is_video
-        .then(|| {
-            downloaded
-                .duration
-                .map(|duration| MediaInfo {
-                    duration,
-                    height: downloaded.height.unwrap_or(1080),
-                    fps: downloaded.fps.unwrap_or(30.0),
-                })
-                .map(Ok)
-                .unwrap_or_else(|| media_info(ffmpeg_path, input))
-        })
-        .transpose()?;
-    let duration = if let Some(media) = media.as_ref() {
-        media.duration
-    } else if let Some(duration) = downloaded.duration {
-        duration
-    } else {
-        media_duration(ffmpeg_path, input)?
-    };
-    let output = available_output_path(input, output_format);
-    let output_dir = output
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf();
-    if available_disk_space(&output_dir)
-        .map(low_disk_guard_triggered)
-        .unwrap_or(true)
-    {
-        return Err(
-            "Недостатньо вільного місця. Конвертацію не розпочато, щоб захистити диск.".into(),
-        );
-    }
-    let temporary = output.with_file_name(format!(
-        ".{}.{}.part.{}",
-        output
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .unwrap_or("video"),
-        Uuid::new_v4(),
-        output_format
-    ));
     let mut command = Command::new(ffmpeg_path);
     configure_command(&mut command);
     command
@@ -2514,38 +2668,11 @@ fn convert_downloaded_media(
             "-i",
         ])
         .arg(input);
-    if let Some(media) = media.as_ref() {
+    if let Some(media) = media {
         let bitrate = target_video_bitrate(Some(media.height), Some(media.fps), None);
         let maxrate = bitrate.saturating_mul(11) / 10;
         let bufsize = bitrate.saturating_mul(2);
-        command.args([
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a:0?",
-            "-map_metadata",
-            "0",
-            "-c:v",
-            if use_videotoolbox {
-                "h264_videotoolbox"
-            } else {
-                "libx264"
-            },
-            "-b:v",
-            &bitrate.to_string(),
-            "-maxrate",
-            &maxrate.to_string(),
-            "-bufsize",
-            &bufsize.to_string(),
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-tag:v",
-            "avc1",
-            "-movflags",
-            "+faststart",
-        ]);
+        command.args(video_encoding_args(encoder, bitrate, maxrate, bufsize));
     } else {
         command.args(["-map", "0:a:0", "-vn", "-map_metadata", "0"]);
         match output_format {
@@ -2564,23 +2691,23 @@ fn convert_downloaded_media(
         }
     }
     command
-        .arg(&temporary)
+        .arg(temporary)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
     #[cfg(unix)]
     command.process_group(0);
 
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("Не вдалося запустити ffmpeg: {error}"))?;
+    let mut child = command.spawn().map_err(|error| {
+        ConversionAttemptError::Failed(format!("Не вдалося запустити ffmpeg: {error}"))
+    })?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let child = Arc::new(Mutex::new(child));
     manager
         .jobs
         .lock()
-        .map_err(|_| "Внутрішня помилка черги".to_string())?
+        .map_err(|_| ConversionAttemptError::Failed("Внутрішня помилка черги".into()))?
         .insert(id.to_string(), child.clone());
 
     let errors = Arc::new(Mutex::new(String::new()));
@@ -2598,10 +2725,8 @@ fn convert_downloaded_media(
     let mut out_time_us = 0.0;
     let mut speed_value = 0.0;
     let format_label = output_format.to_ascii_uppercase();
-    let encoder_label = if use_videotoolbox {
-        "VideoToolbox"
-    } else if is_video {
-        "H.264"
+    let encoder_label = if media.is_some() {
+        encoder.label()
     } else {
         "FFmpeg"
     };
@@ -2616,14 +2741,14 @@ fn convert_downloaded_media(
                 speed_label = if value.is_empty() || value == "N/A" {
                     encoder_label.into()
                 } else {
-                    format!("Кодування {value}")
+                    format!("{encoder_label} · {value}")
                 };
                 speed_value = value
                     .trim_end_matches('x')
                     .parse::<f64>()
                     .unwrap_or(speed_value);
             } else if line.starts_with("progress=") {
-                if available_disk_space(&output_dir)
+                if available_disk_space(output_dir)
                     .map(low_disk_guard_triggered)
                     .unwrap_or(true)
                 {
@@ -2670,12 +2795,16 @@ fn convert_downloaded_media(
     }
 
     let status = loop {
-        if let Some(status) = child
+        let wait = child
             .lock()
-            .ok()
-            .and_then(|mut child| child.try_wait().ok())
-            .flatten()
-        {
+            .map_err(|_| ConversionAttemptError::Failed("Внутрішня помилка FFmpeg".into()))?
+            .try_wait()
+            .map_err(|error| {
+                ConversionAttemptError::Failed(format!(
+                    "Не вдалося перевірити стан FFmpeg: {error}"
+                ))
+            })?;
+        if let Some(status) = wait {
             break status;
         }
         thread::sleep(Duration::from_millis(100));
@@ -2685,28 +2814,169 @@ fn convert_downloaded_media(
     }
 
     if download_was_cancelled(manager, id) {
-        let _ = fs::remove_file(&temporary);
-        return Err("Завантаження скасовано".into());
+        return Err(ConversionAttemptError::Cancelled);
     }
     if low_disk {
-        let _ = fs::remove_file(&temporary);
-        return Err("Недостатньо вільного місця. Конвертацію зупинено, щоб захистити диск.".into());
+        return Err(ConversionAttemptError::LowDisk);
     }
     if !status.success() {
-        let _ = fs::remove_file(&temporary);
         let detail = errors
             .lock()
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "ffmpeg завершився з помилкою".into());
-        return Err(format!("Не вдалося створити {format_label}: {detail}"));
+        return Err(ConversionAttemptError::Failed(detail));
+    }
+    Ok(())
+}
+
+fn convert_downloaded_media(
+    app: &AppHandle,
+    manager: &DownloadManager,
+    id: &str,
+    ffmpeg_path: &Path,
+    downloaded: &DownloadedMedia,
+    file_position: (usize, usize),
+    output_format: &str,
+) -> Result<PathBuf, String> {
+    let input = &downloaded.path;
+    if download_was_cancelled(manager, id) {
+        return Err("Завантаження скасовано".into());
     }
 
-    fs::rename(&temporary, &output)
-        .map_err(|error| format!("Не вдалося зберегти готовий {format_label}: {error}"))?;
-    let _ = fs::remove_file(input);
-    Ok(output)
+    let is_video = output_format == "mp4";
+    let media = is_video
+        .then(|| {
+            downloaded
+                .duration
+                .map(|duration| MediaInfo {
+                    duration,
+                    height: downloaded.height.unwrap_or(1080),
+                    fps: downloaded.fps.unwrap_or(30.0),
+                })
+                .map(Ok)
+                .unwrap_or_else(|| media_info(ffmpeg_path, input))
+        })
+        .transpose()?;
+    let duration = if let Some(media) = media.as_ref() {
+        media.duration
+    } else if let Some(duration) = downloaded.duration {
+        duration
+    } else {
+        media_duration(ffmpeg_path, input)?
+    };
+    let output = available_output_path(input, output_format);
+    let output_dir = output
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    if available_disk_space(&output_dir)
+        .map(low_disk_guard_triggered)
+        .unwrap_or(true)
+    {
+        return Err(
+            "Недостатньо вільного місця. Конвертацію не розпочато, щоб захистити диск.".into(),
+        );
+    }
+    let temporary = output.with_file_name(format!(
+        ".{}.{}.part.{}",
+        output
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("video"),
+        Uuid::new_v4(),
+        output_format
+    ));
+    let selected_encoder = if is_video {
+        select_video_encoder(ffmpeg_path)
+    } else {
+        VideoEncoder::Software
+    };
+    let attempts = conversion_attempt_encoders(selected_encoder);
+    let format_label = output_format.to_ascii_uppercase();
+
+    for (index, encoder) in attempts.iter().copied().enumerate() {
+        if download_was_cancelled(manager, id) {
+            cleanup_failed_conversion(&temporary);
+            return Err("Завантаження скасовано".into());
+        }
+        if index > 0 {
+            let _ = app.emit(
+                "download-event",
+                DownloadEvent {
+                    id: id.into(),
+                    kind: "conversion_progress".into(),
+                    percent: Some(conversion_percent(
+                        0.0,
+                        duration,
+                        file_position.0,
+                        file_position.1,
+                    )),
+                    speed: Some(encoder.label().into()),
+                    eta: Some("—".into()),
+                    message: Some(format!(
+                        "Апаратний кодер не завершив обробку — продовжуємо через {}…",
+                        encoder.label()
+                    )),
+                    storage: None,
+                    outputs: None,
+                    title: None,
+                    thumbnail: None,
+                    uploader: None,
+                    extractor: None,
+                    error_code: None,
+                },
+            );
+        }
+        cleanup_failed_conversion(&temporary);
+        match run_conversion_attempt(
+            app,
+            manager,
+            id,
+            ffmpeg_path,
+            input,
+            &temporary,
+            &output_dir,
+            media.as_ref(),
+            duration,
+            file_position,
+            output_format,
+            encoder,
+        ) {
+            Ok(()) => {
+                if let Err(error) = fs::rename(&temporary, &output) {
+                    cleanup_failed_conversion(&temporary);
+                    return Err(format!(
+                        "Не вдалося зберегти готовий {format_label}: {error}"
+                    ));
+                }
+                let _ = fs::remove_file(input);
+                return Ok(output);
+            }
+            Err(ConversionAttemptError::Cancelled) => {
+                cleanup_failed_conversion(&temporary);
+                return Err("Завантаження скасовано".into());
+            }
+            Err(ConversionAttemptError::LowDisk) => {
+                cleanup_failed_conversion(&temporary);
+                return Err(
+                    "Недостатньо вільного місця. Конвертацію зупинено, щоб захистити диск.".into(),
+                );
+            }
+            Err(ConversionAttemptError::Failed(detail)) => {
+                cleanup_failed_conversion(&temporary);
+                if index + 1 == attempts.len() {
+                    return Err(format!("Не вдалося створити {format_label}: {detail}"));
+                }
+                eprintln!(
+                    "Кодер {} не завершив конвертацію, повторюємо через libx264: {detail}",
+                    encoder.label()
+                );
+            }
+        }
+    }
+    Err(format!("Не вдалося створити {format_label}"))
 }
 
 #[tauri::command]
@@ -2938,10 +3208,7 @@ fn start_download(
             return Err("Інше завантаження ще не завершено".into());
         }
     }
-    let parsed = Url::parse(&request.url).map_err(|_| "Вставте повне посилання".to_string())?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-        return Err("Підтримуються лише HTTP та HTTPS посилання".into());
-    }
+    let parsed = normalize_media_url(&request.url)?;
     let is_youtube = parsed
         .host_str()
         .map(|host| {
@@ -2968,7 +3235,6 @@ fn start_download(
     if !enough_space {
         return Err("Недостатньо вільного місця для безпечного завантаження".into());
     }
-
     let yt_dlp = yt_dlp_path(&app)?;
     if !yt_dlp.is_file() {
         return Err("Спочатку встановіть yt-dlp".into());
@@ -3037,8 +3303,10 @@ fn start_download(
     if request.subtitles {
         command.args(["--write-subs", "--write-auto-subs", "--sub-langs", "uk,en"]);
     }
+    let job_temp_dir = create_download_temp_dir(&output_dir, &id)?;
+    command.args(["-P", &format!("temp:{}", job_temp_dir.to_string_lossy())]);
     command
-        .arg(&request.url)
+        .arg(parsed.as_str())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -3047,9 +3315,13 @@ fn start_download(
 
     let retry_program: OsString = command.get_program().to_os_string();
     let retry_args: Vec<OsString> = command.get_args().map(OsString::from).collect();
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("Не вдалося запустити yt-dlp: {error}"))?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            cleanup_download_temp_dir(&job_temp_dir);
+            return Err(format!("Не вдалося запустити yt-dlp: {error}"));
+        }
+    };
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let child = Arc::new(Mutex::new(child));
@@ -3070,7 +3342,11 @@ fn start_download(
     manager
         .jobs
         .lock()
-        .map_err(|_| "Внутрішня помилка черги".to_string())?
+        .map_err(|_| {
+            let _ = stop_child_process_group(&child);
+            cleanup_download_temp_dir(&job_temp_dir);
+            "Внутрішня помилка черги".to_string()
+        })?
         .insert(id.clone(), child.clone());
 
     let stdout_reader = stdout.map(|stdout| {
@@ -3147,7 +3423,20 @@ fn start_download(
                         .as_deref()
                         .map(|message| message.contains("403"))
                         .unwrap_or(false);
-                if youtube_403 && !cancelled && retry_attempt < 2 {
+                let youtube_retry_ready = if youtube_403 && !cancelled && retry_attempt < 2 {
+                    match reset_download_temp_dir(&job_temp_dir) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            if let Ok(mut last_error) = last_error.lock() {
+                                *last_error = Some(error);
+                            }
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                if youtube_retry_ready {
                     retry_attempt += 1;
                     let retry_message = if retry_attempt == 1 {
                         "YouTube перервав потік. Оновлюємо посилання й продовжуємо…"
@@ -3279,6 +3568,7 @@ fn start_download(
                     }
                     cancelled = download_was_cancelled(&manager, &monitor_id);
                 }
+                cleanup_download_temp_dir(&job_temp_dir);
                 manager
                     .jobs
                     .lock()
@@ -3802,6 +4092,112 @@ mod tests {
     }
 
     #[test]
+    fn windows_hardware_encoder_selection_is_deterministic() {
+        assert_eq!(
+            windows_encoder_candidates(),
+            [
+                VideoEncoder::Nvenc,
+                VideoEncoder::QuickSync,
+                VideoEncoder::Amf
+            ]
+        );
+        let mut probed = Vec::new();
+        let selected = first_available_encoder(&windows_encoder_candidates(), |encoder| {
+            probed.push(encoder);
+            encoder == VideoEncoder::QuickSync
+        });
+        assert_eq!(selected, VideoEncoder::QuickSync);
+        assert_eq!(probed, vec![VideoEncoder::Nvenc, VideoEncoder::QuickSync]);
+    }
+
+    #[test]
+    fn unavailable_hardware_selects_software_and_retry_never_loops() {
+        let selected = first_available_encoder(&windows_encoder_candidates(), |_| false);
+        assert_eq!(selected, VideoEncoder::Software);
+        assert_eq!(
+            conversion_attempt_encoders(VideoEncoder::Nvenc),
+            vec![VideoEncoder::Nvenc, VideoEncoder::Software]
+        );
+        assert_eq!(
+            conversion_attempt_encoders(VideoEncoder::Software),
+            vec![VideoEncoder::Software]
+        );
+        assert_eq!(
+            conversion_attempt_encoders(VideoEncoder::VideoToolbox),
+            vec![VideoEncoder::VideoToolbox]
+        );
+    }
+
+    #[test]
+    fn failed_hardware_cleanup_preserves_source_and_removes_only_temporary_mp4() {
+        let directory =
+            std::env::temp_dir().join(format!("yt-dlp-bd-encoder-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("merged-source.mkv");
+        let temporary = directory.join(".converted.part.mp4");
+        fs::write(&source, b"source").unwrap();
+        fs::write(&temporary, b"partial output").unwrap();
+
+        cleanup_failed_conversion(&temporary);
+
+        assert!(source.exists());
+        assert!(!temporary.exists());
+        fs::remove_file(source).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn download_temp_cleanup_removes_only_the_job_owned_directory() {
+        let root = std::env::temp_dir().join(format!("yt-dlp-bd-temp-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let kept = root.join("finished-video.mp4");
+        fs::write(&kept, b"finished").unwrap();
+        let id = Uuid::new_v4().to_string();
+        let job_temp = create_download_temp_dir(&root, &id).unwrap();
+        fs::write(job_temp.join("video.f137.part"), b"partial").unwrap();
+
+        reset_download_temp_dir(&job_temp).unwrap();
+        assert!(job_temp.is_dir());
+        assert_eq!(fs::read_dir(&job_temp).unwrap().count(), 0);
+        fs::write(job_temp.join("audio.f140.m4a"), b"partial").unwrap();
+        cleanup_download_temp_dir(&job_temp);
+
+        assert!(!job_temp.exists());
+        assert!(kept.exists());
+        fs::remove_file(kept).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn hardware_and_software_video_args_preserve_output_contract() {
+        for encoder in [
+            VideoEncoder::Nvenc,
+            VideoEncoder::QuickSync,
+            VideoEncoder::Amf,
+            VideoEncoder::Software,
+        ] {
+            let args = video_encoding_args(encoder, 8_000_000, 8_800_000, 16_000_000);
+            let joined = args.join(" ");
+            assert!(joined.contains(&format!("-c:v {}", encoder.codec())));
+            assert!(joined.contains("-map 0:v:0 -map 0:a:0? -map_metadata 0"));
+            assert!(joined.contains("-b:v 8000000 -maxrate 8800000 -bufsize 16000000"));
+            assert!(joined.contains("-c:a aac -profile:a aac_low -b:a 192k"));
+            assert!(joined.contains("-tag:v avc1 -movflags +faststart"));
+        }
+    }
+
+    #[test]
+    fn encoder_probe_creates_a_real_frame() {
+        for encoder in windows_encoder_candidates() {
+            let args = encoder_probe_args(encoder).join(" ");
+            assert!(args.contains("-f lavfi -i color=size=128x128:rate=30"));
+            assert!(args.contains("-frames:v 1"));
+            assert!(args.contains(&format!("-c:v {}", encoder.codec())));
+            assert!(args.ends_with("-f null -"));
+        }
+    }
+
+    #[test]
     fn selector_and_playlist_intent_are_explicit() {
         assert_eq!(
             format_selector("video", "1080"),
@@ -3810,6 +4206,24 @@ mod tests {
         assert_eq!(format_selector("audio", "best"), "bestaudio/best");
         assert_eq!(playlist_flag(false), "--no-playlist");
         assert_eq!(playlist_flag(true), "--yes-playlist");
+    }
+
+    #[test]
+    fn canonical_tiktok_video_urls_drop_tracking_parameters() {
+        let normalized = normalize_media_url(
+            "https://www.tiktok.com/@the_best_president_ua/video/7667686431778688274/?is_from_webapp=1&sender_device=pc#share",
+        )
+        .unwrap();
+        assert_eq!(
+            normalized.as_str(),
+            "https://www.tiktok.com/@the_best_president_ua/video/7667686431778688274"
+        );
+        assert_eq!(
+            normalize_media_url("https://vm.tiktok.com/ZMexample/?share_app_id=123")
+                .unwrap()
+                .as_str(),
+            "https://vm.tiktok.com/ZMexample/?share_app_id=123"
+        );
     }
 
     #[test]

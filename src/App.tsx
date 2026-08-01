@@ -382,11 +382,7 @@ function hostFromInput(value: string): string | null {
 }
 
 function normalizeInputUrl(value: string): string | null {
-  try {
-    return new URL(/^https?:\/\//i.test(value.trim()) ? value.trim() : `https://${value.trim()}`).toString();
-  } catch {
-    return null;
-  }
+  return normalizeHttpUrl(value);
 }
 
 function isRussianDomain(host: string): boolean {
@@ -2141,9 +2137,9 @@ function App() {
       {job && job.status !== "auth_required" && <div className="download-progress-backdrop" role="presentation">
         <DialogSurface className={`job-card ${job.status}`} labelledBy="download-progress-title" onEscape={!active ? () => setJob(null) : undefined}>
           {job.status === "completed" ? (
-            <div className="job-icon" aria-hidden="true"><Icon name="check"/></div>
+            <button type="button" className="job-icon status-action" aria-label="Закрити повідомлення про завершення" onClick={() => setJob(null)}><Icon name="check"/></button>
           ) : job.status === "failed" ? (
-            <div className="job-icon" aria-hidden="true"><Icon name="warning" size={28}/></div>
+            <button type="button" className="job-icon status-action" aria-label="Закрити повідомлення про помилку" onClick={() => setJob(null)}><Icon name="x" size={24}/></button>
           ) : (
             <div className="job-icon" aria-label={`Етап ${jobStageNumber(job.status)}`}><span className="job-stage"><small>ЕТАП</small><strong>{jobStageNumber(job.status)}</strong></span></div>
           )}

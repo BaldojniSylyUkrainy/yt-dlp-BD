@@ -433,6 +433,9 @@ select:focus { border-color: var(--pink); }
 .download-progress-backdrop { position: fixed; inset: 0; z-index: 30; display: grid; place-items: center; padding: 30px; background: rgba(0,0,0,.86); backdrop-filter: blur(5px); }
 .job-card { width: min(820px, calc(100vw - 60px)); padding: 0; display: grid; grid-template-columns: 96px 1fr 64px; align-items: stretch; border: 1px solid var(--line); }
 .job-icon { min-height: 148px; padding: 0; display: grid; place-items: center; border: 0; border-right: 1px solid #985b74; border-radius: 0; color: var(--pink-ink); background: var(--pink); }
+.job-icon.status-action { cursor: pointer; transition: filter .16s ease, box-shadow .16s ease; }
+.job-icon.status-action:hover { filter: brightness(1.08); }
+.job-icon.status-action:focus-visible { outline: 2px solid var(--paper); outline-offset: -5px; }
 .job-stage { display: flex; flex-direction: column; align-items: center; justify-content: center; line-height: 1; }
 .job-stage small { margin-bottom: 5px; font-size: 12px; font-weight: 850; letter-spacing: .14em; }
 .job-stage strong { font-family: var(--font-poster); font-size: 54px; font-weight: 900; letter-spacing: -.04em; }

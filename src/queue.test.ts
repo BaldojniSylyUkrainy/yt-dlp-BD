@@ -32,6 +32,13 @@ describe("batch queue input", () => {
     expect(normalizeHttpUrl("ftp://example.org/file")).toBeNull();
   });
 
+  it("removes TikTok tracking parameters only from canonical video links", () => {
+    expect(normalizeHttpUrl("https://www.tiktok.com/@the_best_president_ua/video/7667686431778688274?is_from_webapp=1&sender_device=pc"))
+      .toBe("https://www.tiktok.com/@the_best_president_ua/video/7667686431778688274");
+    expect(normalizeHttpUrl("https://vm.tiktok.com/ZMexample/?share_app_id=123"))
+      .toBe("https://vm.tiktok.com/ZMexample/?share_app_id=123");
+  });
+
   it("splits multiline paste and enforces the 50 URL limit", () => {
     let id = 0;
     const raw = Array.from({ length: QUEUE_LIMIT + 3 }, (_, index) => `https://example.org/${index}`).join("\n");

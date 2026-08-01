@@ -86,6 +86,12 @@ export function normalizeHttpUrl(value: string): string | null {
   try {
     const parsed = new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`);
     if (!(["http:", "https:"] as string[]).includes(parsed.protocol) || !parsed.hostname) return null;
+    const host = parsed.hostname.toLowerCase();
+    if ((host === "tiktok.com" || host.endsWith(".tiktok.com")) && /^\/@[^/]+\/video\/\d+\/?$/i.test(parsed.pathname)) {
+      parsed.pathname = parsed.pathname.replace(/\/$/, "");
+      parsed.search = "";
+      parsed.hash = "";
+    }
     return parsed.toString();
   } catch {
     return null;

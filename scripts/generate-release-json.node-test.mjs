@@ -26,6 +26,17 @@ test("uses the public product name and version for GitHub Release titles", async
   assert.match(workflow, /description: "Four-part release tag from package\.json, for example vX\.Y\.Z\.H"/);
 });
 
+test("uses the branded installed app name and Windows installer icons", async () => {
+  const tauriConfig = JSON.parse(await readFile("src-tauri/tauri.conf.json", "utf8"));
+  const macBuild = await readFile("scripts/build-macos.sh", "utf8");
+  const releaseGenerator = await readFile("scripts/generate-release-json.mjs", "utf8");
+  assert.equal(tauriConfig.productName, "Baldojnyi Downloader");
+  assert.equal(tauriConfig.bundle.windows.nsis.installerIcon, "icons/icon.ico");
+  assert.equal(tauriConfig.bundle.windows.nsis.uninstallerIcon, "icons/icon.ico");
+  assert.match(macBuild, /Baldojnyi Downloader\.app/);
+  assert.match(releaseGenerator, /Baldojnyi Downloader\.app\.tar\.gz/);
+});
+
 test("grants repository write access only to the final draft-release job", async () => {
   const workflow = await readFile(".github/workflows/release.yml", "utf8");
   assert.match(workflow, /^permissions:\r?\n  contents: read$/m);
