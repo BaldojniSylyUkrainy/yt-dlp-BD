@@ -211,6 +211,8 @@ struct DownloadedMedia {
     duration: Option<f64>,
     height: Option<u64>,
     fps: Option<f64>,
+    video_codec: Option<String>,
+    audio_codec: Option<String>,
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -1912,6 +1914,18 @@ fn downloaded_media_from_print(payload: &str) -> Option<DownloadedMedia> {
             height: positive_finite_number(metadata.get("height"))
                 .map(|value| value.round() as u64),
             fps: positive_finite_number(metadata.get("fps")),
+            video_codec: metadata
+                .get("vcodec")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_ascii_lowercase),
+            audio_codec: metadata
+                .get("acodec")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_ascii_lowercase),
         });
     }
 
@@ -1921,6 +1935,8 @@ fn downloaded_media_from_print(payload: &str) -> Option<DownloadedMedia> {
         duration: None,
         height: None,
         fps: None,
+        video_codec: None,
+        audio_codec: None,
     })
 }
 
@@ -2679,8 +2695,82 @@ fn conversion_attempt_encoders(selected: VideoEncoder) -> Vec<VideoEncoder> {
     }
 }
 
-fn requires_app_conversion(is_threads: bool, output_format: &str) -> bool {
-    !(is_threads && output_format == "mp4")
+fn is_h264_codec(codec: &str) -> bool {
+    let codec = codec.to_ascii_lowercase();
+    codec.starts_with("h264") || codec.starts_with("avc1") || codec == "avc"
+}
+
+fn is_mp4_audio_codec(codec: &str) -> bool {
+    let codec = codec.to_ascii_lowercase();
+    codec == "none" || codec.starts_with("aac") || codec.starts_with("mp4a")
+}
+
+fn parse_media_codecs(metadata: &serde_json::Value) -> Option<(String, Vec<String>)> {
+    let streams = metadata.get("streams")?.as_array()?;
+    let video = streams.iter().find_map(|stream| {
+        if stream.get("codec_type")?.as_str()? != "video" {
+            return None;
+        }
+        Some(stream.get("codec_name")?.as_str()?.to_ascii_lowercase())
+    })?;
+    let audio = streams
+        .iter()
+        .filter_map(|stream| {
+            if stream.get("codec_type")?.as_str()? != "audio" {
+                return None;
+            }
+            Some(stream.get("codec_name")?.as_str()?.to_ascii_lowercase())
+        })
+        .collect();
+    Some((video, audio))
+}
+
+fn probe_media_codecs(ffmpeg_path: &Path, input: &Path) -> Option<(String, Vec<String>)> {
+    let mut command = Command::new(ffprobe_path(ffmpeg_path));
+    configure_command(&mut command);
+    let output = command
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,codec_name",
+            "-of",
+            "json",
+        ])
+        .arg(input)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let metadata = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok()?;
+    parse_media_codecs(&metadata)
+}
+
+fn is_ready_compatible_mp4(media: &DownloadedMedia, ffmpeg_path: &Path) -> bool {
+    let is_mp4 = media
+        .path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("mp4"));
+    if !is_mp4 {
+        return false;
+    }
+    if let (Some(video), Some(audio)) = (media.video_codec.as_deref(), media.audio_codec.as_deref())
+    {
+        return is_h264_codec(video) && is_mp4_audio_codec(audio);
+    }
+    probe_media_codecs(ffmpeg_path, &media.path).is_some_and(|(video, audio)| {
+        is_h264_codec(&video) && audio.iter().all(|codec| is_mp4_audio_codec(codec))
+    })
+}
+
+fn requires_app_conversion(
+    media: &DownloadedMedia,
+    output_format: &str,
+    ffmpeg_path: &Path,
+) -> bool {
+    output_format != "mp4" || !is_ready_compatible_mp4(media, ffmpeg_path)
 }
 
 fn video_encoding_args(
@@ -3418,10 +3508,10 @@ fn start_download(
 
     command.args([
         "--print",
-        "after_move:__YTDLP_FILE__%(.{filepath,duration,height,fps})j",
+        "after_move:__YTDLP_FILE__%(.{filepath,duration,height,fps,vcodec,acodec})j",
     ]);
-    if request.mode != "audio" && requires_app_conversion(is_threads, "mp4") {
-        command.args(["--merge-output-format", "mkv", "--remux-video", "mkv"]);
+    if request.mode != "audio" {
+        command.args(["--merge-output-format", "mkv"]);
     }
     if request.subtitles {
         command.args(["--write-subs", "--write-auto-subs", "--sub-langs", "uk,en"]);
@@ -3659,7 +3749,7 @@ fn start_download(
                         );
                     } else if !files.is_empty() {
                         for (index, file) in files.iter().enumerate() {
-                            if !requires_app_conversion(is_threads, &output_format) {
+                            if !requires_app_conversion(file, &output_format, &ffmpeg_path) {
                                 let size = fs::metadata(&file.path)
                                     .map(|metadata| metadata.len())
                                     .unwrap_or(0);
@@ -4082,6 +4172,8 @@ mod tests {
         assert_eq!(media.duration, Some(5470.0));
         assert_eq!(media.height, Some(2160));
         assert_eq!(media.fps, Some(24.0));
+        assert_eq!(media.video_codec, None);
+        assert_eq!(media.audio_codec, None);
     }
 
     #[test]
@@ -4096,6 +4188,18 @@ mod tests {
         assert_eq!(media.duration, None);
         assert_eq!(media.height, None);
         assert_eq!(media.fps, None);
+        assert_eq!(media.video_codec, None);
+        assert_eq!(media.audio_codec, None);
+    }
+
+    #[test]
+    fn download_handoff_reports_selected_codecs() {
+        let direct = downloaded_media_from_print(
+            r#"{"filepath":"clip.mp4","duration":12,"vcodec":"avc1.640028","acodec":"mp4a.40.2"}"#,
+        )
+        .unwrap();
+        assert_eq!(direct.video_codec.as_deref(), Some("avc1.640028"));
+        assert_eq!(direct.audio_codec.as_deref(), Some("mp4a.40.2"));
     }
 
     #[test]
@@ -4292,10 +4396,53 @@ mod tests {
     }
 
     #[test]
-    fn threads_mp4_bypasses_merge_and_app_conversion() {
-        assert!(!requires_app_conversion(true, "mp4"));
-        assert!(requires_app_conversion(true, "mp3"));
-        assert!(requires_app_conversion(false, "mp4"));
+    fn compatible_single_mp4_bypasses_conversion_independent_of_site() {
+        let ffmpeg_path = Path::new("ffmpeg");
+        let compatible = DownloadedMedia {
+            path: PathBuf::from("ready.mp4"),
+            duration: Some(10.0),
+            height: Some(1080),
+            fps: Some(30.0),
+            video_codec: Some("avc1.640028".into()),
+            audio_codec: Some("mp4a.40.2".into()),
+        };
+        assert!(!requires_app_conversion(&compatible, "mp4", ffmpeg_path));
+        assert!(requires_app_conversion(&compatible, "mp3", ffmpeg_path));
+
+        let incompatible_video = DownloadedMedia {
+            video_codec: Some("vp9".into()),
+            ..compatible.clone()
+        };
+        assert!(requires_app_conversion(
+            &incompatible_video,
+            "mp4",
+            ffmpeg_path
+        ));
+
+        let merged_streams = DownloadedMedia {
+            path: PathBuf::from("merged.mkv"),
+            ..compatible.clone()
+        };
+        assert!(requires_app_conversion(&merged_streams, "mp4", ffmpeg_path));
+    }
+
+    #[test]
+    fn ffprobe_codec_metadata_recognizes_h264_aac_and_silent_mp4() {
+        let compatible = serde_json::json!({
+            "streams": [
+                {"codec_type": "video", "codec_name": "h264"},
+                {"codec_type": "audio", "codec_name": "aac"}
+            ]
+        });
+        assert_eq!(
+            parse_media_codecs(&compatible),
+            Some(("h264".into(), vec!["aac".into()]))
+        );
+
+        let silent = serde_json::json!({
+            "streams": [{"codec_type": "video", "codec_name": "h264"}]
+        });
+        assert_eq!(parse_media_codecs(&silent), Some(("h264".into(), vec![])));
     }
 
     #[test]
