@@ -218,12 +218,15 @@ struct DownloadedMedia {
     audio_codec: Option<String>,
 }
 
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum VideoEncoder {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     VideoToolbox,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     Nvenc,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     QuickSync,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     Amf,
     Software,
 }

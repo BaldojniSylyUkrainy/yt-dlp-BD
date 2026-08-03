@@ -1,3 +1,5 @@
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import {
   applyDownloadEvent,
@@ -5,11 +7,13 @@ import {
   applyHistoryFileStatuses,
   applyHistoryThumbnailCache,
   defaultCookieBrowser,
+  DownloadCollectionIntent,
   groupHistoryEntries,
   historyPaths,
   inputUrlState,
   isLikelyMultiItemUrl,
   parseHistoryStorage,
+  playlistIntentToMultiItem,
   preflightAllowsStart,
   preflightConfidenceLabel,
   runtimeInstallCommand,
@@ -261,9 +265,25 @@ describe("playlist intent detection", () => {
     expect(isLikelyMultiItemUrl("https://youtube.com/watch?v=VIDEO")).toBe(false);
   });
 
-  it("reveals collection controls when an extractor reports multiple media items", () => {
-    expect(shouldShowMultiItemIntent("https://www.threads.com/@author/post/POST", 3)).toBe(true);
-    expect(shouldShowMultiItemIntent("https://www.threads.com/@author/post/POST", 1)).toBe(false);
+  it("recognizes Threads post and share URLs without a network metadata probe", () => {
+    expect(shouldShowMultiItemIntent("https://www.threads.com/@author/post/POST")).toBe(true);
+    expect(shouldShowMultiItemIntent("https://threads.net/@author/t/POST")).toBe(true);
+    expect(shouldShowMultiItemIntent("https://www.threads.com/share/POST")).toBe(true);
+    expect(shouldShowMultiItemIntent("https://www.threads.com/@author")).toBe(false);
+  });
+
+  it("wires a real Threads URL into the rendered single/all selector", () => {
+    const markup = renderToStaticMarkup(createElement(DownloadCollectionIntent, {
+      url: "https://www.threads.com/@author/post/POST",
+      intent: "single",
+      onIntentChange: () => undefined,
+    }));
+    expect(markup).toContain("Що взяти з добірки");
+    expect(markup).toContain("Лише це відео");
+    expect(markup).toContain("Уся добірка");
+    expect(markup).toContain('class="selected"');
+    expect(playlistIntentToMultiItem("single")).toBe(false);
+    expect(playlistIntentToMultiItem("playlist")).toBe(true);
   });
 });
 
