@@ -83,7 +83,7 @@ Current automated coverage includes size confidence, protected-reserve arithmeti
 
 ## Current Stabilization Work
 
-- The dedicated `chore/vite-8` maintenance branch upgrades only the frontend build pair to Vite 8.2.1 and `@vitejs/plugin-react` 6.0.5, declares their shared Node requirement (`^20.19.0 || >=22.12.0`), and deliberately leaves unrelated Dependabot upgrades out of the PR. Clean install, all JS/Node and Rust tests, production build, strict macOS and Windows x64 Clippy/checks, and a native macOS Tauri debug build pass.
+- The dedicated `chore/vite-8` maintenance branch upgrades only the frontend build pair to Vite 8.2.1 and `@vitejs/plugin-react` 6.0.5, declares their shared Node requirement (`^20.19.0 || >=22.12.0`), and deliberately leaves unrelated Dependabot upgrades out of the PR. Dependabot version updates are consolidated across npm, Cargo, and GitHub Actions into one monthly minor/patch PR; automatic major-version PRs are suppressed, while security audits and CodeQL remain independent. Clean install, all JS/Node and Rust tests, production build, strict macOS and Windows x64 Clippy/checks, and a native macOS Tauri debug build pass.
 
 Implemented from `HANDOFF_REVIEW_UK.md`:
 
