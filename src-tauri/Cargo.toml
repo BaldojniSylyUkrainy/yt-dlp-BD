@@ -33,5 +33,5 @@ fs2 = "0.4.3"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "time"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "4", default-features = false, features = ["deflate"] }
 libc = "0.2"
