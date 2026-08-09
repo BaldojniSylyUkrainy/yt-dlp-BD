@@ -46,11 +46,50 @@ test("grants repository write access only to the final draft-release job", async
   assert.equal(workflow.match(/contents: write/g)?.length, 1);
 });
 
+test("scopes protected signing secrets to only the steps that need them", async () => {
+  const workflow = await readFile(".github/workflows/release.yml", "utf8");
+  for (const job of ["windows", "macos", "runtime-manifest"]) {
+    const jobHeader = workflow.match(new RegExp(`^  ${job}:([\\s\\S]*?)^    steps:`, "m"))?.[1] || "";
+    assert.doesNotMatch(jobHeader, /secrets\.(?:TAURI_SIGNING|APPLE_)/u, `${job} exposes signing secrets at job scope`);
+  }
+  assert.match(workflow, /Build signed NSIS installer[\s\S]*?TAURI_SIGNING_PRIVATE_KEY:/u);
+  assert.match(workflow, /Build, notarize, staple, and verify macOS artifacts[\s\S]*?TAURI_SIGNING_PRIVATE_KEY:/u);
+  assert.match(workflow, /Sign and verify runtime manifest outputs[\s\S]*?TAURI_SIGNING_PRIVATE_KEY:/u);
+});
+
+test("removes Apple signing files before any external upload action", async () => {
+  const workflow = await readFile(".github/workflows/release.yml", "utf8");
+  const cleanup = workflow.indexOf("- name: Remove temporary signing material");
+  const macUpload = workflow.indexOf("- uses: actions/upload-artifact@", cleanup);
+  assert.ok(cleanup > workflow.indexOf("- name: Build, notarize, staple, and verify macOS artifacts"));
+  assert.ok(macUpload > cleanup, "macOS upload must run only after signing-material cleanup");
+  assert.ok(workflow.indexOf("- name: Verify expected macOS release files", cleanup) > cleanup);
+});
+
 test("uses Node 24 artifact actions in both platform release jobs", async () => {
   const workflow = await readFile(".github/workflows/release.yml", "utf8");
-  assert.equal(workflow.match(/actions\/upload-artifact@v7/g)?.length, 2);
-  assert.equal(workflow.match(/actions\/download-artifact@v7/g)?.length, 1);
+  assert.equal(workflow.match(/actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a/g)?.length, 3);
+  assert.equal(workflow.match(/actions\/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131/g)?.length, 1);
   assert.doesNotMatch(workflow, /actions\/(?:upload|download)-artifact@v4/);
+});
+
+test("pins every external GitHub Action to an immutable full commit SHA", async () => {
+  for (const file of [".github/workflows/release.yml", ".github/workflows/security.yml"]) {
+    const workflow = await readFile(file, "utf8");
+    const uses = [...workflow.matchAll(/^\s*- uses:\s+([^\s#]+)/gmu)].map((match) => match[1]);
+    assert.ok(uses.length > 0, `${file} must contain actions`);
+    for (const action of uses) {
+      assert.match(action, /^[\w.-]+\/[\w.-]+(?:\/[\w.-]+)?@[a-f0-9]{40}$/u, `${action} in ${file} must be pinned`);
+    }
+  }
+});
+
+test("release publishes a signed runtime component manifest", async () => {
+  const workflow = await readFile(".github/workflows/release.yml", "utf8");
+  assert.match(workflow, /runtime-manifest:/);
+  assert.match(workflow, /tauri signer sign release-assets\/runtime-components\.json/);
+  assert.match(workflow, /needs: \[windows, macos, runtime-manifest\]/);
+  assert.match(workflow, /test -s release-assets\/runtime-components\.json\.sig/);
 });
 
 test("keeps every current project and public release version in sync", async () => {
