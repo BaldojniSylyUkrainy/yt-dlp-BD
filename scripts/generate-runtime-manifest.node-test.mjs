@@ -19,6 +19,7 @@ test("uses a stable versioned name for the redistributed Windows FFmpeg runtime"
 
 test("pins Windows FFmpeg to this app's immutable versioned release asset", () => {
   const manifest = {
+    releaseVersion: "0.6.1.0",
     platforms: {
       "windows-x86_64": {
         ffmpeg: { archive: { url: "https://example.invalid/moving-latest.zip" } },
@@ -56,6 +57,7 @@ test("runtime manifest requires both shipped targets and complete FFmpeg layouts
   const asset = (version, url) => ({ version, url, sha256: hash });
   const manifest = {
     schemaVersion: 1,
+    releaseVersion: "0.6.1.0",
     generatedAt: "2026-08-09T00:00:00.000Z",
     platforms: {
       "darwin-aarch64": {
@@ -81,6 +83,9 @@ test("runtime manifest requires both shipped targets and complete FFmpeg layouts
     },
   };
   assert.equal(validateRuntimeManifest(manifest), manifest);
+  const missingReleaseVersion = structuredClone(manifest);
+  delete missingReleaseVersion.releaseVersion;
+  assert.throws(() => validateRuntimeManifest(missingReleaseVersion), /releaseVersion/);
   delete manifest.platforms["windows-x86_64"];
   assert.throws(() => validateRuntimeManifest(manifest), /windows-x86_64/);
 });

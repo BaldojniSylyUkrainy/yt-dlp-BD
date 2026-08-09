@@ -107,8 +107,16 @@ struct RuntimePlatformManifest {
 #[serde(rename_all = "camelCase")]
 struct RuntimeManifest {
     schema_version: u32,
+    release_version: String,
     generated_at: String,
     platforms: HashMap<String, RuntimePlatformManifest>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeManifestState {
+    release_version: String,
+    generated_at: String,
 }
 
 #[derive(Serialize)]
@@ -824,7 +832,99 @@ fn validate_runtime_platform_manifest(manifest: &RuntimePlatformManifest) -> Res
     Ok(())
 }
 
+fn parsed_runtime_release_version(value: &str) -> Result<[u64; 4], String> {
+    let parts = value
+        .split('.')
+        .map(|part| part.parse::<u64>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "Runtime manifest має неправильну версію релізу".to_string())?;
+    parts
+        .try_into()
+        .map_err(|_| "Runtime manifest має неправильну версію релізу".to_string())
+}
+
+fn validate_runtime_manifest_timestamp(value: &str) -> Result<(), String> {
+    let bytes = value.as_bytes();
+    let separators = [
+        (4, b'-'),
+        (7, b'-'),
+        (10, b'T'),
+        (13, b':'),
+        (16, b':'),
+        (19, b'.'),
+        (23, b'Z'),
+    ];
+    if bytes.len() != 24
+        || separators
+            .iter()
+            .any(|(index, expected)| bytes.get(*index) != Some(expected))
+        || bytes.iter().enumerate().any(|(index, value)| {
+            !separators.iter().any(|(separator, _)| *separator == index) && !value.is_ascii_digit()
+        })
+    {
+        return Err("Runtime manifest має неправильний час генерації".into());
+    }
+    Ok(())
+}
+
+fn ensure_runtime_manifest_is_current(
+    incoming: &RuntimeManifestState,
+    accepted: Option<&RuntimeManifestState>,
+) -> Result<(), String> {
+    let incoming_version = parsed_runtime_release_version(&incoming.release_version)?;
+    validate_runtime_manifest_timestamp(&incoming.generated_at)?;
+    let Some(accepted) = accepted else {
+        return Ok(());
+    };
+    let accepted_version = parsed_runtime_release_version(&accepted.release_version)
+        .map_err(|_| "Збережений стан runtime manifest пошкоджено".to_string())?;
+    validate_runtime_manifest_timestamp(&accepted.generated_at)
+        .map_err(|_| "Збережений стан runtime manifest пошкоджено".to_string())?;
+    if incoming_version < accepted_version
+        || (incoming_version == accepted_version && incoming.generated_at < accepted.generated_at)
+    {
+        return Err("Підписаний runtime manifest старіший за вже прийняту версію".into());
+    }
+    Ok(())
+}
+
+fn runtime_manifest_state_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(runtime_dir(app)?.join(".runtime-manifest-state.json"))
+}
+
+fn read_runtime_manifest_state(app: &AppHandle) -> Result<Option<RuntimeManifestState>, String> {
+    let path = runtime_manifest_state_path(app)?;
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|_| "Збережений стан runtime manifest пошкоджено".to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "Не вдалося прочитати стан runtime manifest: {error}"
+        )),
+    }
+}
+
+fn write_runtime_manifest_state(
+    app: &AppHandle,
+    state: &RuntimeManifestState,
+) -> Result<(), String> {
+    let destination = runtime_manifest_state_path(app)?;
+    let temporary = destination.with_extension(format!("json.{}.tmp", Uuid::new_v4()));
+    let bytes = serde_json::to_vec(state)
+        .map_err(|error| format!("Не вдалося підготувати стан runtime manifest: {error}"))?;
+    fs::write(&temporary, bytes)
+        .map_err(|error| format!("Не вдалося записати стан runtime manifest: {error}"))?;
+    if let Err(error) = replace_runtime_file(&temporary, &destination, "стан runtime manifest")
+    {
+        let _ = fs::remove_file(temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
 async fn runtime_platform_manifest(
+    app: &AppHandle,
     maintenance: &RuntimeMaintenance,
 ) -> Result<RuntimePlatformManifest, String> {
     let mut cached = maintenance.manifest.lock().await;
@@ -839,9 +939,15 @@ async fn runtime_platform_manifest(
     verify_runtime_manifest_signature(&manifest_bytes, &signature_bytes)?;
     let manifest: RuntimeManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|_| "Підписаний runtime manifest має неправильний формат".to_string())?;
-    if manifest.schema_version != 1 || manifest.generated_at.trim().is_empty() {
+    if manifest.schema_version != 1 {
         return Err("Підписаний runtime manifest має непідтримувану версію".into());
     }
+    let incoming_state = RuntimeManifestState {
+        release_version: manifest.release_version.clone(),
+        generated_at: manifest.generated_at.clone(),
+    };
+    let accepted_state = read_runtime_manifest_state(app)?;
+    ensure_runtime_manifest_is_current(&incoming_state, accepted_state.as_ref())?;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let platform = "darwin-aarch64";
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -858,6 +964,7 @@ async fn runtime_platform_manifest(
         .cloned()
         .ok_or_else(|| format!("Runtime manifest не містить платформу {platform}"))?;
     validate_runtime_platform_manifest(&platform_manifest)?;
+    write_runtime_manifest_state(app, &incoming_state)?;
     cached.replace(platform_manifest.clone());
     Ok(platform_manifest)
 }
@@ -1225,7 +1332,7 @@ async fn install_ffmpeg(
 ) -> Result<(), String> {
     let _operation = maintenance.operation.lock().await;
     ensure_runtime_idle(manager.inner())?;
-    let manifest = runtime_platform_manifest(maintenance.inner()).await?;
+    let manifest = runtime_platform_manifest(&app, maintenance.inner()).await?;
     install_ffmpeg_inner(app, &manifest).await
 }
 
@@ -1276,7 +1383,7 @@ async fn install_deno(
 ) -> Result<(), String> {
     let _operation = maintenance.operation.lock().await;
     ensure_runtime_idle(manager.inner())?;
-    let manifest = runtime_platform_manifest(maintenance.inner()).await?;
+    let manifest = runtime_platform_manifest(&app, maintenance.inner()).await?;
     install_deno_inner(app, &manifest).await
 }
 
@@ -1329,7 +1436,7 @@ async fn install_ytdlp(
 ) -> Result<(), String> {
     let _operation = maintenance.operation.lock().await;
     ensure_runtime_idle(manager.inner())?;
-    let manifest = runtime_platform_manifest(maintenance.inner()).await?;
+    let manifest = runtime_platform_manifest(&app, maintenance.inner()).await?;
     install_ytdlp_inner(app, &manifest).await
 }
 
@@ -1341,7 +1448,7 @@ async fn update_ytdlp(
 ) -> Result<(), String> {
     let _operation = maintenance.operation.lock().await;
     ensure_runtime_idle(manager.inner())?;
-    let result = match runtime_platform_manifest(maintenance.inner()).await {
+    let result = match runtime_platform_manifest(&app, maintenance.inner()).await {
         Ok(manifest) => install_ytdlp_inner(app, &manifest).await,
         Err(error) => Err(error),
     };
@@ -4571,6 +4678,46 @@ mod tests {
         let signature = b"dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdHFlblU0elMzUEZzRFNkS21tNGJOMWp4bDRxQ0VwUTFRYjVwZmQ2ZjJUQlVyUnVPQUFkWHVQMFNBMmJzOUN5ZUNNaUl4SmErdXllUXNPTkFXOUdWQThBUVFWSk9HZ2djPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2MjU3NTQ1CWZpbGU6eXQtZGxwLWJkLXJ1bnRpbWUtc2lnbmF0dXJlLWZpeHR1cmUKbFFOTGRNKy9FUWJzUGJ5WlhOR29BbE13OW5mOEd6Tm5DZUE4My83WWtmdlM0a1RJbGJ6SmpicjZWMU42WTR6cDdQelM3enRMVms3cytOZDNKVXRvREE9PQo=";
         assert!(verify_runtime_manifest_signature(b"runtime-manifest-test-v1", signature).is_ok());
         assert!(verify_runtime_manifest_signature(b"runtime-manifest-test-v2", signature).is_err());
+    }
+
+    #[test]
+    fn runtime_manifest_rollback_protection_is_monotonic_and_allows_clean_install() {
+        let accepted = RuntimeManifestState {
+            release_version: "0.6.1.0".into(),
+            generated_at: "2026-08-09T08:00:00.000Z".into(),
+        };
+        assert!(ensure_runtime_manifest_is_current(&accepted, None).is_ok());
+        assert!(ensure_runtime_manifest_is_current(&accepted, Some(&accepted)).is_ok());
+
+        let newer_generation = RuntimeManifestState {
+            generated_at: "2026-08-09T09:00:00.000Z".into(),
+            ..accepted.clone()
+        };
+        assert!(ensure_runtime_manifest_is_current(&newer_generation, Some(&accepted)).is_ok());
+
+        let newer_release = RuntimeManifestState {
+            release_version: "0.6.2.0".into(),
+            generated_at: "2026-08-08T00:00:00.000Z".into(),
+        };
+        assert!(ensure_runtime_manifest_is_current(&newer_release, Some(&accepted)).is_ok());
+
+        let older_generation = RuntimeManifestState {
+            generated_at: "2026-08-09T07:59:59.999Z".into(),
+            ..accepted.clone()
+        };
+        assert!(ensure_runtime_manifest_is_current(&older_generation, Some(&accepted)).is_err());
+
+        let older_release = RuntimeManifestState {
+            release_version: "0.6.0.0".into(),
+            generated_at: "2026-08-10T00:00:00.000Z".into(),
+        };
+        assert!(ensure_runtime_manifest_is_current(&older_release, Some(&accepted)).is_err());
+
+        let malformed = RuntimeManifestState {
+            release_version: "0.6.2".into(),
+            generated_at: "tomorrow".into(),
+        };
+        assert!(ensure_runtime_manifest_is_current(&malformed, Some(&accepted)).is_err());
     }
 
     #[test]

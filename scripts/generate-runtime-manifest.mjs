@@ -84,6 +84,9 @@ export function macFfmpegAssetUrl(page, filename) {
 
 export function validateRuntimeManifest(manifest) {
   if (manifest.schemaVersion !== 1) throw new Error("Unsupported runtime manifest schema");
+  if (!/^\d+\.\d+\.\d+\.\d+$/u.test(manifest.releaseVersion || "")) {
+    throw new Error("Runtime manifest releaseVersion is invalid");
+  }
   if (!Number.isFinite(Date.parse(manifest.generatedAt))) {
     throw new Error("Runtime manifest generatedAt is invalid");
   }
@@ -173,7 +176,7 @@ async function downloadVerifiedAsset(asset, destination) {
   }
 }
 
-export async function buildRuntimeManifest(now = new Date()) {
+export async function buildRuntimeManifest(releaseVersion, now = new Date()) {
   const [ytDlp, deno, windowsFfmpeg, macPage] = await Promise.all([
     githubLatest("yt-dlp", "yt-dlp"),
     githubLatest("denoland", "deno"),
@@ -204,6 +207,7 @@ export async function buildRuntimeManifest(now = new Date()) {
 
   return validateRuntimeManifest({
     schemaVersion: 1,
+    releaseVersion,
     generatedAt: now.toISOString(),
     platforms: {
       "darwin-aarch64": {
@@ -248,16 +252,18 @@ export async function buildRuntimeManifest(now = new Date()) {
 
 async function main() {
   const output = path.resolve(argumentValue("--output") || path.join(projectDir, "runtime-components.json"));
-  const manifest = await buildRuntimeManifest();
-  const releaseVersion = argumentValue("--release-version");
+  const requestedReleaseVersion = argumentValue("--release-version");
   const assetsDirValue = argumentValue("--assets-dir");
-  if ((releaseVersion == null) !== (assetsDirValue == null)) {
+  if ((requestedReleaseVersion == null) !== (assetsDirValue == null)) {
     throw new Error("--release-version and --assets-dir must be provided together");
   }
-  if (releaseVersion && assetsDirValue) {
-    const releaseConfig = JSON.parse(
-      await readFile(path.join(projectDir, "release.config.json"), "utf8"),
-    );
+  const [packageMetadata, releaseConfig] = await Promise.all([
+    readFile(path.join(projectDir, "package.json"), "utf8").then(JSON.parse),
+    readFile(path.join(projectDir, "release.config.json"), "utf8").then(JSON.parse),
+  ]);
+  const releaseVersion = requestedReleaseVersion || packageMetadata.releaseVersion;
+  const manifest = await buildRuntimeManifest(releaseVersion);
+  if (requestedReleaseVersion && assetsDirValue) {
     const repository = process.env.GITHUB_REPOSITORY || releaseConfig.githubRepository;
     const assetsDir = path.resolve(assetsDirValue);
     const names = runtimeAssetNames(releaseVersion);

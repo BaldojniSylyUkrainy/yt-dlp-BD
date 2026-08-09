@@ -176,6 +176,16 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run build:mac
 
+      - name: Remove temporary signing material
+        if: always()
+        run: |
+          security list-keychains -d user -s "$HOME/Library/Keychains/login.keychain-db" || true
+          if [[ -n "${SIGNING_KEYCHAIN_PATH:-}" ]]; then
+            security delete-keychain "$SIGNING_KEYCHAIN_PATH" || true
+          fi
+          [[ -z "${SIGNING_CERTIFICATE_PATH:-}" ]] || rm -f "$SIGNING_CERTIFICATE_PATH"
+          [[ -z "${APPLE_API_KEY_PATH:-}" ]] || rm -f "$APPLE_API_KEY_PATH"
+
       - name: Verify expected macOS release files
         run: |
           RELEASE_VERSION="$(node -p "require('./package.json').releaseVersion")"
@@ -198,16 +208,6 @@ jobs:
             release/*.app.tar.gz.sig
           if-no-files-found: error
           retention-days: 1
-
-      - name: Remove temporary signing material
-        if: always()
-        run: |
-          security list-keychains -d user -s "$HOME/Library/Keychains/login.keychain-db" || true
-          if [[ -n "${SIGNING_KEYCHAIN_PATH:-}" ]]; then
-            security delete-keychain "$SIGNING_KEYCHAIN_PATH" || true
-          fi
-          [[ -z "${SIGNING_CERTIFICATE_PATH:-}" ]] || rm -f "$SIGNING_CERTIFICATE_PATH"
-          [[ -z "${APPLE_API_KEY_PATH:-}" ]] || rm -f "$APPLE_API_KEY_PATH"
 
   runtime-manifest:
     name: Signed runtime manifest

@@ -59,5 +59,9 @@ GitHub не показує збережене значення Secret назад
 містить cookies, паролів або інших приватних даних — лише версії, дозволені
 HTTPS URL і SHA-256 runtime-компонентів.
 
+Тимчасові `.p8`, `.p12` і signing keychain видаляються одразу після macOS
+build/notarization — до перевірки артефактів і до запуску зовнішнього upload
+action.
+
 Операційний запуск signed release:
 [GITHUB_RELEASE_HANDOFF_UK.md](GITHUB_RELEASE_HANDOFF_UK.md).

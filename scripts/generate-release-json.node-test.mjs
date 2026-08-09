@@ -57,6 +57,15 @@ test("scopes protected signing secrets to only the steps that need them", async 
   assert.match(workflow, /Sign and verify runtime manifest outputs[\s\S]*?TAURI_SIGNING_PRIVATE_KEY:/u);
 });
 
+test("removes Apple signing files before any external upload action", async () => {
+  const workflow = await readFile(".github/workflows/release.yml", "utf8");
+  const cleanup = workflow.indexOf("- name: Remove temporary signing material");
+  const macUpload = workflow.indexOf("- uses: actions/upload-artifact@", cleanup);
+  assert.ok(cleanup > workflow.indexOf("- name: Build, notarize, staple, and verify macOS artifacts"));
+  assert.ok(macUpload > cleanup, "macOS upload must run only after signing-material cleanup");
+  assert.ok(workflow.indexOf("- name: Verify expected macOS release files", cleanup) > cleanup);
+});
+
 test("uses Node 24 artifact actions in both platform release jobs", async () => {
   const workflow = await readFile(".github/workflows/release.yml", "utf8");
   assert.equal(workflow.match(/actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a/g)?.length, 3);
