@@ -5,7 +5,7 @@ on:
     inputs:
       tag:
         description: "Four-part release tag from package.json, for example vX.Y.Z.H"
-        default: "v0.6.0.0"
+        default: "v0.6.1.0"
         required: true
         type: string
 
@@ -23,12 +23,10 @@ jobs:
     environment: release
     env:
       REQUESTED_TAG: ${{ inputs.tag }}
-      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
           cache: npm
@@ -39,15 +37,12 @@ jobs:
           rustup update stable
           rustup default stable
 
-      - name: Validate tag and required secret
+      - name: Validate tag and release notes
         shell: pwsh
         run: |
           $releaseVersion = node -p "require('./package.json').releaseVersion"
           if ($env:REQUESTED_TAG -ne "v$releaseVersion") {
             throw "Requested tag must be v$releaseVersion"
-          }
-          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
-            throw "TAURI_SIGNING_PRIVATE_KEY is missing in the release environment"
           }
           node scripts/generate-release-json.mjs --validate-notes
 
@@ -59,7 +54,15 @@ jobs:
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
       - name: Build signed NSIS installer
-        run: npm run tauri build -- --bundles nsis
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY) -or [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) {
+            throw "Tauri updater signing key or password is missing in the release environment"
+          }
+          npm run tauri build -- --bundles nsis
 
       - name: Normalize and verify Windows artifacts
         shell: pwsh
@@ -79,7 +82,7 @@ jobs:
           Copy-Item -LiteralPath $installers[0].FullName -Destination "release-assets/$target"
           Copy-Item -LiteralPath $signature -Destination "release-assets/$target.sig"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-windows
           path: release-assets/
@@ -92,18 +95,10 @@ jobs:
     environment: release
     env:
       REQUESTED_TAG: ${{ inputs.tag }}
-      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-      APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
-      APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
-      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
           cache: npm
@@ -114,19 +109,13 @@ jobs:
           rustup default stable
           rustup target add aarch64-apple-darwin
 
-      - name: Validate tag and required release credentials
+      - name: Validate tag and release notes
         run: |
           RELEASE_VERSION="$(node -p "require('./package.json').releaseVersion")"
           [[ "$REQUESTED_TAG" == "v$RELEASE_VERSION" ]] || {
             echo "Requested tag must be v$RELEASE_VERSION"
             exit 1
           }
-          for NAME in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_CONTENT APPLE_SIGNING_IDENTITY TAURI_SIGNING_PRIVATE_KEY; do
-            [[ -n "${!NAME:-}" ]] || {
-              echo "$NAME is missing in the release environment"
-              exit 1
-            }
-          done
           node scripts/generate-release-json.mjs --validate-notes
 
       - run: npm ci
@@ -137,6 +126,12 @@ jobs:
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
       - name: Import Developer ID certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
         run: |
           KEYCHAIN_PATH="$RUNNER_TEMP/yt-dlp-bd-signing.keychain-db"
           CERTIFICATE_PATH="$RUNNER_TEMP/yt-dlp-bd-certificate.p12"
@@ -173,6 +168,12 @@ jobs:
           security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -F "$APPLE_SIGNING_IDENTITY"
 
       - name: Build, notarize, staple, and verify macOS artifacts
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run build:mac
 
       - name: Verify expected macOS release files
@@ -188,7 +189,7 @@ jobs:
             }
           done
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-macos
           path: |
@@ -208,20 +209,68 @@ jobs:
           [[ -z "${SIGNING_CERTIFICATE_PATH:-}" ]] || rm -f "$SIGNING_CERTIFICATE_PATH"
           [[ -z "${APPLE_API_KEY_PATH:-}" ]] || rm -f "$APPLE_API_KEY_PATH"
 
+  runtime-manifest:
+    name: Signed runtime manifest
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Generate pinned runtime components
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p release-assets
+          RELEASE_VERSION="$(node -p "require('./package.json').releaseVersion")"
+          node scripts/generate-runtime-manifest.mjs \
+            --output release-assets/runtime-components.json \
+            --assets-dir release-assets \
+            --release-version "$RELEASE_VERSION"
+
+      - name: Sign and verify runtime manifest outputs
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          [[ -n "$TAURI_SIGNING_PRIVATE_KEY" && -n "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" ]] || {
+            echo "Tauri updater signing key or password is missing in the release environment"
+            exit 1
+          }
+          npm run tauri signer sign release-assets/runtime-components.json
+          test -s release-assets/runtime-components.json
+          test -s release-assets/runtime-components.json.sig
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-runtime
+          path: |
+            release-assets/runtime-components.json
+            release-assets/runtime-components.json.sig
+            release-assets/BaldojnyiDownloader-*-Runtime-Windows-x64-FFmpeg.zip
+          if-no-files-found: error
+          retention-days: 1
+
   publish-draft:
     name: Assemble draft release
-    needs: [windows, macos]
+    needs: [windows, macos, runtime-manifest]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
 
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           pattern: release-*
           path: release-assets
@@ -238,6 +287,9 @@ jobs:
           }
           node scripts/generate-release-json.mjs --assets-dir release-assets --require-all
           test -s release-assets/latest.json
+          test -s release-assets/runtime-components.json
+          test -s release-assets/runtime-components.json.sig
+          test -s "release-assets/BaldojnyiDownloader-${RELEASE_VERSION}-Runtime-Windows-x64-FFmpeg.zip"
 
       - name: Create or update draft GitHub Release
         env:

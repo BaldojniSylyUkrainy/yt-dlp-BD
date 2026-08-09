@@ -7,6 +7,8 @@ Actions secrets уже налаштовані. Ручний workflow
 - тестує і збирає Windows x64 NSIS installer;
 - підписує Windows updater-артефакт приватним Tauri key;
 - тестує, підписує Developer ID, нотаризує та перевіряє macOS Apple Silicon build;
+- формує й тим самим Tauri key підписує manifest точних версій, URL і SHA-256 для yt-dlp, Deno та FFmpeg;
+- перевіряє upstream SHA-256 і додає Windows FFmpeg як незмінний versioned asset конкретного Release;
 - генерує один `latest.json` для macOS і Windows;
 - створює **draft** GitHub Release, але не публікує його автоматично.
 
@@ -34,7 +36,7 @@ PATCH (`0.3.2` → `0.3.3`), а реліз із будь-якою новою ф�
 3. Відкрийте **Actions → Manual signed release → Run workflow**.
 4. Branch: `main`.
 5. `tag`: чотирикомпонентний public tag із `package.json`, наприклад
-   `v0.6.0.0`.
+   `v0.6.1.0`.
 6. Натисніть **Run workflow** і вручну approve jobs для environment `release`.
 
 Workflow зупиниться, якщо tag не дорівнює `v${releaseVersion}`, бракує ключа,
@@ -49,12 +51,31 @@ Workflow зупиниться, якщо tag не дорівнює `v${releaseVer
    - `BaldojnyiDownloader-…-Windows-x64-Setup.exe` і його `.sig`;
    - `BaldojnyiDownloader-…-Mac-Apple-Silicon.dmg`;
    - `BaldojnyiDownloader-…-Mac-Apple-Silicon-AutoUpdate.app.tar.gz` і його `.sig`;
+   - `BaldojnyiDownloader-…-Runtime-Windows-x64-FFmpeg.zip`;
+   - `runtime-components.json` і його `.sig`;
    - `latest.json`.
 4. За можливості встановіть `.exe` і `.dmg` на чистих тестових машинах.
 5. Натисніть **Publish release**.
 
 До публікації draft не стане новим `/releases/latest`, тому користувачі не
 отримають напівготовий updater manifest.
+
+`runtime-components.json` у `/releases/latest` є спільним для всіх підтримуваних
+версій застосунку. Його `schemaVersion: 1` треба зберігати зворотно сумісним.
+Якщо колись знадобиться несумісна schema, спочатку слід додати versioned endpoint
+та міграцію в застосунок, а вже потім публікувати новий формат. Чисте встановлення
+не зможе завантажити runtime-компоненти з draft: повний bootstrap перевіряється
+після Publish release, тоді як installer/UI слід перевірити ще на draft.
+
+## Увімкнути обов’язкові immutable Actions після merge
+
+Workflow-файли в `0.6.1.0` уже використовують тільки повні 40-символьні commit
+SHA. Одразу після merge цього commit власник repository має відкрити
+**Settings → Actions → General → Actions permissions**, увімкнути
+**Require actions to be pinned to a full-length commit SHA** і зберегти зміни.
+Не вмикайте цю політику до merge: старий `main` із `@v5`/`@v7` перестане
+запускати release workflow. Після ввімкнення GitHub відхилятиме будь-який новий
+workflow із рухомим action tag.
 
 ## Windows SmartScreen
 

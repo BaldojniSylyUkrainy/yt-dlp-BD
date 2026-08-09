@@ -1,3 +1,5 @@
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use minisign_verify::{PublicKey as MinisignPublicKey, Signature as MinisignSignature};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -22,10 +24,10 @@ use uuid::Uuid;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-const YTDLP_RELEASE_BASE: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download";
-#[cfg(target_os = "windows")]
-const FFMPEG_RELEASE_BASE: &str =
-    "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest";
+const RUNTIME_MANIFEST_URL: &str = "https://github.com/BaldojniSylyUkrainy/yt-dlp-BD/releases/latest/download/runtime-components.json";
+const RUNTIME_MANIFEST_SIGNATURE_URL: &str = "https://github.com/BaldojniSylyUkrainy/yt-dlp-BD/releases/latest/download/runtime-components.json.sig";
+const MAX_RUNTIME_METADATA_BYTES: usize = 1024 * 1024;
+const TAURI_CONFIG_SOURCE: &str = include_str!("../tauri.conf.json");
 const MIN_FREE_SPACE_RESERVE: u64 = 500 * 1024 * 1024;
 const DISK_GUARD_TRIGGER: u64 = MIN_FREE_SPACE_RESERVE + 128 * 1024 * 1024;
 const MAX_HISTORY_THUMBNAIL_BYTES: u64 = 8 * 1024 * 1024;
@@ -74,6 +76,39 @@ struct RuntimeInstallProgress {
     component: String,
     downloaded: u64,
     total: Option<u64>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeAssetManifest {
+    version: String,
+    url: String,
+    sha256: String,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeFfmpegManifest {
+    version: String,
+    archive: Option<RuntimeAssetManifest>,
+    ffmpeg: Option<RuntimeAssetManifest>,
+    ffprobe: Option<RuntimeAssetManifest>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimePlatformManifest {
+    yt_dlp: RuntimeAssetManifest,
+    deno: RuntimeAssetManifest,
+    ffmpeg: RuntimeFfmpegManifest,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeManifest {
+    schema_version: u32,
+    generated_at: String,
+    platforms: HashMap<String, RuntimePlatformManifest>,
 }
 
 #[derive(Serialize)]
@@ -310,6 +345,7 @@ struct HistoryThumbnailCache {
 #[derive(Default)]
 struct RuntimeMaintenance {
     operation: tokio::sync::Mutex<()>,
+    manifest: tokio::sync::Mutex<Option<RuntimePlatformManifest>>,
 }
 
 #[derive(Default)]
@@ -571,7 +607,7 @@ async fn fetch_bytes_with_final_url(
     client: &reqwest::Client,
     url: &str,
 ) -> Result<(Vec<u8>, Url), String> {
-    let response = client
+    let mut response = client
         .get(url)
         .header("User-Agent", "yt-dlp-desktop")
         .send()
@@ -580,17 +616,31 @@ async fn fetch_bytes_with_final_url(
         .error_for_status()
         .map_err(|error| format!("Сервер повернув помилку: {error}"))?;
     let final_url = response.url().clone();
-    let bytes = response
-        .bytes()
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RUNTIME_METADATA_BYTES as u64)
+    {
+        return Err("Службовий runtime-файл перевищує дозволений розмір".into());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|error| format!("Не вдалося прочитати відповідь: {error}"))?;
-    Ok((bytes.to_vec(), final_url))
+        .map_err(|error| format!("Не вдалося прочитати відповідь: {error}"))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > MAX_RUNTIME_METADATA_BYTES {
+            return Err("Службовий runtime-файл перевищує дозволений розмір".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok((bytes, final_url))
 }
 
 async fn fetch_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
     Ok(fetch_bytes_with_final_url(client, url).await?.0)
 }
 
+#[cfg(test)]
 fn release_version_from_download_url(url: &Url) -> Option<String> {
     if url.scheme() != "https" || url.host_str() != Some("github.com") {
         return None;
@@ -613,6 +663,203 @@ fn download_client() -> Result<reqwest::Client, String> {
         .connect_timeout(Duration::from_secs(5))
         .build()
         .map_err(|error| format!("Не вдалося підготувати завантаження: {error}"))
+}
+
+fn verify_runtime_manifest_signature(
+    manifest: &[u8],
+    encoded_signature: &[u8],
+) -> Result<(), String> {
+    let config: serde_json::Value = serde_json::from_str(TAURI_CONFIG_SOURCE)
+        .map_err(|_| "Вбудована конфігурація updater пошкоджена".to_string())?;
+    let encoded_public_key = config
+        .pointer("/plugins/updater/pubkey")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "У конфігурації updater немає публічного ключа".to_string())?;
+    let public_key_text = BASE64_STANDARD
+        .decode(encoded_public_key.trim())
+        .map_err(|_| "Публічний ключ updater має неправильний формат".to_string())?;
+    let public_key_text = std::str::from_utf8(&public_key_text)
+        .map_err(|_| "Публічний ключ updater має неправильне кодування".to_string())?;
+    let public_key = MinisignPublicKey::decode(public_key_text)
+        .map_err(|_| "Не вдалося прочитати публічний ключ updater".to_string())?;
+
+    let encoded_signature = std::str::from_utf8(encoded_signature)
+        .map_err(|_| "Підпис manifest має неправильне кодування".to_string())?;
+    let signature_text = BASE64_STANDARD
+        .decode(encoded_signature.trim())
+        .map_err(|_| "Підпис manifest має неправильний формат".to_string())?;
+    let signature_text = std::str::from_utf8(&signature_text)
+        .map_err(|_| "Підпис manifest має неправильне кодування".to_string())?;
+    let signature = MinisignSignature::decode(signature_text)
+        .map_err(|_| "Не вдалося прочитати підпис runtime manifest".to_string())?;
+    public_key
+        .verify(manifest, &signature, true)
+        .map_err(|_| "Підпис runtime manifest не пройшов перевірку".to_string())
+}
+
+fn validate_runtime_asset(asset: &RuntimeAssetManifest, label: &str) -> Result<(), String> {
+    if asset.version.trim().is_empty() {
+        return Err(format!("Runtime manifest не містить версію {label}"));
+    }
+    if asset.sha256.len() != 64 || !asset.sha256.chars().all(|value| value.is_ascii_hexdigit()) {
+        return Err(format!(
+            "Runtime manifest містить неправильний SHA-256 для {label}"
+        ));
+    }
+    let url = Url::parse(&asset.url)
+        .map_err(|_| format!("Runtime manifest містить неправильний URL для {label}"))?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+    {
+        return Err(format!(
+            "Runtime manifest містить небезпечний URL для {label}"
+        ));
+    }
+    let allowed = match url.host_str() {
+        Some("github.com") => {
+            url.path().starts_with("/yt-dlp/yt-dlp/releases/download/")
+                || url
+                    .path()
+                    .starts_with("/yt-dlp/FFmpeg-Builds/releases/download/")
+                || url.path().starts_with("/denoland/deno/releases/download/")
+                || url
+                    .path()
+                    .starts_with("/BaldojniSylyUkrainy/yt-dlp-BD/releases/download/")
+        }
+        Some("ffmpeg.martin-riedl.de") => url.path().starts_with("/download/macos/arm64/"),
+        _ => false,
+    };
+    if !allowed {
+        return Err(format!(
+            "Runtime manifest вказує неочікуване джерело для {label}"
+        ));
+    }
+    Ok(())
+}
+
+fn require_runtime_asset_source(
+    asset: &RuntimeAssetManifest,
+    host: &str,
+    path_prefix: &str,
+    label: &str,
+) -> Result<(), String> {
+    let url = Url::parse(&asset.url)
+        .map_err(|_| format!("Runtime manifest містить неправильний URL для {label}"))?;
+    if url.host_str() != Some(host) || !url.path().starts_with(path_prefix) {
+        return Err(format!(
+            "Runtime manifest вказує неправильне джерело для {label}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_runtime_platform_manifest(manifest: &RuntimePlatformManifest) -> Result<(), String> {
+    validate_runtime_asset(&manifest.yt_dlp, "yt-dlp")?;
+    require_runtime_asset_source(
+        &manifest.yt_dlp,
+        "github.com",
+        "/yt-dlp/yt-dlp/releases/download/",
+        "yt-dlp",
+    )?;
+    validate_runtime_asset(&manifest.deno, "Deno")?;
+    require_runtime_asset_source(
+        &manifest.deno,
+        "github.com",
+        "/denoland/deno/releases/download/",
+        "Deno",
+    )?;
+    if manifest.ffmpeg.version.trim().is_empty() {
+        return Err("Runtime manifest не містить версію FFmpeg".into());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if manifest.ffmpeg.archive.is_some() {
+            return Err("Runtime manifest містить неправильний macOS FFmpeg-пакет".into());
+        }
+        let ffmpeg = manifest
+            .ffmpeg
+            .ffmpeg
+            .as_ref()
+            .ok_or_else(|| "Runtime manifest не містить macOS FFmpeg".to_string())?;
+        let ffprobe = manifest
+            .ffmpeg
+            .ffprobe
+            .as_ref()
+            .ok_or_else(|| "Runtime manifest не містить macOS FFprobe".to_string())?;
+        validate_runtime_asset(ffmpeg, "macOS FFmpeg")?;
+        require_runtime_asset_source(
+            ffmpeg,
+            "ffmpeg.martin-riedl.de",
+            "/download/macos/arm64/",
+            "macOS FFmpeg",
+        )?;
+        validate_runtime_asset(ffprobe, "macOS FFprobe")?;
+        require_runtime_asset_source(
+            ffprobe,
+            "ffmpeg.martin-riedl.de",
+            "/download/macos/arm64/",
+            "macOS FFprobe",
+        )?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if manifest.ffmpeg.ffmpeg.is_some() || manifest.ffmpeg.ffprobe.is_some() {
+            return Err("Runtime manifest містить неправильний Windows FFmpeg-пакет".into());
+        }
+        let archive = manifest
+            .ffmpeg
+            .archive
+            .as_ref()
+            .ok_or_else(|| "Runtime manifest не містить Windows FFmpeg".to_string())?;
+        validate_runtime_asset(archive, "Windows FFmpeg")?;
+        require_runtime_asset_source(
+            archive,
+            "github.com",
+            "/BaldojniSylyUkrainy/yt-dlp-BD/releases/download/",
+            "Windows FFmpeg",
+        )?;
+    }
+    Ok(())
+}
+
+async fn runtime_platform_manifest(
+    maintenance: &RuntimeMaintenance,
+) -> Result<RuntimePlatformManifest, String> {
+    let mut cached = maintenance.manifest.lock().await;
+    if let Some(manifest) = cached.as_ref() {
+        return Ok(manifest.clone());
+    }
+    let client = download_client()?;
+    let (manifest_bytes, signature_bytes) = tokio::try_join!(
+        fetch_bytes(&client, RUNTIME_MANIFEST_URL),
+        fetch_bytes(&client, RUNTIME_MANIFEST_SIGNATURE_URL),
+    )?;
+    verify_runtime_manifest_signature(&manifest_bytes, &signature_bytes)?;
+    let manifest: RuntimeManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|_| "Підписаний runtime manifest має неправильний формат".to_string())?;
+    if manifest.schema_version != 1 || manifest.generated_at.trim().is_empty() {
+        return Err("Підписаний runtime manifest має непідтримувану версію".into());
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let platform = "darwin-aarch64";
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    let platform = "windows-x86_64";
+    #[cfg(not(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "windows", target_arch = "x86_64")
+    )))]
+    return Err("Підписані runtime-компоненти недоступні для цієї платформи".into());
+
+    let platform_manifest = manifest
+        .platforms
+        .get(platform)
+        .cloned()
+        .ok_or_else(|| format!("Runtime manifest не містить платформу {platform}"))?;
+    validate_runtime_platform_manifest(&platform_manifest)?;
+    cached.replace(platform_manifest.clone());
+    Ok(platform_manifest)
 }
 
 fn is_public_thumbnail_ip(ip: IpAddr) -> bool {
@@ -752,11 +999,6 @@ fn verify_sha256_file_expected(path: &Path, expected: &str, label: &str) -> Resu
     Ok(())
 }
 
-fn verify_sha256_file(path: &Path, checksum_file: &[u8], label: &str) -> Result<(), String> {
-    let expected = checksum_value(checksum_file, label)?;
-    verify_sha256_file_expected(path, &expected, label)
-}
-
 fn replace_runtime_file(temporary: &Path, destination: &Path, label: &str) -> Result<(), String> {
     if !destination.exists() {
         return fs::rename(temporary, destination)
@@ -782,7 +1024,7 @@ fn replace_runtime_file(temporary: &Path, destination: &Path, label: &str) -> Re
     }
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(test)]
 fn checksum_for_asset(checksum_file: &[u8], asset_name: &str) -> Result<String, String> {
     let checksums = String::from_utf8(checksum_file.to_vec())
         .map_err(|_| "Файл контрольних сум FFmpeg має неправильний формат".to_string())?;
@@ -799,28 +1041,7 @@ fn checksum_for_asset(checksum_file: &[u8], asset_name: &str) -> Result<String, 
         .ok_or_else(|| format!("Не знайдено контрольну суму для {asset_name}"))
 }
 
-#[cfg(target_os = "macos")]
-fn macos_ffmpeg_release_asset(page: &str, filename: &str) -> Result<String, String> {
-    let release_section = page
-        .split_once("<h2>Download Release Build</h2>")
-        .map(|(_, section)| section)
-        .ok_or_else(|| "Сервер ffmpeg не повідомив про стабільний реліз".to_string())?;
-    let architecture_prefix = "/download/macos/arm64/";
-
-    for candidate in release_section.split("href=\"").skip(1) {
-        let Some(path) = candidate.split('"').next() else {
-            continue;
-        };
-        if path.starts_with(architecture_prefix) && path.ends_with(filename) {
-            return Ok(format!("https://ffmpeg.martin-riedl.de{path}"));
-        }
-    }
-
-    Err(format!(
-        "Сервер ffmpeg не надав {filename} для macOS Apple Silicon"
-    ))
-}
-
+#[cfg(test)]
 fn checksum_value(checksum_file: &[u8], label: &str) -> Result<String, String> {
     let checksum = String::from_utf8(checksum_file.to_vec())
         .map_err(|_| format!("Контрольна сума {label} має неправильний формат"))?;
@@ -885,25 +1106,23 @@ fn extract_binary_from_file(
     replace_runtime_file(&temporary, destination, binary_name)
 }
 
-async fn install_ffmpeg_inner(app: AppHandle) -> Result<(), String> {
+async fn install_ffmpeg_inner(
+    app: AppHandle,
+    manifest: &RuntimePlatformManifest,
+) -> Result<(), String> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        const RELEASES_PAGE: &str = "https://ffmpeg.martin-riedl.de/";
         let client = download_client()?;
-        let page = fetch_bytes(&client, RELEASES_PAGE).await?;
-        let page = String::from_utf8(page)
-            .map_err(|_| "Сторінка релізів ffmpeg має неправильний формат".to_string())?;
-        let ffmpeg_url = macos_ffmpeg_release_asset(&page, "ffmpeg.zip")?;
-        let ffprobe_url = macos_ffmpeg_release_asset(&page, "ffprobe.zip")?;
-        eprintln!("Перевіряємо стабільний ffmpeg: {ffmpeg_url}");
-        let ffmpeg_checksum_url = format!("{ffmpeg_url}.sha256");
-        let ffprobe_checksum_url = format!("{ffprobe_url}.sha256");
-        let (ffmpeg_checksum, ffprobe_checksum) = tokio::try_join!(
-            fetch_bytes(&client, &ffmpeg_checksum_url),
-            fetch_bytes(&client, &ffprobe_checksum_url)
-        )?;
-        let ffmpeg_expected = checksum_value(&ffmpeg_checksum, "ffmpeg")?;
-        let ffprobe_expected = checksum_value(&ffprobe_checksum, "ffprobe")?;
+        let ffmpeg = manifest
+            .ffmpeg
+            .ffmpeg
+            .as_ref()
+            .ok_or_else(|| "Runtime manifest не містить macOS FFmpeg".to_string())?;
+        let ffprobe = manifest
+            .ffmpeg
+            .ffprobe
+            .as_ref()
+            .ok_or_else(|| "Runtime manifest не містить macOS FFprobe".to_string())?;
         let directory = runtime_dir(&app)?;
         let ffmpeg_path = directory.join("ffmpeg");
         let ffprobe_path = directory.join("ffprobe");
@@ -912,10 +1131,10 @@ async fn install_ffmpeg_inner(app: AppHandle) -> Result<(), String> {
         let current = command_version(&ffmpeg_path, &["-version"]).is_some()
             && command_version(&ffprobe_path, &["-version"]).is_some()
             && fs::read_to_string(&ffmpeg_stamp)
-                .map(|value| value.trim() == ffmpeg_expected)
+                .map(|value| value.trim() == ffmpeg.sha256.as_str())
                 .unwrap_or(false)
             && fs::read_to_string(&ffprobe_stamp)
-                .map(|value| value.trim() == ffprobe_expected)
+                .map(|value| value.trim() == ffprobe.sha256.as_str())
                 .unwrap_or(false);
         if current {
             eprintln!("Керований ffmpeg вже актуальний");
@@ -926,8 +1145,8 @@ async fn install_ffmpeg_inner(app: AppHandle) -> Result<(), String> {
         let ffmpeg_archive = directory.join(".ffmpeg.zip.download");
         let ffprobe_archive = directory.join(".ffprobe.zip.download");
         let download_result = tokio::try_join!(
-            fetch_to_file(&app, &client, &ffmpeg_url, &ffmpeg_archive, "ffmpeg"),
-            fetch_to_file(&app, &client, &ffprobe_url, &ffprobe_archive, "ffmpeg")
+            fetch_to_file(&app, &client, &ffmpeg.url, &ffmpeg_archive, "ffmpeg"),
+            fetch_to_file(&app, &client, &ffprobe.url, &ffprobe_archive, "ffmpeg")
         );
         if let Err(error) = download_result {
             let _ = fs::remove_file(&ffmpeg_archive);
@@ -935,35 +1154,29 @@ async fn install_ffmpeg_inner(app: AppHandle) -> Result<(), String> {
             return Err(error);
         }
         let install_result = (|| {
-            verify_sha256_file(&ffmpeg_archive, &ffmpeg_checksum, "ffmpeg")?;
-            verify_sha256_file(&ffprobe_archive, &ffprobe_checksum, "ffprobe")?;
+            verify_sha256_file_expected(&ffmpeg_archive, &ffmpeg.sha256, "ffmpeg")?;
+            verify_sha256_file_expected(&ffprobe_archive, &ffprobe.sha256, "ffprobe")?;
             extract_binary_from_file(&ffmpeg_archive, "ffmpeg", &ffmpeg_path)?;
             extract_binary_from_file(&ffprobe_archive, "ffprobe", &ffprobe_path)
         })();
         let _ = fs::remove_file(&ffmpeg_archive);
         let _ = fs::remove_file(&ffprobe_archive);
         install_result?;
-        fs::write(ffmpeg_stamp, ffmpeg_expected)
+        fs::write(ffmpeg_stamp, &ffmpeg.sha256)
             .map_err(|error| format!("Не вдалося зберегти версію ffmpeg: {error}"))?;
-        fs::write(ffprobe_stamp, ffprobe_expected)
+        fs::write(ffprobe_stamp, &ffprobe.sha256)
             .map_err(|error| format!("Не вдалося зберегти версію ffprobe: {error}"))?;
         Ok(())
     }
 
     #[cfg(target_os = "windows")]
     {
-        #[cfg(target_arch = "x86_64")]
-        let asset_name = "ffmpeg-master-latest-win64-gpl.zip";
-        #[cfg(target_arch = "aarch64")]
-        let asset_name = "ffmpeg-master-latest-winarm64-gpl.zip";
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        return Err("Portable FFmpeg підтримує лише Windows x64 та ARM64".into());
-
+        let archive_asset = manifest
+            .ffmpeg
+            .archive
+            .as_ref()
+            .ok_or_else(|| "Runtime manifest не містить Windows FFmpeg".to_string())?;
         let client = download_client()?;
-        let archive_url = format!("{FFMPEG_RELEASE_BASE}/{asset_name}");
-        let checksums_url = format!("{FFMPEG_RELEASE_BASE}/checksums.sha256");
-        let checksums = fetch_bytes(&client, &checksums_url).await?;
-        let expected = checksum_for_asset(&checksums, asset_name)?;
         let directory = runtime_dir(&app)?;
         let ffmpeg_path = directory.join("ffmpeg.exe");
         let ffprobe_path = directory.join("ffprobe.exe");
@@ -971,7 +1184,7 @@ async fn install_ffmpeg_inner(app: AppHandle) -> Result<(), String> {
         let current = command_version(&ffmpeg_path, &["-version"]).is_some()
             && command_version(&ffprobe_path, &["-version"]).is_some()
             && fs::read_to_string(&stamp)
-                .map(|value| value.trim() == expected)
+                .map(|value| value.trim() == archive_asset.sha256.as_str())
                 .unwrap_or(false);
         if current {
             return Ok(());
@@ -979,18 +1192,20 @@ async fn install_ffmpeg_inner(app: AppHandle) -> Result<(), String> {
 
         eprintln!("Завантажуємо керовані FFmpeg та FFprobe для Windows");
         let archive = directory.join(".ffmpeg.zip.download");
-        if let Err(error) = fetch_to_file(&app, &client, &archive_url, &archive, "ffmpeg").await {
+        if let Err(error) =
+            fetch_to_file(&app, &client, &archive_asset.url, &archive, "ffmpeg").await
+        {
             let _ = fs::remove_file(&archive);
             return Err(error);
         }
         let install_result = (|| {
-            verify_sha256_file_expected(&archive, &expected, "FFmpeg")?;
+            verify_sha256_file_expected(&archive, &archive_asset.sha256, "FFmpeg")?;
             extract_binary_from_file(&archive, "ffmpeg.exe", &ffmpeg_path)?;
             extract_binary_from_file(&archive, "ffprobe.exe", &ffprobe_path)
         })();
         let _ = fs::remove_file(&archive);
         install_result?;
-        fs::write(stamp, expected)
+        fs::write(stamp, &archive_asset.sha256)
             .map_err(|error| format!("Не вдалося зберегти версію FFmpeg: {error}"))?;
         Ok(())
     }
@@ -1010,30 +1225,17 @@ async fn install_ffmpeg(
 ) -> Result<(), String> {
     let _operation = maintenance.operation.lock().await;
     ensure_runtime_idle(manager.inner())?;
-    install_ffmpeg_inner(app).await
+    let manifest = runtime_platform_manifest(maintenance.inner()).await?;
+    install_ffmpeg_inner(app, &manifest).await
 }
 
-async fn install_deno_inner(app: AppHandle) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    let asset_name = if cfg!(target_arch = "aarch64") {
-        "deno-aarch64-apple-darwin.zip"
-    } else {
-        "deno-x86_64-apple-darwin.zip"
-    };
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    let asset_name = "deno-x86_64-pc-windows-msvc.zip";
-    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
-    let asset_name = "deno-aarch64-pc-windows-msvc.zip";
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    return Err("Ця платформа поки що не підтримується".into());
-
-    let base = "https://github.com/denoland/deno/releases/latest/download";
-    let archive_url = format!("{base}/{asset_name}");
-    let checksum_url = format!("{base}/{asset_name}.sha256sum");
+async fn install_deno_inner(
+    app: AppHandle,
+    manifest: &RuntimePlatformManifest,
+) -> Result<(), String> {
+    let asset = &manifest.deno;
     let client = download_client()
         .map_err(|error| format!("Не вдалося підготувати завантаження Deno: {error}"))?;
-    let checksum = fetch_bytes(&client, &checksum_url).await?;
-    let expected = checksum_value(&checksum, "Deno")?;
     let filename = if cfg!(target_os = "windows") {
         "deno.exe"
     } else {
@@ -1044,24 +1246,24 @@ async fn install_deno_inner(app: AppHandle) -> Result<(), String> {
     let stamp = directory.join(".deno.sha256");
     let current = command_version(&destination, &["--version"]).is_some()
         && fs::read_to_string(&stamp)
-            .map(|value| value.trim() == expected)
+            .map(|value| value.trim() == asset.sha256.as_str())
             .unwrap_or(false);
     if current {
         return Ok(());
     }
 
     let archive = directory.join(".deno.zip.download");
-    if let Err(error) = fetch_to_file(&app, &client, &archive_url, &archive, "deno").await {
+    if let Err(error) = fetch_to_file(&app, &client, &asset.url, &archive, "deno").await {
         let _ = fs::remove_file(&archive);
         return Err(error);
     }
     let install_result = (|| {
-        verify_sha256_file(&archive, &checksum, "Deno")?;
+        verify_sha256_file_expected(&archive, &asset.sha256, "Deno")?;
         extract_binary_from_file(&archive, filename, &destination)
     })();
     let _ = fs::remove_file(&archive);
     install_result?;
-    fs::write(stamp, expected)
+    fs::write(stamp, &asset.sha256)
         .map_err(|error| format!("Не вдалося зберегти версію Deno: {error}"))?;
     Ok(())
 }
@@ -1074,59 +1276,34 @@ async fn install_deno(
 ) -> Result<(), String> {
     let _operation = maintenance.operation.lock().await;
     ensure_runtime_idle(manager.inner())?;
-    install_deno_inner(app).await
+    let manifest = runtime_platform_manifest(maintenance.inner()).await?;
+    install_deno_inner(app, &manifest).await
 }
 
-async fn install_ytdlp_inner(app: AppHandle) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    let asset_name = "yt-dlp_macos";
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    let asset_name = "yt-dlp.exe";
-    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
-    let asset_name = "yt-dlp_arm64.exe";
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    return Err("Ця платформа поки що не підтримується".into());
-
+async fn install_ytdlp_inner(
+    app: AppHandle,
+    manifest: &RuntimePlatformManifest,
+) -> Result<(), String> {
+    let asset = &manifest.yt_dlp;
     let client = download_client()?;
-    let binary_url = format!("{YTDLP_RELEASE_BASE}/{asset_name}");
-    let checksums_url = format!("{YTDLP_RELEASE_BASE}/SHA2-256SUMS");
-
-    let (checksums, checksums_final_url) =
-        fetch_bytes_with_final_url(&client, &checksums_url).await?;
-    let release_version = release_version_from_download_url(&checksums_final_url);
-    let checksums = String::from_utf8(checksums)
-        .map_err(|_| "Файл контрольних сум має неправильний формат".to_string())?;
-    let expected = checksums
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            Some((parts.next()?, parts.next()?))
-        })
-        .find_map(|(hash, filename)| {
-            (filename.trim_start_matches('*') == asset_name).then(|| hash.to_lowercase())
-        })
-        .ok_or_else(|| "Не вдалося знайти контрольну суму yt-dlp".to_string())?;
-
     let destination = yt_dlp_path(&app)?;
     let version_stamp = runtime_dir(&app)?.join(".yt-dlp.version");
     let current = fs::read(&destination)
-        .map(|binary| format!("{:x}", Sha256::digest(binary)) == expected)
+        .map(|binary| format!("{:x}", Sha256::digest(binary)) == asset.sha256.as_str())
         .unwrap_or(false);
     if current {
-        if let Some(version) = release_version {
-            let _ = fs::write(version_stamp, version);
-        }
+        let _ = fs::write(version_stamp, &asset.version);
         return Ok(());
     }
 
     eprintln!("Завантажуємо стабільний yt-dlp");
     let temporary = destination.with_extension("download");
-    if let Err(error) = fetch_to_file(&app, &client, &binary_url, &temporary, "ytDlp").await {
+    if let Err(error) = fetch_to_file(&app, &client, &asset.url, &temporary, "ytDlp").await {
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
     let actual = sha256_file(&temporary)?;
-    if actual != expected {
+    if actual != asset.sha256.as_str() {
         let _ = fs::remove_file(&temporary);
         return Err("Контрольна сума yt-dlp не збігається. Файл не встановлено".into());
     }
@@ -1139,9 +1316,7 @@ async fn install_ytdlp_inner(app: AppHandle) -> Result<(), String> {
     }
 
     replace_runtime_file(&temporary, &destination, "yt-dlp")?;
-    if let Some(version) = release_version {
-        let _ = fs::write(version_stamp, version);
-    }
+    let _ = fs::write(version_stamp, &asset.version);
 
     Ok(())
 }
@@ -1154,7 +1329,8 @@ async fn install_ytdlp(
 ) -> Result<(), String> {
     let _operation = maintenance.operation.lock().await;
     ensure_runtime_idle(manager.inner())?;
-    install_ytdlp_inner(app).await
+    let manifest = runtime_platform_manifest(maintenance.inner()).await?;
+    install_ytdlp_inner(app, &manifest).await
 }
 
 #[tauri::command]
@@ -1165,7 +1341,10 @@ async fn update_ytdlp(
 ) -> Result<(), String> {
     let _operation = maintenance.operation.lock().await;
     ensure_runtime_idle(manager.inner())?;
-    let result = install_ytdlp_inner(app).await;
+    let result = match runtime_platform_manifest(maintenance.inner()).await {
+        Ok(manifest) => install_ytdlp_inner(app, &manifest).await,
+        Err(error) => Err(error),
+    };
     if let Err(error) = &result {
         eprintln!("Не вдалося оновити yt-dlp: {error}");
     }
@@ -2647,6 +2826,7 @@ fn conversion_percent(elapsed: f64, duration: f64, file_index: usize, file_count
         .clamp(0.0, 100.0) as f32
 }
 
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn encoder_probe_args(encoder: VideoEncoder) -> Vec<&'static str> {
     vec![
         "-hide_banner",
@@ -2668,6 +2848,7 @@ fn encoder_probe_args(encoder: VideoEncoder) -> Vec<&'static str> {
     ]
 }
 
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn probe_video_encoder(ffmpeg_path: &Path, encoder: VideoEncoder) -> bool {
     let mut command = Command::new(ffmpeg_path);
     configure_command(&mut command);
@@ -2696,6 +2877,7 @@ fn probe_video_encoder(ffmpeg_path: &Path, encoder: VideoEncoder) -> bool {
     }
 }
 
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn first_available_encoder<F>(candidates: &[VideoEncoder], mut probe: F) -> VideoEncoder
 where
     F: FnMut(VideoEncoder) -> bool,
@@ -2716,6 +2898,7 @@ fn windows_encoder_candidates() -> [VideoEncoder; 3] {
     ]
 }
 
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn select_video_encoder_uncached(ffmpeg_path: &Path) -> VideoEncoder {
     #[cfg(target_os = "macos")]
     {
@@ -2725,9 +2908,11 @@ fn select_video_encoder_uncached(ffmpeg_path: &Path) -> VideoEncoder {
     }
     #[cfg(target_os = "windows")]
     {
-        return first_available_encoder(&windows_encoder_candidates(), |encoder| {
-            probe_video_encoder(ffmpeg_path, encoder)
-        });
+        // A synthetic one-frame probe can reject a perfectly usable Windows
+        // encoder while the NVIDIA/Intel/AMD driver is still warming up. The
+        // real conversion is the authoritative capability test on Windows.
+        let _ = ffmpeg_path;
+        return VideoEncoder::Nvenc;
     }
     #[allow(unreachable_code)]
     VideoEncoder::Software
@@ -2757,6 +2942,7 @@ where
     selected
 }
 
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn select_video_encoder(ffmpeg_path: &Path) -> VideoEncoder {
     let modified = fs::metadata(ffmpeg_path)
         .and_then(|metadata| metadata.modified())
@@ -2766,11 +2952,52 @@ fn select_video_encoder(ffmpeg_path: &Path) -> VideoEncoder {
     })
 }
 
+#[cfg(any(not(target_os = "windows"), test))]
 fn conversion_attempt_encoders(selected: VideoEncoder) -> Vec<VideoEncoder> {
     if selected != VideoEncoder::Software {
         vec![selected, VideoEncoder::Software]
     } else {
         vec![selected]
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_conversion_attempt_encoders(cached: Option<VideoEncoder>) -> Vec<VideoEncoder> {
+    match cached {
+        Some(VideoEncoder::Software) => vec![VideoEncoder::Software],
+        Some(encoder) => vec![encoder, VideoEncoder::Software],
+        None => windows_encoder_candidates()
+            .into_iter()
+            .chain(std::iter::once(VideoEncoder::Software))
+            .collect(),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn cached_windows_video_encoder(ffmpeg_path: &Path) -> Option<VideoEncoder> {
+    let modified = fs::metadata(ffmpeg_path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    encoder_selection_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| match cache.as_ref() {
+            Some((cached_path, cached_modified, encoder))
+                if cached_path == ffmpeg_path && *cached_modified == modified =>
+            {
+                Some(*encoder)
+            }
+            _ => None,
+        })
+}
+
+#[cfg(target_os = "windows")]
+fn remember_windows_video_encoder(ffmpeg_path: &Path, encoder: VideoEncoder) {
+    let modified = fs::metadata(ffmpeg_path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    if let Ok(mut cache) = encoder_selection_cache().lock() {
+        *cache = Some((ffmpeg_path.to_path_buf(), modified, encoder));
     }
 }
 
@@ -3167,12 +3394,18 @@ fn convert_downloaded_media(
         Uuid::new_v4(),
         output_format
     ));
-    let selected_encoder = if is_video {
+    #[cfg(target_os = "windows")]
+    let attempts = if is_video {
+        windows_conversion_attempt_encoders(cached_windows_video_encoder(ffmpeg_path))
+    } else {
+        vec![VideoEncoder::Software]
+    };
+    #[cfg(not(target_os = "windows"))]
+    let attempts = conversion_attempt_encoders(if is_video {
         select_video_encoder(ffmpeg_path)
     } else {
         VideoEncoder::Software
-    };
-    let attempts = conversion_attempt_encoders(selected_encoder);
+    });
     let format_label = output_format.to_ascii_uppercase();
 
     for (index, encoder) in attempts.iter().copied().enumerate() {
@@ -3224,6 +3457,10 @@ fn convert_downloaded_media(
             encoder,
         ) {
             Ok(()) => {
+                #[cfg(target_os = "windows")]
+                if is_video {
+                    remember_windows_video_encoder(ffmpeg_path, encoder);
+                }
                 if let Err(error) = fs::rename(&temporary, &output) {
                     cleanup_failed_conversion(&temporary);
                     return Err(format!(
@@ -4330,6 +4567,13 @@ mod tests {
     }
 
     #[test]
+    fn verifies_runtime_manifest_with_the_real_updater_public_key() {
+        let signature = b"dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdHFlblU0elMzUEZzRFNkS21tNGJOMWp4bDRxQ0VwUTFRYjVwZmQ2ZjJUQlVyUnVPQUFkWHVQMFNBMmJzOUN5ZUNNaUl4SmErdXllUXNPTkFXOUdWQThBUVFWSk9HZ2djPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2MjU3NTQ1CWZpbGU6eXQtZGxwLWJkLXJ1bnRpbWUtc2lnbmF0dXJlLWZpeHR1cmUKbFFOTGRNKy9FUWJzUGJ5WlhOR29BbE13OW5mOEd6Tm5DZUE4My83WWtmdlM0a1RJbGJ6SmpicjZWMU42WTR6cDdQelM3enRMVms3cytOZDNKVXRvREE9PQo=";
+        assert!(verify_runtime_manifest_signature(b"runtime-manifest-test-v1", signature).is_ok());
+        assert!(verify_runtime_manifest_signature(b"runtime-manifest-test-v2", signature).is_err());
+    }
+
+    #[test]
     fn parses_structured_windows_download_handoff() {
         let payload = serde_json::json!({
             "filepath": r"C:\Users\Влад\Downloads\AGE OF KINGDOMS [x-2wmD5Pc1E].mkv",
@@ -4537,6 +4781,23 @@ mod tests {
         assert_eq!(
             conversion_attempt_encoders(VideoEncoder::VideoToolbox),
             vec![VideoEncoder::VideoToolbox, VideoEncoder::Software]
+        );
+        assert_eq!(
+            windows_conversion_attempt_encoders(None),
+            vec![
+                VideoEncoder::Nvenc,
+                VideoEncoder::QuickSync,
+                VideoEncoder::Amf,
+                VideoEncoder::Software
+            ]
+        );
+        assert_eq!(
+            windows_conversion_attempt_encoders(Some(VideoEncoder::QuickSync)),
+            vec![VideoEncoder::QuickSync, VideoEncoder::Software]
+        );
+        assert_eq!(
+            windows_conversion_attempt_encoders(Some(VideoEncoder::Software)),
+            vec![VideoEncoder::Software]
         );
     }
 

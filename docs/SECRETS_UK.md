@@ -53,5 +53,11 @@ GitHub не показує збережене значення Secret назад
 
 `scripts/build-macos.sh` також підтримує локальний `APPLE_NOTARY_KEYCHAIN_PROFILE`. Для CI він приймає updater private key безпосередньо через `TAURI_SIGNING_PRIVATE_KEY`, а локально — через ignored-файл `.secrets/updater.key`. Release-build з ad-hoc identity, неповними Apple credentials або відсутнім updater key завершується помилкою до публікації артефактів.
 
+Той самий updater key підписує `runtime-components.json`. Це не створює нового
+секрету: застосунок перевіряє manifest уже вбудованим публічним updater key, а
+приватний ключ доступний лише захищеному `release` environment. Manifest не
+містить cookies, паролів або інших приватних даних — лише версії, дозволені
+HTTPS URL і SHA-256 runtime-компонентів.
+
 Операційний запуск signed release:
 [GITHUB_RELEASE_HANDOFF_UK.md](GITHUB_RELEASE_HANDOFF_UK.md).
