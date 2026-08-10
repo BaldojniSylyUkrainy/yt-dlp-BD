@@ -73,6 +73,15 @@ test("uses Node 24 artifact actions in both platform release jobs", async () => 
   assert.doesNotMatch(workflow, /actions\/(?:upload|download)-artifact@v4/);
 });
 
+test("keeps Dependabot updates in one monthly non-major maintenance PR", async () => {
+  const config = await readFile(".github/dependabot.yml", "utf8");
+  assert.match(config, /multi-ecosystem-groups:\r?\n  monthly-maintenance:/);
+  assert.match(config, /schedule:\r?\n      interval: monthly/);
+  assert.equal(config.match(/multi-ecosystem-group: monthly-maintenance/g)?.length, 3);
+  assert.equal(config.match(/version-update:semver-major/g)?.length, 3);
+  assert.doesNotMatch(config, /interval: weekly/);
+});
+
 test("pins every external GitHub Action to an immutable full commit SHA", async () => {
   for (const file of [".github/workflows/release.yml", ".github/workflows/security.yml"]) {
     const workflow = await readFile(file, "utf8");
