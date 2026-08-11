@@ -8,6 +8,12 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [react()],
 
+  // macOS 12.3 ships Safari/WebKit 15.4. Keep the generated JS and CSS
+  // compatible with the oldest operating system supported by the app.
+  build: {
+    target: "safari15.4",
+  },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors
