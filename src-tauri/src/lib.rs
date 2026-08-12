@@ -2517,6 +2517,41 @@ fn available_disk_space(path: &Path) -> Option<u64> {
     fs2::available_space(path).ok()
 }
 
+#[cfg(target_os = "macos")]
+fn macos_important_usage_space(path: &Path) -> Option<u64> {
+    use objc2_foundation::{
+        NSNumber, NSString, NSURLVolumeAvailableCapacityForImportantUsageKey, NSURL,
+    };
+
+    let path = NSString::from_str(&path.to_string_lossy());
+    let url = NSURL::fileURLWithPath_isDirectory(&path, true);
+    let mut value = None;
+    unsafe {
+        url.getResourceValue_forKey_error(
+            &mut value,
+            NSURLVolumeAvailableCapacityForImportantUsageKey,
+        )
+        .ok()?;
+    }
+    value?
+        .downcast::<NSNumber>()
+        .ok()
+        .map(|value| value.as_u64())
+}
+
+/// Capacity suitable for a user-requested download. On APFS this includes
+/// purgeable space that macOS can reclaim, matching the system storage UI.
+/// The live guard deliberately continues to use `available_disk_space`, so it
+/// still reacts to immediately writable blocks while a process is active.
+fn planning_available_disk_space(path: &Path) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    if let Some(available) = macos_important_usage_space(path) {
+        return Some(available);
+    }
+
+    available_disk_space(path)
+}
+
 fn scale_playlist_estimate(
     estimate: Option<u64>,
     item_count: u64,
@@ -2535,7 +2570,7 @@ fn folder_free_space(path: String) -> Result<u64, String> {
     if !path.is_dir() {
         return Err("Обрана папка недоступна".into());
     }
-    available_disk_space(&path)
+    planning_available_disk_space(&path)
         .ok_or_else(|| "Не вдалося визначити вільне місце в обраній папці".into())
 }
 
@@ -2546,7 +2581,7 @@ fn preflight_download(request: PreflightRequest) -> Result<PreflightResult, Stri
     if !output_dir.is_dir() {
         return Err("Обрана папка для завантаження недоступна".into());
     }
-    let available_space = available_disk_space(&output_dir)
+    let available_space = planning_available_disk_space(&output_dir)
         .ok_or_else(|| "Не вдалося визначити вільне місце в обраній папці".to_string())?;
     let title = request
         .title
@@ -2643,7 +2678,7 @@ fn emit_storage_estimate(
         })
         .unwrap_or((final_size, source_size.saturating_add(final_size)));
     let required_space = required_space.saturating_add(MIN_FREE_SPACE_RESERVE);
-    let available_space = available_disk_space(&tracker.output_dir);
+    let available_space = planning_available_disk_space(&tracker.output_dir);
     let _ = app.emit(
         "download-event",
         DownloadEvent {
@@ -3858,7 +3893,7 @@ fn start_download(
             "Обрана папка завантажень недоступна. Підключіть диск або виберіть іншу папку".into(),
         );
     }
-    let available_space = available_disk_space(&output_dir)
+    let available_space = planning_available_disk_space(&output_dir)
         .ok_or_else(|| "Не вдалося визначити вільне місце в обраній папці".to_string())?;
     let enough_space = request
         .expected_required_space
@@ -4771,6 +4806,16 @@ mod tests {
     #[test]
     fn reports_available_space_for_existing_directory() {
         assert!(available_disk_space(&std::env::temp_dir()).is_some());
+        assert!(planning_available_disk_space(&std::env::temp_dir()).is_some());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_planning_space_includes_system_reclaimable_capacity() {
+        let path = std::env::temp_dir();
+        let physical = available_disk_space(&path).expect("physical capacity");
+        let planning = planning_available_disk_space(&path).expect("important usage capacity");
+        assert!(planning >= physical);
     }
 
     #[test]

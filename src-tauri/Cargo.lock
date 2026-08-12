@@ -5453,12 +5453,13 @@ dependencies = [
 
 [[package]]
 name = "yt-dlp-desktop"
-version = "0.6.20"
+version = "0.6.30"
 dependencies = [
  "base64 0.22.1",
  "fs2",
  "libc",
  "minisign-verify",
+ "objc2-foundation",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
