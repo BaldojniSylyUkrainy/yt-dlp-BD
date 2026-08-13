@@ -2543,15 +2543,24 @@ fn macos_important_usage_space(path: &Path) -> Option<u64> {
 /// purgeable space that macOS can reclaim, matching the system storage UI.
 /// The live guard deliberately continues to use `available_disk_space`, so it
 /// still reacts to immediately writable blocks while a process is active.
+#[cfg(target_os = "macos")]
+fn select_macos_planning_capacity(
+    physical: Option<u64>,
+    important_usage: Option<u64>,
+) -> Option<u64> {
+    match (physical, important_usage) {
+        (Some(physical), Some(important_usage)) => Some(physical.max(important_usage)),
+        (physical, important_usage) => physical.or(important_usage),
+    }
+}
+
 fn planning_available_disk_space(path: &Path) -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
-        let physical = available_disk_space(path);
-        let important_usage = macos_important_usage_space(path);
-        match (physical, important_usage) {
-            (Some(physical), Some(important_usage)) => Some(physical.max(important_usage)),
-            (physical, important_usage) => physical.or(important_usage),
-        }
+        select_macos_planning_capacity(
+            available_disk_space(path),
+            macos_important_usage_space(path),
+        )
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -4817,11 +4826,18 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_planning_space_never_undercuts_immediately_available_capacity() {
-        let path = std::env::temp_dir();
-        let physical = available_disk_space(&path).expect("physical capacity");
-        let planning = planning_available_disk_space(&path).expect("planning capacity");
-        assert!(planning >= physical);
+    fn macos_planning_capacity_selects_the_larger_available_source() {
+        assert_eq!(
+            select_macos_planning_capacity(Some(200), Some(100)),
+            Some(200)
+        );
+        assert_eq!(
+            select_macos_planning_capacity(Some(100), Some(200)),
+            Some(200)
+        );
+        assert_eq!(select_macos_planning_capacity(Some(100), None), Some(100));
+        assert_eq!(select_macos_planning_capacity(None, Some(200)), Some(200));
+        assert_eq!(select_macos_planning_capacity(None, None), None);
     }
 
     #[test]
