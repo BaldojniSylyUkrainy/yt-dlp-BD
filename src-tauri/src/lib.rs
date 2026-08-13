@@ -2545,10 +2545,16 @@ fn macos_important_usage_space(path: &Path) -> Option<u64> {
 /// still reacts to immediately writable blocks while a process is active.
 fn planning_available_disk_space(path: &Path) -> Option<u64> {
     #[cfg(target_os = "macos")]
-    if let Some(available) = macos_important_usage_space(path) {
-        return Some(available);
+    {
+        let physical = available_disk_space(path);
+        let important_usage = macos_important_usage_space(path);
+        match (physical, important_usage) {
+            (Some(physical), Some(important_usage)) => Some(physical.max(important_usage)),
+            (physical, important_usage) => physical.or(important_usage),
+        }
     }
 
+    #[cfg(not(target_os = "macos"))]
     available_disk_space(path)
 }
 
@@ -4811,10 +4817,10 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_planning_space_includes_system_reclaimable_capacity() {
+    fn macos_planning_space_never_undercuts_immediately_available_capacity() {
         let path = std::env::temp_dir();
         let physical = available_disk_space(&path).expect("physical capacity");
-        let planning = planning_available_disk_space(&path).expect("important usage capacity");
+        let planning = planning_available_disk_space(&path).expect("planning capacity");
         assert!(planning >= physical);
     }
 

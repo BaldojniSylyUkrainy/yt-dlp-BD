@@ -64,6 +64,7 @@ Tauri `0.4.0`, а tag — `v0.4.0.0`.
 - `src-tauri/Cargo.toml` і запис застосунку в `src-tauri/Cargo.lock`;
 - `src-tauri/tauri.conf.json`;
 - `RELEASE_NOTES.md`;
+- `docs/RELEASE_NOTES_ARCHIVE.md` з точними нотатками вже опублікованих версій: поточні нотатки мають описувати лише нову дельту й не дублювати старі пункти;
 - `.github/workflows/release.yml`: `workflow_dispatch.inputs.tag.default`;
 - актуальні release-приклади в `docs/START_HERE_UK.md`,
   `docs/GITHUB_RELEASE_HANDOFF_UK.md` і `READMEAI`.

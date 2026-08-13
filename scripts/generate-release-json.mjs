@@ -23,8 +23,8 @@ export function validateReleaseNotes(notes, releaseVersion) {
   if (normalized.length < 80) {
     throw new Error("RELEASE_NOTES.md must contain a meaningful description of the release");
   }
-  if (!normalized.includes(releaseVersion)) {
-    throw new Error(`RELEASE_NOTES.md must mention release version ${releaseVersion}`);
+  if (normalized.split(/\r?\n/u)[0] !== `# BaldojnyiDownloader ${releaseVersion}`) {
+    throw new Error(`RELEASE_NOTES.md must start with the exact current release heading`);
   }
   if (/\b(?:TODO|TBD|CHANGE ME)\b/i.test(normalized)) {
     throw new Error("RELEASE_NOTES.md still contains placeholder text");

@@ -190,11 +190,30 @@ test("fails closed when a required updater signature is missing", () => {
 });
 
 test("requires meaningful versioned release notes", () => {
-  const notes = `# yt-dlp BD ${releaseVersion}\n\n## Що нового\n\n- Додано зрозумілий опис важливих змін для користувачів застосунку.`;
+  const notes = `# BaldojnyiDownloader ${releaseVersion}\n\n## Що нового\n\n- Додано зрозумілий опис важливих змін для користувачів застосунку.`;
   assert.equal(validateReleaseNotes(notes, releaseVersion), notes);
   assert.throws(() => validateReleaseNotes("TODO", releaseVersion), /meaningful/);
   assert.throws(
     () => validateReleaseNotes(notes.replace(releaseVersion, "9.9.9.9"), releaseVersion),
-    /must mention release version/,
+    /exact current release heading/,
   );
+  assert.throws(
+    () => validateReleaseNotes(`${notes}\n\nПопередня версія ${releaseVersion}`, releaseVersion.replace(/\.0$/u, ".1")),
+    /exact current release heading/,
+  );
+});
+
+test("current release notes do not repeat published release bullets", async () => {
+  const current = await readFile("RELEASE_NOTES.md", "utf8");
+  const archive = await readFile("docs/RELEASE_NOTES_ARCHIVE.md", "utf8");
+  const bulletLines = (value) =>
+    new Set(
+      value
+        .split(/\r?\n/u)
+        .map((line) => line.trim())
+        .filter((line) => line.startsWith("- ")),
+    );
+  const archivedBullets = bulletLines(archive);
+  const duplicated = [...bulletLines(current)].filter((line) => archivedBullets.has(line));
+  assert.deepEqual(duplicated, [], `current release repeats published bullets: ${duplicated.join(" | ")}`);
 });
