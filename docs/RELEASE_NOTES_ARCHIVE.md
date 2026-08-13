@@ -1,0 +1,15 @@
+# Published release notes archive
+
+This file preserves the exact user-facing bullets of published releases. Before
+preparing the next release, append the just-published `RELEASE_NOTES.md` here.
+The release test rejects exact bullet reuse so a maintenance change is not
+silently attributed to multiple versions.
+
+## 0.6.2.0
+
+- Оновлено frontend-збірку до Vite 8 та сумісного React-плагіна. Для розробки й складання тепер використовується актуальна підтримувана версія Node.js.
+- Production bundle явно орієнтується на Safari 15.4, тому заявлена підтримка macOS 12.3 не змінюється після переходу на Vite 8.
+- Оновлено TypeScript до 5.9 та типи React/React DOM. Поведінка й інтерфейс застосунку не змінюються, але перевірка коду та сумісність майбутніх оновлень стали актуальнішими.
+- Перевірки залежностей об’єднано в один щомісячний maintenance PR без автоматичних major-оновлень. Це прибирає десятки окремих бот-комітів і залишає великі міграції під ручним контролем.
+- Збережено повний кросплатформний lock-файл, включно з optional-залежностями для Windows і macOS.
+- Прогнано frontend-тести, release-перевірки, production build, Rust-перевірки та Windows cross-check перед підготовкою релізу.
