@@ -1771,6 +1771,22 @@ fn replace_option_value(args: &[OsString], option: &str, value: &str) -> Vec<OsS
     replaced
 }
 
+fn youtube_retry_args(args: &[OsString]) -> Vec<OsString> {
+    // Re-run extraction from scratch and let the installed yt-dlp choose its
+    // current supported YouTube clients. Hard-coded client combinations age
+    // independently of yt-dlp and can turn a recoverable expired stream URL
+    // into a persistent 403.
+    args.to_vec()
+}
+
+fn youtube_retry_message(retry_attempt: u8) -> &'static str {
+    if retry_attempt == 1 {
+        "YouTube перервав потік. Оновлюємо посилання й продовжуємо…"
+    } else {
+        "YouTube знову перервав потік. Отримуємо ще одне свіже посилання…"
+    }
+}
+
 async fn probe_oembed(url: &str, endpoint: &str, extractor: &str) -> Result<MediaPreview, String> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(2))
@@ -4220,11 +4236,7 @@ fn start_download(
                 };
                 if youtube_retry_ready {
                     retry_attempt += 1;
-                    let retry_message = if retry_attempt == 1 {
-                        "YouTube перервав потік. Оновлюємо посилання й продовжуємо…"
-                    } else {
-                        "Перемикаємо спосіб отримання відео й продовжуємо…"
-                    };
+                    let retry_message = youtube_retry_message(retry_attempt);
                     let _ = monitor_app.emit(
                         "download-event",
                         DownloadEvent {
@@ -4249,15 +4261,9 @@ fn start_download(
                     let mut retry_command = Command::new(&retry_program);
                     configure_command(&mut retry_command);
                     retry_command
-                        .args(&retry_args)
+                        .args(youtube_retry_args(&retry_args))
                         .stdout(Stdio::piped())
                         .stderr(Stdio::piped());
-                    if retry_attempt == 2 {
-                        retry_command.args([
-                            "--extractor-args",
-                            "youtube:player_client=web_embedded,android_vr",
-                        ]);
-                    }
                     #[cfg(unix)]
                     retry_command.process_group(0);
 
@@ -4651,6 +4657,25 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn youtube_retries_refresh_without_forcing_stale_clients() {
+        let original = vec![
+            OsString::from("--format"),
+            OsString::from("bestvideo+bestaudio/best"),
+            OsString::from("https://www.youtube.com/watch?v=example"),
+        ];
+
+        assert_eq!(youtube_retry_args(&original), original);
+        assert_eq!(
+            youtube_retry_message(1),
+            "YouTube перервав потік. Оновлюємо посилання й продовжуємо…"
+        );
+        assert_eq!(
+            youtube_retry_message(2),
+            "YouTube знову перервав потік. Отримуємо ще одне свіже посилання…"
+        );
+    }
 
     #[test]
     fn parses_exact_selected_format_size() {
