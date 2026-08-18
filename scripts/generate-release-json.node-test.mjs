@@ -40,6 +40,8 @@ test("keeps the updater-compatible installed identity and branded window title",
   assert.match(windowsMigration, /\$R1 == "0\.7\.0"/);
   assert.match(windowsMigration, /\$LOCALAPPDATA\\Baldojnyi Downloader/);
   assert.match(windowsMigration, /yt-dlp-desktop\.exe/);
+  assert.match(windowsMigration, /Software\\ytdlp\\Baldojnyi Downloader/);
+  assert.doesNotMatch(windowsMigration, /Software\\yt-dlp Desktop contributors\\Baldojnyi Downloader/);
   assert.match(windowsMigration, /\/UPDATE \/P/);
   assert.doesNotMatch(windowsMigration, /RMDir\s+\/r/i);
   assert.doesNotMatch(windowsMigration, /(?:APPDATA|LOCALAPPDATA).*app\.ytdlp\.desktop/i);

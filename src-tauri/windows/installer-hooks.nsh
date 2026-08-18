@@ -71,7 +71,7 @@ Var LegacyCleanupExitCode
     ${EndIf}
 
     DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Baldojnyi Downloader"
-    DeleteRegKey HKCU "Software\yt-dlp Desktop contributors\Baldojnyi Downloader"
+    DeleteRegKey HKCU "Software\ytdlp\Baldojnyi Downloader"
     DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "Baldojnyi Downloader"
   ${EndIf}
 !macroend
