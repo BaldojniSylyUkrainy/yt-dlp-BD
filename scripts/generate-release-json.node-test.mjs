@@ -28,12 +28,21 @@ test("uses the public product name and version for GitHub Release titles", async
 
 test("keeps the updater-compatible installed identity and branded window title", async () => {
   const tauriConfig = JSON.parse(await readFile("src-tauri/tauri.conf.json", "utf8"));
+  const windowsMigration = await readFile("src-tauri/windows/installer-hooks.nsh", "utf8");
   const macBuild = await readFile("scripts/build-macos.sh", "utf8");
   const releaseGenerator = await readFile("scripts/generate-release-json.mjs", "utf8");
   assert.equal(tauriConfig.productName, "yt-dlp BD");
   assert.equal(tauriConfig.app.windows[0].title, "yt-dlp BD — Baldojnyi Downloader");
   assert.equal(tauriConfig.bundle.windows.nsis.installerIcon, "icons/icon.ico");
   assert.equal(tauriConfig.bundle.windows.nsis.uninstallerIcon, "icons/icon.ico");
+  assert.equal(tauriConfig.bundle.windows.nsis.installerHooks, "windows/installer-hooks.nsh");
+  assert.match(windowsMigration, /Uninstall\\Baldojnyi Downloader/);
+  assert.match(windowsMigration, /\$R1 == "0\.7\.0"/);
+  assert.match(windowsMigration, /\$LOCALAPPDATA\\Baldojnyi Downloader/);
+  assert.match(windowsMigration, /yt-dlp-desktop\.exe/);
+  assert.match(windowsMigration, /\/UPDATE \/P/);
+  assert.doesNotMatch(windowsMigration, /RMDir\s+\/r/i);
+  assert.doesNotMatch(windowsMigration, /(?:APPDATA|LOCALAPPDATA).*app\.ytdlp\.desktop/i);
   assert.match(macBuild, /yt-dlp BD\.app/);
   assert.match(macBuild, /git status --porcelain\)/);
   assert.doesNotMatch(macBuild, /--untracked-files=no/);
