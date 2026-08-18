@@ -634,6 +634,18 @@ fn ensure_ytdlp_bootstrap_not_rollback(
     Ok(())
 }
 
+fn verified_nightly_is_current(
+    release_tag: &str,
+    accepted_version: Option<&str>,
+    github_digest: &str,
+    accepted_digest: Option<&str>,
+    installed_digest: Option<&str>,
+) -> bool {
+    accepted_version.is_some_and(|version| version.trim() == release_tag)
+        && accepted_digest.is_some_and(|digest| digest.trim() == github_digest)
+        && installed_digest == Some(github_digest)
+}
+
 fn github_asset_sha256(asset: &GithubReleaseAsset) -> Result<String, String> {
     let digest = asset
         .digest
@@ -1792,10 +1804,26 @@ async fn update_ytdlp_to_latest_nightly(app: &AppHandle) -> Result<(), String> {
     if binary_asset.size == 0 || binary_asset.size > MAX_YT_DLP_BINARY_BYTES {
         return Err("Офіційний nightly має неочікуваний розмір".into());
     }
+    let github_binary_digest = github_asset_sha256(&binary_asset)?;
     let checksum_asset = select_nightly_asset(&release, "SHA2-256SUMS")?;
     if checksum_asset.size == 0 || checksum_asset.size > MAX_RUNTIME_METADATA_BYTES as u64 {
         return Err("Офіційний файл SHA-256 має неочікуваний розмір".into());
     }
+
+    let destination = yt_dlp_path(app)?;
+    let hash_stamp = runtime_dir(app)?.join(".yt-dlp.sha256");
+    let accepted_hash = fs::read_to_string(&hash_stamp).ok();
+    let installed_hash = sha256_file(&destination).ok();
+    if verified_nightly_is_current(
+        &release.tag_name,
+        accepted_version.as_deref(),
+        &github_binary_digest,
+        accepted_hash.as_deref(),
+        installed_hash.as_deref(),
+    ) {
+        return Ok(());
+    }
+
     let checksum_bytes = tokio::time::timeout(
         Duration::from_secs(8),
         fetch_bytes(&client, &checksum_asset.browser_download_url),
@@ -1810,13 +1838,10 @@ async fn update_ytdlp_to_latest_nightly(app: &AppHandle) -> Result<(), String> {
         return Err("GitHub SHA-256 для офіційного списку сум не збігається".into());
     }
     let expected = nightly_checksum_for_asset(&checksum_bytes, binary_name)?;
-    if expected != github_asset_sha256(&binary_asset)? {
+    if expected != github_binary_digest {
         return Err("Офіційні SHA-256 nightly не узгоджені між собою".into());
     }
 
-    let destination = yt_dlp_path(app)?;
-    let hash_stamp = runtime_dir(app)?.join(".yt-dlp.sha256");
-    let installed_hash = sha256_file(&destination).ok();
     if installed_hash.as_deref() == Some(expected.as_str()) {
         write_runtime_text_atomic(&hash_stamp, &expected, "SHA-256 yt-dlp")?;
         write_runtime_text_atomic(&version_stamp, &release.tag_name, "версію yt-dlp")?;
@@ -5510,6 +5535,27 @@ mod tests {
             false,
         )
         .is_ok());
+        assert!(verified_nightly_is_current(
+            "2026.08.18.000001",
+            Some("2026.08.18.000001\n"),
+            "abc123",
+            Some("abc123\n"),
+            Some("abc123"),
+        ));
+        assert!(!verified_nightly_is_current(
+            "2026.08.18.000002",
+            Some("2026.08.18.000001"),
+            "abc123",
+            Some("abc123"),
+            Some("abc123"),
+        ));
+        assert!(!verified_nightly_is_current(
+            "2026.08.18.000001",
+            Some("2026.08.18.000001"),
+            "abc123",
+            Some("abc123"),
+            Some("changed"),
+        ));
     }
 
     #[test]
