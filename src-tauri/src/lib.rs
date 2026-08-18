@@ -1417,6 +1417,20 @@ fn write_runtime_text_atomic(destination: &Path, value: &str, label: &str) -> Re
     Ok(())
 }
 
+fn commit_ytdlp_runtime_update(
+    temporary: &Path,
+    destination: &Path,
+    version_stamp: &Path,
+    hash_stamp: &Path,
+    version: &str,
+    hash: &str,
+    label: &str,
+) -> Result<(), String> {
+    replace_runtime_file(temporary, destination, label)?;
+    write_runtime_text_atomic(version_stamp, version, "версію yt-dlp")?;
+    write_runtime_text_atomic(hash_stamp, hash, "SHA-256 yt-dlp")
+}
+
 #[cfg(test)]
 fn checksum_for_asset(checksum_file: &[u8], asset_name: &str) -> Result<String, String> {
     let checksums = String::from_utf8(checksum_file.to_vec())
@@ -1765,13 +1779,15 @@ async fn install_ytdlp_inner(
             .map_err(|error| format!("Не вдалося дозволити запуск yt-dlp: {error}"))?;
     }
 
-    write_runtime_text_atomic(&version_stamp, &asset.version, "версію yt-dlp")?;
-    write_runtime_text_atomic(
+    commit_ytdlp_runtime_update(
+        &temporary,
+        &destination,
+        &version_stamp,
         &runtime_dir(&app)?.join(".yt-dlp.sha256"),
+        &asset.version,
         &asset.sha256,
-        "SHA-256 yt-dlp",
+        "yt-dlp",
     )?;
-    replace_runtime_file(&temporary, &destination, "yt-dlp")?;
 
     Ok(())
 }
@@ -1887,14 +1903,18 @@ async fn update_ytdlp_to_latest_nightly(app: &AppHandle) -> Result<(), String> {
         let _ = fs::remove_file(&temporary);
         return Err("Завантажений yt-dlp nightly повідомив неочікувану версію".into());
     }
-    if let Err(error) = (|| {
-        write_runtime_text_atomic(&version_stamp, &release.tag_name, "версію yt-dlp")?;
-        write_runtime_text_atomic(&hash_stamp, &expected, "SHA-256 yt-dlp")
-    })() {
+    if let Err(error) = commit_ytdlp_runtime_update(
+        &temporary,
+        &destination,
+        &version_stamp,
+        &hash_stamp,
+        &release.tag_name,
+        &expected,
+        "yt-dlp nightly",
+    ) {
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
-    replace_runtime_file(&temporary, &destination, "yt-dlp nightly")?;
     Ok(())
 }
 
@@ -5579,6 +5599,39 @@ mod tests {
         drop(second);
         fs::remove_file(path).unwrap();
         fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_ytdlp_binary_replacement_keeps_old_binary_and_stamps_consistent() {
+        let directory =
+            std::env::temp_dir().join(format!("yt-dlp-bd-runtime-commit-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let destination = directory.join("yt-dlp");
+        let missing_temporary = directory.join("missing-download");
+        let version_stamp = directory.join(".yt-dlp.version");
+        let hash_stamp = directory.join(".yt-dlp.sha256");
+        fs::write(&destination, b"old-binary").unwrap();
+        fs::write(&version_stamp, "2026.08.17.000001").unwrap();
+        fs::write(&hash_stamp, "old-hash").unwrap();
+
+        assert!(commit_ytdlp_runtime_update(
+            &missing_temporary,
+            &destination,
+            &version_stamp,
+            &hash_stamp,
+            "2026.08.18.000001",
+            "new-hash",
+            "yt-dlp nightly",
+        )
+        .is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"old-binary");
+        assert_eq!(
+            fs::read_to_string(&version_stamp).unwrap(),
+            "2026.08.17.000001"
+        );
+        assert_eq!(fs::read_to_string(&hash_stamp).unwrap(), "old-hash");
+
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
