@@ -11,6 +11,10 @@ const projectDir = path.resolve(scriptDir, "..");
 
 const MAC_FFMPEG_PAGE = "https://ffmpeg.martin-riedl.de/";
 const GITHUB_API = "https://api.github.com/repos";
+export const YT_DLP_RELEASE_SOURCE = Object.freeze({
+  owner: "yt-dlp",
+  repository: "yt-dlp-nightly-builds",
+});
 
 function githubApiHeaders() {
   const headers = {
@@ -178,7 +182,7 @@ async function downloadVerifiedAsset(asset, destination) {
 
 export async function buildRuntimeManifest(releaseVersion, now = new Date()) {
   const [ytDlp, deno, windowsFfmpeg, macPage] = await Promise.all([
-    githubLatest("yt-dlp", "yt-dlp"),
+    githubLatest(YT_DLP_RELEASE_SOURCE.owner, YT_DLP_RELEASE_SOURCE.repository),
     githubLatest("denoland", "deno"),
     githubLatest("yt-dlp", "FFmpeg-Builds"),
     fetchText(MAC_FFMPEG_PAGE),

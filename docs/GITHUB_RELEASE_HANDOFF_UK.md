@@ -36,7 +36,7 @@ PATCH (`0.3.2` → `0.3.3`), а реліз із будь-якою новою ф�
 3. Відкрийте **Actions → Manual signed release → Run workflow**.
 4. Branch: `main`.
 5. `tag`: чотирикомпонентний public tag із `package.json`, наприклад
-   `v0.6.4.0`.
+   `v0.7.0.0`.
 6. Натисніть **Run workflow** і вручну approve jobs для environment `release`.
 
 Workflow зупиниться, якщо tag не дорівнює `v${releaseVersion}`, бракує ключа,
@@ -74,7 +74,7 @@ Workflow зупиниться, якщо tag не дорівнює `v${releaseVer
 
 ## Увімкнути обов’язкові immutable Actions після merge
 
-Workflow-файли в `0.6.4.0` уже використовують тільки повні 40-символьні commit
+Workflow-файли в `0.7.0.0` уже використовують тільки повні 40-символьні commit
 SHA. Одразу після merge цього commit власник repository має відкрити
 **Settings → Actions → General → Actions permissions**, увімкнути
 **Require actions to be pinned to a full-length commit SHA** і зберегти зміни.

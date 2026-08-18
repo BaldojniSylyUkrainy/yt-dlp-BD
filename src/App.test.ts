@@ -17,6 +17,8 @@ import {
   preflightAllowsStart,
   preflightConfidenceLabel,
   runtimeInstallCommand,
+  runtimeUpdateKey,
+  shouldShowRuntimeRetry,
   shouldShowMultiItemIntent,
   shouldPlayCompletionSound,
   shouldPlayQueueCompletionSound,
@@ -307,9 +309,21 @@ describe("preflight and retry guards", () => {
   });
 
   it("maps every runtime retry to its own backend command", () => {
-    expect(runtimeInstallCommand("ytDlp")).toBe("install_ytdlp");
+    expect(runtimeInstallCommand("ytDlp")).toBe("update_ytdlp");
     expect(runtimeInstallCommand("ffmpeg")).toBe("install_ffmpeg");
     expect(runtimeInstallCommand("deno")).toBe("install_deno");
+  });
+
+  it("uses the nightly schedule key for every yt-dlp maintenance path", () => {
+    expect(runtimeUpdateKey("ytDlp")).toBe("runtimeUpdate.ytDlpNightly.v1");
+    expect(runtimeUpdateKey("ffmpeg")).toBe("runtimeUpdate.ffmpeg");
+    expect(runtimeUpdateKey("deno")).toBe("runtimeUpdate.deno");
+  });
+
+  it("keeps Retry visible when an installed component failed to update", () => {
+    expect(shouldShowRuntimeRetry(false, true)).toBe(true);
+    expect(shouldShowRuntimeRetry(true, true)).toBe(false);
+    expect(shouldShowRuntimeRetry(false, false)).toBe(false);
   });
 
   it("validates link syntax without waiting for a network availability probe", () => {
