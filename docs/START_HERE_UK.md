@@ -93,8 +93,8 @@ release збирає ручний GitHub-hosted workflow, а не локальн
 файлів. Повний handoff для власника repository:
 [GITHUB_RELEASE_HANDOFF_UK.md](GITHUB_RELEASE_HANDOFF_UK.md).
 
-Підготовлений public release tag — `v0.7.0.0`, а внутрішня Tauri/SemVer version —
-`0.7.0`. Workflow перевіряє public tag за `package.json.releaseVersion` і
+Підготовлений public release tag — `v0.7.1.0`, а внутрішня Tauri/SemVer version —
+`0.7.10`. Workflow перевіряє public tag за `package.json.releaseVersion` і
 створює draft Release. Після
 ручної перевірки та публікації `latest.json` встановлені копії побачать нову
 версію, перевірять криптографічний підпис своєї платформи й запропонують

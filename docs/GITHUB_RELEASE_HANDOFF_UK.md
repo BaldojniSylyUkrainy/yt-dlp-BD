@@ -36,7 +36,7 @@ PATCH (`0.3.2` → `0.3.3`), а реліз із будь-якою новою ф�
 3. Відкрийте **Actions → Manual signed release → Run workflow**.
 4. Branch: `main`.
 5. `tag`: чотирикомпонентний public tag із `package.json`, наприклад
-   `v0.7.0.0`.
+   `v0.7.1.0`.
 6. Натисніть **Run workflow** і вручну approve jobs для environment `release`.
 
 Workflow зупиниться, якщо tag не дорівнює `v${releaseVersion}`, бракує ключа,
