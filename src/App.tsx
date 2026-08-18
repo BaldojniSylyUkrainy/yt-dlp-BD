@@ -162,6 +162,15 @@ export function runtimeInstallCommand(stage: Exclude<RuntimeStage, null>): strin
   return "install_deno";
 }
 
+export function runtimeUpdateKey(stage: Exclude<RuntimeStage, null>): string {
+  if (stage === "ytDlp") return "runtimeUpdate.ytDlpNightly.v1";
+  return `runtimeUpdate.${stage}`;
+}
+
+export function shouldShowRuntimeRetry(loading: boolean, hasRetry: boolean): boolean {
+  return !loading && hasRetry;
+}
+
 export function defaultCookieBrowser(platform: string, stored: string | null): string {
   const normalized = normalizeCookieBrowser(stored);
   if (normalized) return normalized;
@@ -924,9 +933,9 @@ function App() {
   const refreshManagedComponents = useCallback(async () => {
     const now = Date.now();
     const schedules = [
-      { command: "update_ytdlp", stage: "ytDlp" as const, key: "runtimeUpdate.ytDlpNightly.v1", interval: 24 * 60 * 60 * 1000 },
-      { command: "install_ffmpeg", stage: "ffmpeg" as const, key: "runtimeUpdate.ffmpeg", interval: 7 * 24 * 60 * 60 * 1000 },
-      { command: "install_deno", stage: "deno" as const, key: "runtimeUpdate.deno", interval: 7 * 24 * 60 * 60 * 1000 },
+      { command: "update_ytdlp", stage: "ytDlp" as const, key: runtimeUpdateKey("ytDlp"), interval: 24 * 60 * 60 * 1000 },
+      { command: "install_ffmpeg", stage: "ffmpeg" as const, key: runtimeUpdateKey("ffmpeg"), interval: 7 * 24 * 60 * 60 * 1000 },
+      { command: "install_deno", stage: "deno" as const, key: runtimeUpdateKey("deno"), interval: 7 * 24 * 60 * 60 * 1000 },
     ];
     const due = schedules.filter(({ key, interval }) => now - Number(localStorage.getItem(key) || 0) >= interval);
     if (!due.length) return;
@@ -940,8 +949,14 @@ function App() {
         try {
           await invoke<void>(component.command);
           localStorage.setItem(component.key, String(now));
+          setRuntimeFailures((current) => {
+            const next = new Set(current);
+            next.delete(component.stage);
+            return next;
+          });
         } catch (error) {
           issues.push(String(error));
+          setRuntimeFailures((current) => new Set(current).add(component.stage));
         }
       }
       setRuntime(await invoke<RuntimeStatus>("runtime_status"));
@@ -980,7 +995,7 @@ function App() {
         setStartupProgress(62 + Math.round((index / missing.length) * 30));
         try {
           await invoke<void>(component.command);
-          localStorage.setItem(`runtimeUpdate.${component.stage}`, String(Date.now()));
+          localStorage.setItem(runtimeUpdateKey(component.stage), String(Date.now()));
           setRuntimeFailures((current) => {
             const next = new Set(current);
             next.delete(component.stage);
@@ -1018,7 +1033,7 @@ function App() {
         next.delete(stage);
         return next;
       });
-      localStorage.setItem(`runtimeUpdate.${stage}`, String(Date.now()));
+      localStorage.setItem(runtimeUpdateKey(stage), String(Date.now()));
     } catch (error) {
       setRuntimeError(String(error));
       setRuntimeFailures((current) => new Set(current).add(stage));
@@ -2434,7 +2449,8 @@ function HistoryView({ entries, retryingId, retryDisabled, onRetry, onClear }: {
 
 function RuntimeRow({ label, component, loading = false, retry }: { label: string; component?: ComponentStatus; loading?: boolean; retry?: () => void }) {
   const ready = component?.installed;
-  return <div className="runtime-row"><span className={`component-dot ${loading ? "loading" : ready ? "ready" : "missing"}`}/><div><strong>{label}</strong><small>{loading ? "Завантажуємо й перевіряємо…" : ready ? shortVersion(component.version) : "Компонент недоступний"}</small></div>{ready && !loading ? <Icon name="check" size={15}/> : retry && !loading ? <button type="button" className="runtime-retry" aria-label={`Повторити встановлення ${label}`} onClick={retry}><Icon name="refresh" size={14}/></button> : null}</div>;
+  const showRetry = shouldShowRuntimeRetry(loading, Boolean(retry));
+  return <div className="runtime-row"><span className={`component-dot ${loading ? "loading" : ready ? "ready" : "missing"}`}/><div><strong>{label}</strong><small>{loading ? "Завантажуємо й перевіряємо…" : ready ? shortVersion(component.version) : "Компонент недоступний"}</small></div>{showRetry ? <button type="button" className="runtime-retry" aria-label={`Повторити встановлення ${label}`} onClick={retry}><Icon name="refresh" size={14}/></button> : ready && !loading ? <Icon name="check" size={15}/> : null}</div>;
 }
 
 function StartupOverlay({ progress, message }: { progress: number; message: string }) {
