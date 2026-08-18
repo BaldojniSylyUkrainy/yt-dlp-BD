@@ -26,17 +26,29 @@ test("uses the public product name and version for GitHub Release titles", async
   assert.match(workflow, /description: "Four-part release tag from package\.json, for example vX\.Y\.Z\.H"/);
 });
 
-test("uses the branded installed app name and Windows installer icons", async () => {
+test("keeps the updater-compatible installed identity and branded window title", async () => {
   const tauriConfig = JSON.parse(await readFile("src-tauri/tauri.conf.json", "utf8"));
+  const windowsMigration = await readFile("src-tauri/windows/installer-hooks.nsh", "utf8");
   const macBuild = await readFile("scripts/build-macos.sh", "utf8");
   const releaseGenerator = await readFile("scripts/generate-release-json.mjs", "utf8");
-  assert.equal(tauriConfig.productName, "Baldojnyi Downloader");
+  assert.equal(tauriConfig.productName, "yt-dlp BD");
+  assert.equal(tauriConfig.app.windows[0].title, "yt-dlp BD — Baldojnyi Downloader");
   assert.equal(tauriConfig.bundle.windows.nsis.installerIcon, "icons/icon.ico");
   assert.equal(tauriConfig.bundle.windows.nsis.uninstallerIcon, "icons/icon.ico");
-  assert.match(macBuild, /Baldojnyi Downloader\.app/);
+  assert.equal(tauriConfig.bundle.windows.nsis.installerHooks, "windows/installer-hooks.nsh");
+  assert.match(windowsMigration, /Uninstall\\Baldojnyi Downloader/);
+  assert.match(windowsMigration, /\$R1 == "0\.7\.0"/);
+  assert.match(windowsMigration, /\$LOCALAPPDATA\\Baldojnyi Downloader/);
+  assert.match(windowsMigration, /yt-dlp-desktop\.exe/);
+  assert.match(windowsMigration, /Software\\ytdlp\\Baldojnyi Downloader/);
+  assert.doesNotMatch(windowsMigration, /Software\\yt-dlp Desktop contributors\\Baldojnyi Downloader/);
+  assert.match(windowsMigration, /\/UPDATE \/P/);
+  assert.doesNotMatch(windowsMigration, /RMDir\s+\/r/i);
+  assert.doesNotMatch(windowsMigration, /(?:APPDATA|LOCALAPPDATA).*app\.ytdlp\.desktop/i);
+  assert.match(macBuild, /yt-dlp BD\.app/);
   assert.match(macBuild, /git status --porcelain\)/);
   assert.doesNotMatch(macBuild, /--untracked-files=no/);
-  assert.match(releaseGenerator, /Baldojnyi Downloader\.app\.tar\.gz/);
+  assert.match(releaseGenerator, /yt-dlp BD\.app\.tar\.gz/);
 });
 
 test("grants repository write access only to the final draft-release job", async () => {

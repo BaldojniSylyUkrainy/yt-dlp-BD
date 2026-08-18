@@ -92,9 +92,9 @@ async function prepareMacAssets({ releaseDir, releaseVersion, updaterVersion }) 
     "release",
     "bundle",
   );
-  const updaterSource = path.join(bundleDir, "macos", "Baldojnyi Downloader.app.tar.gz");
+  const updaterSource = path.join(bundleDir, "macos", "yt-dlp BD.app.tar.gz");
   const signatureSource = `${updaterSource}.sig`;
-  const dmgSource = path.join(bundleDir, "dmg", `Baldojnyi Downloader_${updaterVersion}_aarch64.dmg`);
+  const dmgSource = path.join(bundleDir, "dmg", `yt-dlp BD_${updaterVersion}_aarch64.dmg`);
   const expected = expectedAssetNames(releaseVersion);
 
   await mkdir(releaseDir, { recursive: true });
