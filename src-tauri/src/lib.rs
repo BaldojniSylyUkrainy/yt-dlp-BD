@@ -26,7 +26,10 @@ use std::os::unix::process::CommandExt;
 
 const RUNTIME_MANIFEST_URL: &str = "https://github.com/BaldojniSylyUkrainy/yt-dlp-BD/releases/latest/download/runtime-components.json";
 const RUNTIME_MANIFEST_SIGNATURE_URL: &str = "https://github.com/BaldojniSylyUkrainy/yt-dlp-BD/releases/latest/download/runtime-components.json.sig";
+const YT_DLP_NIGHTLY_RELEASE_API: &str =
+    "https://api.github.com/repos/yt-dlp/yt-dlp-nightly-builds/releases/latest";
 const MAX_RUNTIME_METADATA_BYTES: usize = 1024 * 1024;
+const MAX_YT_DLP_BINARY_BYTES: u64 = 64 * 1024 * 1024;
 const TAURI_CONFIG_SOURCE: &str = include_str!("../tauri.conf.json");
 const MIN_FREE_SPACE_RESERVE: u64 = 500 * 1024 * 1024;
 const DISK_GUARD_TRIGGER: u64 = MIN_FREE_SPACE_RESERVE + 128 * 1024 * 1024;
@@ -110,6 +113,20 @@ struct RuntimeManifest {
     release_version: String,
     generated_at: String,
     platforms: HashMap<String, RuntimePlatformManifest>,
+}
+
+#[derive(Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    assets: Vec<GithubReleaseAsset>,
+}
+
+#[derive(Clone, Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+    digest: Option<String>,
+    size: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -517,6 +534,106 @@ fn command_version(path: &Path, args: &[&str]) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+fn parsed_yt_dlp_version(value: &str) -> Option<Vec<u64>> {
+    let parts = value
+        .trim()
+        .split('.')
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    (parts.len() == 3 || parts.len() == 4).then_some(parts)
+}
+
+fn github_asset_sha256(asset: &GithubReleaseAsset) -> Result<String, String> {
+    let digest = asset
+        .digest
+        .as_deref()
+        .and_then(|value| value.strip_prefix("sha256:"))
+        .ok_or_else(|| format!("GitHub не надав SHA-256 для {}", asset.name))?;
+    if digest.len() != 64 || !digest.chars().all(|value| value.is_ascii_hexdigit()) {
+        return Err(format!(
+            "GitHub надав неправильний SHA-256 для {}",
+            asset.name
+        ));
+    }
+    Ok(digest.to_ascii_lowercase())
+}
+
+fn validate_nightly_asset_url(asset: &GithubReleaseAsset, tag: &str) -> Result<(), String> {
+    let url = Url::parse(&asset.browser_download_url)
+        .map_err(|_| format!("Nightly містить неправильний URL для {}", asset.name))?;
+    let expected_path = format!(
+        "/yt-dlp/yt-dlp-nightly-builds/releases/download/{tag}/{}",
+        asset.name
+    );
+    if url.scheme() != "https"
+        || url.host_str() != Some("github.com")
+        || url.path() != expected_path
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(format!(
+            "Nightly містить небезпечний URL для {}",
+            asset.name
+        ));
+    }
+    Ok(())
+}
+
+fn select_nightly_asset(release: &GithubRelease, name: &str) -> Result<GithubReleaseAsset, String> {
+    if parsed_yt_dlp_version(&release.tag_name)
+        .filter(|parts| parts.len() == 4)
+        .is_none()
+    {
+        return Err("Офіційний nightly має неправильну версію".into());
+    }
+    let mut matches = release.assets.iter().filter(|asset| asset.name == name);
+    let asset = matches
+        .next()
+        .cloned()
+        .ok_or_else(|| format!("Офіційний nightly не містить {name}"))?;
+    if matches.next().is_some() {
+        return Err(format!("Офіційний nightly містить кілька {name}"));
+    }
+    validate_nightly_asset_url(&asset, &release.tag_name)?;
+    github_asset_sha256(&asset)?;
+    Ok(asset)
+}
+
+fn nightly_checksum_for_asset(checksum_file: &[u8], asset_name: &str) -> Result<String, String> {
+    let checksums = std::str::from_utf8(checksum_file)
+        .map_err(|_| "Офіційний файл SHA-256 має неправильний формат".to_string())?;
+    let matches = checksums
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            Some((parts.next()?, parts.next()?))
+        })
+        .filter_map(|(hash, filename)| {
+            let normalized = filename.trim_start_matches('*').trim_start_matches("./");
+            (normalized == asset_name
+                && hash.len() == 64
+                && hash.chars().all(|value| value.is_ascii_hexdigit()))
+            .then(|| hash.to_ascii_lowercase())
+        })
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(format!(
+            "Офіційний файл SHA-256 містить неправильний запис для {asset_name}"
+        ));
+    }
+    Ok(matches[0].clone())
+}
+
+fn yt_dlp_nightly_temporary_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let filename = if cfg!(target_os = "windows") {
+        ".yt-dlp-nightly-download.exe"
+    } else {
+        ".yt-dlp-nightly-download"
+    };
+    Ok(runtime_dir(app)?.join(filename))
+}
+
 fn find_ffmpeg(app: &AppHandle) -> Result<ComponentStatus, String> {
     let directory = runtime_dir(app)?;
     let managed_path = directory.join(if cfg!(target_os = "windows") {
@@ -730,6 +847,9 @@ fn validate_runtime_asset(asset: &RuntimeAssetManifest, label: &str) -> Result<(
             url.path().starts_with("/yt-dlp/yt-dlp/releases/download/")
                 || url
                     .path()
+                    .starts_with("/yt-dlp/yt-dlp-nightly-builds/releases/download/")
+                || url
+                    .path()
                     .starts_with("/yt-dlp/FFmpeg-Builds/releases/download/")
                 || url.path().starts_with("/denoland/deno/releases/download/")
                 || url
@@ -743,6 +863,20 @@ fn validate_runtime_asset(asset: &RuntimeAssetManifest, label: &str) -> Result<(
         return Err(format!(
             "Runtime manifest вказує неочікуване джерело для {label}"
         ));
+    }
+    Ok(())
+}
+
+fn require_yt_dlp_asset_source(asset: &RuntimeAssetManifest) -> Result<(), String> {
+    let url = Url::parse(&asset.url)
+        .map_err(|_| "Runtime manifest містить неправильний URL для yt-dlp".to_string())?;
+    let allowed = url.host_str() == Some("github.com")
+        && (url.path().starts_with("/yt-dlp/yt-dlp/releases/download/")
+            || url
+                .path()
+                .starts_with("/yt-dlp/yt-dlp-nightly-builds/releases/download/"));
+    if !allowed {
+        return Err("Runtime manifest вказує неправильне джерело для yt-dlp".into());
     }
     Ok(())
 }
@@ -765,12 +899,7 @@ fn require_runtime_asset_source(
 
 fn validate_runtime_platform_manifest(manifest: &RuntimePlatformManifest) -> Result<(), String> {
     validate_runtime_asset(&manifest.yt_dlp, "yt-dlp")?;
-    require_runtime_asset_source(
-        &manifest.yt_dlp,
-        "github.com",
-        "/yt-dlp/yt-dlp/releases/download/",
-        "yt-dlp",
-    )?;
+    require_yt_dlp_asset_source(&manifest.yt_dlp)?;
     validate_runtime_asset(&manifest.deno, "Deno")?;
     require_runtime_asset_source(
         &manifest.deno,
@@ -1400,6 +1529,7 @@ async fn install_ytdlp_inner(
         .unwrap_or(false);
     if current {
         let _ = fs::write(version_stamp, &asset.version);
+        let _ = fs::write(runtime_dir(&app)?.join(".yt-dlp.sha256"), &asset.sha256);
         return Ok(());
     }
 
@@ -1424,7 +1554,108 @@ async fn install_ytdlp_inner(
 
     replace_runtime_file(&temporary, &destination, "yt-dlp")?;
     let _ = fs::write(version_stamp, &asset.version);
+    let _ = fs::write(runtime_dir(&app)?.join(".yt-dlp.sha256"), &asset.sha256);
 
+    Ok(())
+}
+
+async fn update_ytdlp_to_latest_nightly(app: &AppHandle) -> Result<(), String> {
+    let client = download_client()?;
+    let (release_bytes, final_url) = tokio::time::timeout(
+        Duration::from_secs(8),
+        fetch_bytes_with_final_url(&client, YT_DLP_NIGHTLY_RELEASE_API),
+    )
+    .await
+    .map_err(|_| "Перевірка yt-dlp nightly тривала надто довго".to_string())??;
+    if final_url.as_str() != YT_DLP_NIGHTLY_RELEASE_API {
+        return Err("GitHub перенаправив перевірку nightly на неочікувану адресу".into());
+    }
+    let release: GithubRelease = serde_json::from_slice(&release_bytes)
+        .map_err(|_| "GitHub повернув неправильний опис nightly".to_string())?;
+    let binary_name = if cfg!(target_os = "windows") {
+        "yt-dlp.exe"
+    } else {
+        "yt-dlp_macos"
+    };
+    let binary_asset = select_nightly_asset(&release, binary_name)?;
+    if binary_asset.size == 0 || binary_asset.size > MAX_YT_DLP_BINARY_BYTES {
+        return Err("Офіційний nightly має неочікуваний розмір".into());
+    }
+    let checksum_asset = select_nightly_asset(&release, "SHA2-256SUMS")?;
+    if checksum_asset.size == 0 || checksum_asset.size > MAX_RUNTIME_METADATA_BYTES as u64 {
+        return Err("Офіційний файл SHA-256 має неочікуваний розмір".into());
+    }
+    let checksum_bytes = tokio::time::timeout(
+        Duration::from_secs(8),
+        fetch_bytes(&client, &checksum_asset.browser_download_url),
+    )
+    .await
+    .map_err(|_| "Перевірка SHA-256 yt-dlp тривала надто довго".to_string())??;
+    if checksum_bytes.len() as u64 != checksum_asset.size {
+        return Err("Офіційний файл SHA-256 завантажився не повністю".into());
+    }
+    let checksum_digest = format!("{:x}", Sha256::digest(&checksum_bytes));
+    if checksum_digest != github_asset_sha256(&checksum_asset)? {
+        return Err("GitHub SHA-256 для офіційного списку сум не збігається".into());
+    }
+    let expected = nightly_checksum_for_asset(&checksum_bytes, binary_name)?;
+    if expected != github_asset_sha256(&binary_asset)? {
+        return Err("Офіційні SHA-256 nightly не узгоджені між собою".into());
+    }
+
+    let destination = yt_dlp_path(app)?;
+    let hash_stamp = runtime_dir(app)?.join(".yt-dlp.sha256");
+    let installed_version = command_version(&destination, &["--version"]);
+    let installed_hash = sha256_file(&destination).ok();
+    if installed_version.as_deref() == Some(release.tag_name.as_str())
+        && installed_hash.as_deref() == Some(expected.as_str())
+    {
+        let _ = fs::write(hash_stamp, &expected);
+        let _ = fs::write(runtime_dir(app)?.join(".yt-dlp.version"), &release.tag_name);
+        return Ok(());
+    }
+    let temporary = yt_dlp_nightly_temporary_path(app)?;
+    let _ = fs::remove_file(&temporary);
+    if let Err(error) = fetch_to_file(
+        app,
+        &client,
+        &binary_asset.browser_download_url,
+        &temporary,
+        "ytDlp",
+    )
+    .await
+    {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = verify_sha256_file_expected(&temporary, &expected, "yt-dlp nightly") {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if fs::metadata(&temporary)
+        .map(|metadata| metadata.len())
+        .unwrap_or_default()
+        != binary_asset.size
+    {
+        let _ = fs::remove_file(&temporary);
+        return Err("yt-dlp nightly завантажився не повністю".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755))
+            .map_err(|error| format!("Не вдалося дозволити запуск yt-dlp nightly: {error}"))?;
+    }
+    let downloaded_version = command_version(&temporary, &["--version"]);
+    if downloaded_version.as_deref() != Some(release.tag_name.as_str()) {
+        let _ = fs::remove_file(&temporary);
+        return Err("Завантажений yt-dlp nightly повідомив неочікувану версію".into());
+    }
+    replace_runtime_file(&temporary, &destination, "yt-dlp nightly")?;
+    fs::write(runtime_dir(app)?.join(".yt-dlp.version"), &release.tag_name)
+        .map_err(|error| format!("Не вдалося зберегти версію yt-dlp: {error}"))?;
+    fs::write(hash_stamp, expected)
+        .map_err(|error| format!("Не вдалося зберегти SHA-256 yt-dlp: {error}"))?;
     Ok(())
 }
 
@@ -1448,10 +1679,14 @@ async fn update_ytdlp(
 ) -> Result<(), String> {
     let _operation = maintenance.operation.lock().await;
     ensure_runtime_idle(manager.inner())?;
-    let result = match runtime_platform_manifest(&app, maintenance.inner()).await {
-        Ok(manifest) => install_ytdlp_inner(app, &manifest).await,
-        Err(error) => Err(error),
-    };
+    let result = async {
+        if command_version(&yt_dlp_path(&app)?, &["--version"]).is_none() {
+            let manifest = runtime_platform_manifest(&app, maintenance.inner()).await?;
+            install_ytdlp_inner(app.clone(), &manifest).await?;
+        }
+        update_ytdlp_to_latest_nightly(&app).await
+    }
+    .await;
     if let Err(error) = &result {
         eprintln!("Не вдалося оновити yt-dlp: {error}");
     }
@@ -4959,6 +5194,78 @@ mod tests {
         assert_eq!(release_version_from_download_url(&malformed), None);
         assert_eq!(release_version_from_download_url(&missing_file), None);
         assert_eq!(release_version_from_download_url(&non_github), None);
+    }
+
+    #[test]
+    fn accepts_only_official_stable_or_nightly_yt_dlp_runtime_assets() {
+        let asset = |url: &str| RuntimeAssetManifest {
+            version: "2026.08.17.073947".into(),
+            url: url.into(),
+            sha256: "a".repeat(64),
+        };
+        assert!(require_yt_dlp_asset_source(&asset(
+            "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.17/yt-dlp_macos"
+        ))
+        .is_ok());
+        assert!(require_yt_dlp_asset_source(&asset(
+            "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/download/2026.08.17.073947/yt-dlp_macos"
+        ))
+        .is_ok());
+        assert!(require_yt_dlp_asset_source(&asset(
+            "https://github.com/example/yt-dlp-nightly-builds/releases/download/2026.08.17/yt-dlp_macos"
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn nightly_updater_accepts_only_exact_official_release_assets() {
+        let release = GithubRelease {
+            tag_name: "2026.08.17.073947".into(),
+            assets: vec![GithubReleaseAsset {
+                name: "yt-dlp_macos".into(),
+                browser_download_url: "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/download/2026.08.17.073947/yt-dlp_macos".into(),
+                digest: Some(format!("sha256:{}", "a".repeat(64))),
+                size: 10_000_000,
+            }],
+        };
+        assert!(select_nightly_asset(&release, "yt-dlp_macos").is_ok());
+
+        let mut wrong_host = release;
+        wrong_host.assets[0].browser_download_url = "https://example.com/yt-dlp_macos".into();
+        assert!(select_nightly_asset(&wrong_host, "yt-dlp_macos").is_err());
+    }
+
+    #[test]
+    fn nightly_updater_requires_one_strict_matching_sha256() {
+        let expected = "a".repeat(64);
+        let checksums = format!(
+            "{}  yt-dlp_macos\n{}  yt-dlp.exe\n",
+            expected,
+            "b".repeat(64)
+        );
+        assert_eq!(
+            nightly_checksum_for_asset(checksums.as_bytes(), "yt-dlp_macos").unwrap(),
+            expected
+        );
+        assert!(nightly_checksum_for_asset(checksums.as_bytes(), "missing").is_err());
+        let duplicate = format!(
+            "{}  yt-dlp_macos\n{}  yt-dlp_macos\n",
+            "a".repeat(64),
+            "b".repeat(64)
+        );
+        assert!(nightly_checksum_for_asset(duplicate.as_bytes(), "yt-dlp_macos").is_err());
+    }
+
+    #[test]
+    fn nightly_versions_are_numeric_and_comparable() {
+        assert_eq!(
+            parsed_yt_dlp_version("2026.08.17.073947"),
+            Some(vec![2026, 8, 17, 73947])
+        );
+        assert!(parsed_yt_dlp_version("nightly").is_none());
+        assert!(
+            parsed_yt_dlp_version("2026.08.18.000001") > parsed_yt_dlp_version("2026.08.17.235959")
+        );
     }
 
     #[test]

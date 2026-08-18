@@ -157,7 +157,7 @@ export function preflightConfidenceLabel(confidence: PreflightResult["confidence
 }
 
 export function runtimeInstallCommand(stage: Exclude<RuntimeStage, null>): string {
-  if (stage === "ytDlp") return "install_ytdlp";
+  if (stage === "ytDlp") return "update_ytdlp";
   if (stage === "ffmpeg") return "install_ffmpeg";
   return "install_deno";
 }
@@ -924,7 +924,7 @@ function App() {
   const refreshManagedComponents = useCallback(async () => {
     const now = Date.now();
     const schedules = [
-      { command: "update_ytdlp", stage: "ytDlp" as const, key: "runtimeUpdate.ytDlp", interval: 24 * 60 * 60 * 1000 },
+      { command: "update_ytdlp", stage: "ytDlp" as const, key: "runtimeUpdate.ytDlpNightly.v1", interval: 24 * 60 * 60 * 1000 },
       { command: "install_ffmpeg", stage: "ffmpeg" as const, key: "runtimeUpdate.ffmpeg", interval: 7 * 24 * 60 * 60 * 1000 },
       { command: "install_deno", stage: "deno" as const, key: "runtimeUpdate.deno", interval: 7 * 24 * 60 * 60 * 1000 },
     ];

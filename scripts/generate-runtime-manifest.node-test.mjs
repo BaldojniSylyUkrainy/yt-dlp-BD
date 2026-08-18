@@ -7,9 +7,17 @@ import {
   runtimeAssetNames,
   singleChecksum,
   validateRuntimeManifest,
+  YT_DLP_RELEASE_SOURCE,
 } from "./generate-runtime-manifest.mjs";
 
 const hash = "a".repeat(64);
+
+test("uses yt-dlp's officially recommended nightly channel", () => {
+  assert.deepEqual(YT_DLP_RELEASE_SOURCE, {
+    owner: "yt-dlp",
+    repository: "yt-dlp-nightly-builds",
+  });
+});
 
 test("uses a stable versioned name for the redistributed Windows FFmpeg runtime", () => {
   assert.deepEqual(runtimeAssetNames("0.6.1.0"), {

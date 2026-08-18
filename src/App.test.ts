@@ -307,7 +307,7 @@ describe("preflight and retry guards", () => {
   });
 
   it("maps every runtime retry to its own backend command", () => {
-    expect(runtimeInstallCommand("ytDlp")).toBe("install_ytdlp");
+    expect(runtimeInstallCommand("ytDlp")).toBe("update_ytdlp");
     expect(runtimeInstallCommand("ffmpeg")).toBe("install_ffmpeg");
     expect(runtimeInstallCommand("deno")).toBe("install_deno");
   });
