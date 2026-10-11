@@ -80,7 +80,7 @@ test("removes Apple signing files before any external upload action", async () =
 
 test("uses Node 24 artifact actions in both platform release jobs", async () => {
   const workflow = await readFile(".github/workflows/release.yml", "utf8");
-  assert.equal(workflow.match(/actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a/g)?.length, 3);
+  assert.equal(workflow.match(/actions\/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9/g)?.length, 3);
   assert.equal(workflow.match(/actions\/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131/g)?.length, 1);
   assert.doesNotMatch(workflow, /actions\/(?:upload|download)-artifact@v4/);
 });
