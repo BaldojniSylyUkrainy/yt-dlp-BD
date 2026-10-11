@@ -1,5 +1,19 @@
 # Published release notes archive
 
+## 0.7.1.0
+
+## Виправлено оновлення Windows
+
+- Windows-інсталяція знову використовує незмінну системну назву `yt-dlp BD`. Завдяки цьому автоматичний updater знаходить уже встановлену версію, замінює її в тому самому каталозі й не створює поруч другий застосунок.
+- Після оновлення старий ярлик більше не запускає попередню версію `0.5.1.4` і не показує пропозицію встановити те саме оновлення повторно.
+- Якщо `0.7.0.0` уже встигла створити окрему інсталяцію `Baldojnyi Downloader`, інсталятор автоматично та одноразово переносить саме цю версію до постійної identity, прибирає її застарілі запис і ярлики та не видаляє спільні дані користувача. Вручну нічого видаляти не потрібно.
+- Видима назва у вікні застосунку та назви публічних release-файлів залишаються `Baldojnyi Downloader` / `BaldojnyiDownloader`.
+
+## Сумісність macOS
+
+- macOS app bundle також повернув стабільну системну назву `yt-dlp BD.app`, щоб майбутні оновлення не залежали від перейменування встановленого пакета.
+- Підпис, нотаризація, updater-архів і публічні назви DMG/Setup перевіряються тим самим release-процесом.
+
 This file preserves the exact user-facing bullets of published releases. Before
 preparing the next release, append the just-published `RELEASE_NOTES.md` here.
 The release test rejects exact bullet reuse so a maintenance change is not

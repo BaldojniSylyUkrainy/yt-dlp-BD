@@ -5,7 +5,7 @@ on:
     inputs:
       tag:
         description: "Four-part release tag from package.json, for example vX.Y.Z.H"
-        default: "v0.7.1.0"
+        default: "v0.8.0.0"
         required: true
         type: string
 
@@ -304,7 +304,10 @@ jobs:
               exit 1
             }
           else
+            node scripts/release-target.mjs
             gh release create "$TAG" --draft --target "$GITHUB_SHA" --title "BaldojnyiDownloader $RELEASE_VERSION" --notes-file RELEASE_NOTES.md
           fi
-          gh release edit "$TAG" --title "BaldojnyiDownloader $RELEASE_VERSION" --notes-file RELEASE_NOTES.md
+          node scripts/release-target.mjs
+          gh release edit "$TAG" --target "$GITHUB_SHA" --title "BaldojnyiDownloader $RELEASE_VERSION" --notes-file RELEASE_NOTES.md
+          node scripts/release-target.mjs
           gh release upload "$TAG" release-assets/* --clobber
