@@ -18,6 +18,10 @@ release/
 /runtime-components.json
 /runtime-components.json.sig
 
+# Python extractor fixture caches are generated, never source artifacts
+__pycache__/
+*.pyc
+
 # Signing credentials and private keys must never be committed
 *.p12
 *.pfx

@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useRef, useState, type ClipboardEvent, type ReactNode } from "react";
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { useCallback, useEffect, useRef, useState, type ClipboardEvent } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { HistoryThumbnail } from "./HistoryThumbnail";
 import { listen } from "@tauri-apps/api/event";
 import { downloadDir } from "@tauri-apps/api/path";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -11,6 +12,9 @@ import loadingHandOne from "./assets/logo-call-me-hand-frame-1.png";
 import loadingHandTwo from "./assets/logo-call-me-hand-frame-2.png";
 import loadingHandThree from "./assets/logo-call-me-hand-frame-3.png";
 import packageMetadata from "../package.json";
+import { maintenanceDue, maintenanceRetryAt, friendlyMaintenanceError } from "./maintenance";
+import { DialogSurface } from "./DialogSurface";
+import { canOfferBrowserDiscovery, DownloadTools, HistoryDetails, MediaCandidatePicker, RecoveryNotice } from "./MediaTools";
 import {
   canEditQueueItem,
   commitQueueInput,
@@ -86,10 +90,22 @@ export type DownloadEvent = {
 type DownloadOutput = {
   path: string;
   size: number;
+  sourceUrl?: string | null;
+  title?: string | null;
+  thumbnail?: string | null;
+  uploader?: string | null;
+  extractor?: string | null;
 };
+
+export function isBlockingQueueFailure(kind: string, code?: string | null): boolean {
+  return kind === "auth_required" || ["low_disk", "rate_limited", "selection_required", "auth_required", "destination_unavailable"].includes(code || "");
+}
 
 export type HistoryEntry = {
   id: string;
+  outcome?: "failed" | "cancelled" | "auth_required";
+  message?: string;
+  diagnostics?: string;
   sourceUrl: string;
   title: string;
   thumbnail: string | null;
@@ -178,6 +194,7 @@ export function defaultCookieBrowser(platform: string, stored: string | null): s
 }
 
 export type Job = {
+  errorCode?: string | null;
   id: string;
   url: string;
   title: string;
@@ -268,6 +285,7 @@ export function applyDownloadEvent(current: Job, payload: DownloadEvent): Job | 
   return {
     ...current,
     status: payload.kind,
+    errorCode: payload.errorCode,
     percent: payload.kind === "completed" ? 100 : current.percent,
     message: payload.kind === "auth_required" ? "Потрібен вхід через браузер" : payload.message || current.message,
   };
@@ -313,58 +331,6 @@ function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
     chevron: <path d="m9 18 6-6-6-6"/>,
   };
   return <svg aria-hidden="true" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
-}
-
-function DialogSurface({ className, labelledBy, describedBy, onEscape, children }: {
-  className: string;
-  labelledBy: string;
-  describedBy?: string;
-  onEscape?: () => void;
-  children: ReactNode;
-}) {
-  const dialogRef = useRef<HTMLDivElement>(null);
-  const escapeRef = useRef(onEscape);
-  escapeRef.current = onEscape;
-
-  useEffect(() => {
-    const dialog = dialogRef.current;
-    if (!dialog) return;
-    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    const focusableSelector = "button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex='-1'])";
-    const focusable = () => Array.from(dialog.querySelectorAll<HTMLElement>(focusableSelector));
-    const frame = window.requestAnimationFrame(() => (focusable()[0] || dialog).focus());
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && escapeRef.current) {
-        event.preventDefault();
-        escapeRef.current();
-        return;
-      }
-      if (event.key !== "Tab") return;
-      const controls = focusable();
-      if (!controls.length) {
-        event.preventDefault();
-        dialog.focus();
-        return;
-      }
-      const first = controls[0];
-      const last = controls[controls.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-    dialog.addEventListener("keydown", handleKeyDown);
-    return () => {
-      window.cancelAnimationFrame(frame);
-      dialog.removeEventListener("keydown", handleKeyDown);
-      previous?.focus();
-    };
-  }, []);
-
-  return <div ref={dialogRef} className={className} role="dialog" aria-modal="true" aria-labelledby={labelledBy} aria-describedby={describedBy} tabIndex={-1}>{children}</div>;
 }
 
 function hostFromInput(value: string): string | null {
@@ -520,11 +486,12 @@ function normalizeHistoryEntry(value: unknown): HistoryEntry | null {
   if (!value || typeof value !== "object") return null;
   const entry = value as Record<string, unknown>;
   const id = nonEmptyString(entry.id);
-  const path = nonEmptyString(entry.path);
+  const outcome = ["failed", "cancelled", "auth_required"].includes(String(entry.outcome)) ? entry.outcome as HistoryEntry["outcome"] : undefined;
+  const path = nonEmptyString(entry.path) || (outcome ? "" : null);
   const title = nonEmptyString(entry.title);
   const sourceUrl = nonEmptyString(entry.sourceUrl);
   const downloadedAt = nonEmptyString(entry.downloadedAt);
-  if (!id || !path || !title || !sourceUrl || !downloadedAt || !Number.isFinite(Date.parse(downloadedAt))) {
+  if (!id || path === null || !title || !sourceUrl || !downloadedAt || !Number.isFinite(Date.parse(downloadedAt))) {
     return null;
   }
   const normalizedSourceUrl = normalizeInputUrl(sourceUrl);
@@ -534,6 +501,8 @@ function normalizeHistoryEntry(value: unknown): HistoryEntry | null {
     : 0;
   return {
     id,
+    outcome,
+    message: nonEmptyString(entry.message)?.slice(0, 1000) || undefined,
     sourceUrl: normalizedSourceUrl,
     title,
     thumbnail: nonEmptyString(entry.thumbnail),
@@ -543,19 +512,28 @@ function normalizeHistoryEntry(value: unknown): HistoryEntry | null {
     size,
     downloadedAt,
     path,
-    available: typeof entry.available === "boolean" ? entry.available : true,
+    available: Boolean(path) && (typeof entry.available === "boolean" ? entry.available : true),
     settings: normalizeHistorySettings(entry.settings, path),
+    ...(typeof entry.diagnostics === "string" ? { diagnostics: entry.diagnostics.slice(0, 4000) } : {}),
   };
+}
+
+export function limitHistoryDiagnostics(entries: HistoryEntry[]): HistoryEntry[] {
+  return entries.map((entry, index) => {
+    if (index < 20 || !entry.diagnostics) return entry;
+    const { diagnostics: _diagnostics, ...rest } = entry;
+    return rest;
+  });
 }
 
 export function parseHistoryStorage(raw: string | null): HistoryEntry[] {
   try {
     const parsed: unknown = JSON.parse(raw || "[]");
     if (!Array.isArray(parsed)) return [];
-    return parsed.flatMap((entry) => {
+    return limitHistoryDiagnostics(parsed.flatMap((entry) => {
       const normalized = normalizeHistoryEntry(entry);
       return normalized ? [normalized] : [];
-    }).slice(0, HISTORY_LIMIT);
+    }).slice(0, HISTORY_LIMIT));
   } catch {
     return [];
   }
@@ -570,7 +548,7 @@ function loadHistory(): HistoryEntry[] {
 }
 
 export function historyPaths(entries: HistoryEntry[]): string[] {
-  return Array.from(new Set(entries.map((entry) => entry.path)));
+  return Array.from(new Set(entries.map((entry) => entry.path).filter(Boolean)));
 }
 
 export function applyHistoryFileStatuses(entries: HistoryEntry[], statuses: HistoryFileStatus[]): HistoryEntry[] {
@@ -634,12 +612,17 @@ function youtubeThumbnailFromInput(value: string): string | null {
 
 function App() {
   const maintenanceStarted = useRef(false);
+  const maintenanceChecking = useRef(false);
+  const appMounted = useRef(true);
+  const maintenanceFollowUp = useRef<number | null>(null);
+  const startupFade = useRef<number | null>(null);
   const approvedVpnUrls = useRef(new Set<string>());
   const cancelledDownloadRestore = useRef<{ url: string; playlist: boolean } | null>(null);
   const mainContentRef = useRef<HTMLElement>(null);
   const jobTitleTextRef = useRef<HTMLDivElement>(null);
   const pendingDownloadEvents = useRef(new Map<string, DownloadEvent[]>());
   const historyContexts = useRef(new Map<string, HistoryContext>());
+  const discoverySelections = useRef(new Map<string, { sessionId: string; pageUrl: string }>());
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [runtimeBusy, setRuntimeBusy] = useState(false);
   const [runtimeStage, setRuntimeStage] = useState<RuntimeStage>(null);
@@ -653,6 +636,7 @@ function App() {
   const historyEntriesRef = useRef(historyEntries);
   const [historyHydrated, setHistoryHydrated] = useState(false);
   const [historyRetryPending, setHistoryRetryPending] = useState<string | null>(null);
+  const historyPreparationInFlight = useRef(false);
   const [outputDir, setOutputDir] = useState("");
   const [outputFreeSpace, setOutputFreeSpace] = useState<number | null>(null);
   const [mode, setMode] = useState<"video" | "audio">("video");
@@ -701,6 +685,8 @@ function App() {
   const queueProcessActive = queueHasActiveProcess(downloadQueue);
   const queueBusy = queuePreventsOtherWork(downloadQueue);
   const anyProcessActive = Boolean(active || queueProcessActive);
+  const workBusyRef = useRef(false);
+  workBusyRef.current = anyProcessActive || queueBusy || pendingStart || updateBusy;
   const runtimeReady = Boolean(runtime?.ytDlp.installed && runtime?.ffmpeg.installed && runtime?.deno.installed);
   const isWindows = runtime?.platform === "windows";
   const normalizedInputUrl = normalizeInputUrl(url);
@@ -797,13 +783,26 @@ function App() {
 
   useEffect(() => {
     if (!queueHydrated) return;
-    try {
+    const save = () => { try {
       if (downloadQueue) localStorage.setItem(QUEUE_STORAGE_KEY, JSON.stringify(downloadQueue));
       else localStorage.removeItem(QUEUE_STORAGE_KEY);
     } catch {
       // A queue can continue in memory even when local persistence is unavailable.
-    }
+    } };
+    const timer = window.setTimeout(save, 750);
+    window.addEventListener("pagehide", save);
+    return () => { window.clearTimeout(timer); window.removeEventListener("pagehide", save); };
   }, [downloadQueue, queueHydrated]);
+
+  const queueCheckpoint = downloadQueue ? JSON.stringify([downloadQueue.status, downloadQueue.activeItemId, downloadQueue.settings, downloadQueue.items.map(({ id, status, url }) => [id, status, url])]) : "";
+  useEffect(() => {
+    if (!queueHydrated) return;
+    try {
+      const current = downloadQueueRef.current;
+      if (current) localStorage.setItem(QUEUE_STORAGE_KEY, JSON.stringify(current));
+      else localStorage.removeItem(QUEUE_STORAGE_KEY);
+    } catch { /* Continue safely in memory if storage is full. */ }
+  }, [queueCheckpoint, queueHydrated]);
 
   useEffect(() => {
     if (activeView !== "queue" || downloadQueue) return;
@@ -931,15 +930,16 @@ function App() {
   }, [activeView, historyEntries.length]);
 
   const refreshManagedComponents = useCallback(async () => {
+    if (!appMounted.current || maintenanceChecking.current) return;
     const now = Date.now();
     const schedules = [
       { command: "update_ytdlp", stage: "ytDlp" as const, key: runtimeUpdateKey("ytDlp"), interval: 24 * 60 * 60 * 1000 },
       { command: "install_ffmpeg", stage: "ffmpeg" as const, key: runtimeUpdateKey("ffmpeg"), interval: 7 * 24 * 60 * 60 * 1000 },
       { command: "install_deno", stage: "deno" as const, key: runtimeUpdateKey("deno"), interval: 7 * 24 * 60 * 60 * 1000 },
     ];
-    const due = schedules.filter(({ key, interval }) => now - Number(localStorage.getItem(key) || 0) >= interval);
+    const due = schedules.filter(({ key, interval }) => maintenanceDue(localStorage, key, interval, now));
     if (!due.length) return;
-    setRuntimeBusy(true);
+    maintenanceChecking.current = true;
     setRuntimeError("");
     const issues: string[] = [];
     try {
@@ -947,26 +947,46 @@ function App() {
         setRuntimeStage(component.stage);
         setRuntimeInstallProgress(null);
         try {
-          await invoke<void>(component.command);
+          localStorage.setItem(`${component.key}.attempt`, String(now));
+          const needsUpdate = await invoke<boolean>("runtime_update_available", { component: component.stage });
+          if (needsUpdate) {
+            if (workBusyRef.current) {
+              localStorage.removeItem(`${component.key}.attempt`);
+              continue; // Installation is deferred until the next idle check.
+            }
+            setRuntimeBusy(true);
+            await invoke<void>(component.command);
+            setRuntimeBusy(false);
+          }
           localStorage.setItem(component.key, String(now));
+          localStorage.removeItem(`${component.key}.retryAt`);
           setRuntimeFailures((current) => {
             const next = new Set(current);
             next.delete(component.stage);
             return next;
           });
         } catch (error) {
-          issues.push(String(error));
+          setRuntimeBusy(false);
+          localStorage.setItem(`${component.key}.retryAt`, String(maintenanceRetryAt(error, now)));
+          issues.push(friendlyMaintenanceError(error));
           setRuntimeFailures((current) => new Set(current).add(component.stage));
         }
       }
       setRuntime(await invoke<RuntimeStatus>("runtime_status"));
       setRuntimeError(issues.join(" · "));
     } finally {
+      maintenanceChecking.current = false;
       setRuntimeStage(null);
       setRuntimeInstallProgress(null);
       setRuntimeBusy(false);
     }
   }, []);
+
+  useEffect(() => {
+    if (startupBusy || !runtimeReady) return;
+    const timer = window.setInterval(() => { if (!workBusyRef.current) void refreshManagedComponents(); }, 60_000);
+    return () => window.clearInterval(timer);
+  }, [startupBusy, runtimeReady, refreshManagedComponents]);
 
   const maintainRuntime = useCallback(async () => {
     setStartupBusy(true);
@@ -976,6 +996,7 @@ function App() {
     const issues: string[] = [];
     try {
       const status = await invoke<RuntimeStatus>("runtime_status");
+      if (!appMounted.current) return;
       setRuntime(status);
       setStartupProgress(62);
       const missing = [
@@ -985,7 +1006,7 @@ function App() {
       ].filter(({ installed }) => !installed);
       if (!missing.length) {
         setRuntimeBusy(false);
-        window.setTimeout(() => refreshManagedComponents(), 800);
+        maintenanceFollowUp.current = window.setTimeout(() => { void refreshManagedComponents(); }, 800);
         return;
       }
       setRuntimeBusy(true);
@@ -1015,12 +1036,21 @@ function App() {
       setRuntimeBusy(false);
       setStartupProgress(100);
       setStartupMessage("Готово");
-      window.setTimeout(() => setStartupBusy(false), 320);
+      if (appMounted.current) startupFade.current = window.setTimeout(() => setStartupBusy(false), 320);
     }
   }, [refreshManagedComponents]);
 
   async function retryRuntimeComponent(stage: Exclude<RuntimeStage, null>) {
+    if (maintenanceChecking.current || workBusyRef.current) return;
+    const retryAt = Number(localStorage.getItem(`${runtimeUpdateKey(stage)}.retryAt`) || 0);
+    if (Date.now() < retryAt) {
+      setRuntimeError(`Наступна перевірка можлива після ${new Date(retryAt).toLocaleTimeString("uk-UA")}. Встановлені компоненти залишаються доступними.`);
+      return;
+    }
     const command = runtimeInstallCommand(stage);
+    maintenanceChecking.current = true;
+    const maintenanceKey = runtimeUpdateKey(stage);
+    localStorage.setItem(`${maintenanceKey}.attempt`, String(Date.now()));
     setRuntimeBusy(true);
     setRuntimeStage(stage);
     setRuntimeError("");
@@ -1034,10 +1064,13 @@ function App() {
         return next;
       });
       localStorage.setItem(runtimeUpdateKey(stage), String(Date.now()));
+      localStorage.removeItem(`${maintenanceKey}.retryAt`);
     } catch (error) {
-      setRuntimeError(String(error));
+      localStorage.setItem(`${maintenanceKey}.retryAt`, String(maintenanceRetryAt(error, Date.now())));
+      setRuntimeError(friendlyMaintenanceError(error));
       setRuntimeFailures((current) => new Set(current).add(stage));
     } finally {
+      maintenanceChecking.current = false;
       setRuntimeStage(null);
       setRuntimeBusy(false);
       setRuntimeInstallProgress(null);
@@ -1085,6 +1118,7 @@ function App() {
 
   useEffect(() => {
     let timer = 0;
+    appMounted.current = true;
     const frame = window.requestAnimationFrame(() => {
       timer = window.setTimeout(() => {
         if (maintenanceStarted.current) return;
@@ -1093,8 +1127,11 @@ function App() {
       }, 0);
     });
     return () => {
+      appMounted.current = false;
       window.cancelAnimationFrame(frame);
       window.clearTimeout(timer);
+      if (maintenanceFollowUp.current !== null) window.clearTimeout(maintenanceFollowUp.current);
+      if (startupFade.current !== null) window.clearTimeout(startupFade.current);
     };
   }, [maintainRuntime]);
 
@@ -1227,37 +1264,51 @@ function App() {
           context.extractor = payload.extractor || context.extractor;
         }
       }
-      if (["completed", "failed", "cancelled"].includes(payload.kind) && payload.outputs?.length) {
+      if (["completed", "failed", "cancelled", "auth_required"].includes(payload.kind)) {
         const context = historyContexts.current.get(payload.id);
         if (context) {
           const downloadedAt = new Date().toISOString();
-          const multiple = payload.outputs.length > 1;
-          const additions = payload.outputs.map((output, index): HistoryEntry => ({
+          const outputs = payload.outputs || [];
+          const multiple = outputs.length > 1;
+          const additions = outputs.map((output, index): HistoryEntry => ({
             id: `${payload.id}:${index}`,
-            sourceUrl: context.sourceUrl,
-            title: multiple ? fileTitle(output.path) : context.title,
-            thumbnail: context.thumbnail,
+            sourceUrl: output.sourceUrl || context.sourceUrl,
+            title: output.title || (multiple ? fileTitle(output.path) : context.title),
+            thumbnail: output.thumbnail || (multiple ? null : context.thumbnail),
             cachedThumbnailPath: null,
-            uploader: context.uploader,
-            extractor: context.extractor,
+            uploader: output.uploader || (multiple ? null : context.uploader),
+            extractor: output.extractor || context.extractor,
             size: output.size,
             downloadedAt,
             path: output.path,
             available: true,
-            settings: context.settings,
+            settings: { ...context.settings, playlist: output.sourceUrl ? false : context.settings.playlist },
           }));
-          setHistoryEntries((current) => [
+          if (payload.kind !== "completed") additions.push({
+            id: `${payload.id}:attempt`, sourceUrl: context.sourceUrl, title: context.title,
+            outcome: payload.kind as HistoryEntry["outcome"], message: payload.message || "Спробу перервано",
+            thumbnail: null, cachedThumbnailPath: null, uploader: context.uploader,
+            extractor: context.extractor, size: 0, downloadedAt, path: "", available: false,
+            settings: context.settings,
+          });
+          setHistoryEntries((current) => limitHistoryDiagnostics([
             ...additions,
-            ...current.filter((entry) => !additions.some((addition) => addition.path === entry.path)),
-          ].slice(0, HISTORY_LIMIT));
-          if (shouldCacheHistoryThumbnail(payload.kind, payload.outputs, context.thumbnail)) {
-            const additionIds = new Set(additions.map((entry) => entry.id));
-            void invoke<string>("cache_history_thumbnail", { url: context.thumbnail })
+            ...current.filter((entry) => !additions.some((addition) => addition.id === entry.id || (addition.path && addition.path === entry.path))),
+          ].slice(0, HISTORY_LIMIT)));
+          const additionIds = new Set(additions.map((entry) => entry.id));
+          void invoke<string>("download_diagnostics", { id: payload.id }).then((report) => {
+            if (typeof report !== "string") return;
+            setHistoryEntries((current) => limitHistoryDiagnostics(current.map((entry) => additionIds.has(entry.id)
+              ? { ...entry, diagnostics: report.slice(0, 4000) } : entry)));
+          }).catch(() => undefined);
+          for (const addition of additions.filter((entry) => entry.thumbnail)) {
+            const additionIds = new Set([addition.id]);
+            void invoke<string>("cache_history_thumbnail", { url: addition.thumbnail })
               .then((cachedThumbnailPath) => {
                 setHistoryEntries((current) => {
                   const next = applyHistoryThumbnailCache(current, additionIds, cachedThumbnailPath);
-                  if (next === current && context.thumbnail
-                    && shouldDeleteUnusedHistoryThumbnail(current, context.thumbnail, cachedThumbnailPath)) {
+                  if (next === current && addition.thumbnail
+                    && shouldDeleteUnusedHistoryThumbnail(current, addition.thumbnail, cachedThumbnailPath)) {
                     void invoke("delete_history_thumbnail", { path: cachedThumbnailPath }).catch(() => undefined);
                   }
                   return next;
@@ -1311,10 +1362,10 @@ function App() {
               return { ...item, status, outputs, finalSize: outputs.reduce((sum, output) => sum + output.size, 0), message: status === "skipped" ? "Пропущено" : "Зупинено користувачем", jobId: null };
             }
             if (payload.kind === "failed" || payload.kind === "auth_required") {
-              const blocking = payload.errorCode === "low_disk" || payload.errorCode === "rate_limited" || payload.kind === "auth_required";
+              const blocking = isBlockingQueueFailure(payload.kind, payload.errorCode);
               pauseQueue = blocking;
               const outputs = payload.outputs || [];
-              return { ...item, status: blocking ? "interrupted" as const : "failed" as const, outputs, finalSize: outputs.reduce((sum, output) => sum + output.size, 0), message: payload.message || "Не вдалося завантажити", errorCode: payload.errorCode || (payload.kind === "auth_required" ? "auth_required" : "unknown"), jobId: null };
+              return { ...item, status: blocking ? "interrupted" as const : "failed" as const, outputs, finalSize: outputs.reduce((sum, output) => sum + output.size, 0), message: payload.message || "Не вдалося завантажити", errorCode: payload.errorCode || (payload.kind === "auth_required" ? "auth_required" : "unknown") };
             }
             return item;
           });
@@ -1322,8 +1373,8 @@ function App() {
             const failedItem = items.find((item) => item.id === queueItem.id);
             setQueueMonitorOpen(true);
             setQueueAlert({
-              title: payload.kind === "auth_required" ? "Потрібен вхід" : payload.errorCode === "low_disk" ? "Замало місця" : "Чергу призупинено",
-              message: payload.kind === "auth_required"
+              title: payload.kind === "auth_required" || payload.errorCode === "auth_required" ? "Потрібен вхід" : payload.errorCode === "low_disk" ? "Замало місця" : "Чергу призупинено",
+              message: payload.kind === "auth_required" || payload.errorCode === "auth_required"
                 ? "Увійдіть на сайт у браузері, відкрийте налаштування пакетного завантаження, виберіть цей браузер і продовжте чергу."
                 : failedItem?.message || "Виправте проблему та продовжте чергу.",
             });
@@ -1373,6 +1424,18 @@ function App() {
     } catch (error) {
       setFormError(`Не вдалося відкрити пошту: ${String(error)}`);
     }
+  }
+
+  function recordFailedStart(id: string, message: string) {
+    const context = historyContexts.current.get(id);
+    if (!context) return;
+    const entry: HistoryEntry = { ...context, id: `${id}:attempt`, downloadedAt: new Date().toISOString(), outcome: "failed", message,
+      path: "", size: 0, available: false, cachedThumbnailPath: null };
+    setHistoryEntries((current) => limitHistoryDiagnostics([entry, ...current].slice(0, HISTORY_LIMIT)));
+    void invoke<string>("download_diagnostics", {id}).then((report) => {
+      if (typeof report !== "string") return;
+      setHistoryEntries((current) => limitHistoryDiagnostics(current.map((item) => item.id === entry.id ? {...item, diagnostics: report.slice(0, 4000)} : item)));
+    }).catch(() => undefined);
   }
 
   async function launchDownload(downloadUrl: string, parsedHost: string, preflightResult: PreflightResult, cookiesBrowser?: string, playlist = playlistIntentToMultiItem(playlistIntent)) {
@@ -1428,14 +1491,18 @@ function App() {
           subtitles,
           multiItem: playlist,
           cookiesBrowser: cookiesBrowser || null,
+          discoverySession: discoverySelections.current.get("single")?.pageUrl === normalizedDownloadUrl ? discoverySelections.current.get("single")?.sessionId : null,
           expectedRequiredSpace: preflightResult.requiredSpace,
         },
       });
       setUrl("");
     } catch (error) {
+      recordFailedStart(id, String(error));
       historyContexts.current.delete(id);
       const message = String(error);
       setJob((current) => current?.id === id ? { ...current, status: "failed", message } : current);
+    } finally {
+      discoverySelections.current.delete("single");
     }
   }
 
@@ -1526,8 +1593,9 @@ function App() {
   }
 
   async function retryHistoryDownload(entry: HistoryEntry) {
-    if (active || queueBusy || historyRetryPending) return;
-    setHistoryRetryPending(entry.id);
+    if (active || queueBusy || pendingStart || historyRetryPending || historyPreparationInFlight.current) return;
+    historyPreparationInFlight.current = true;
+    setPendingStart(true);
     setFormError("");
     let destination = entry.settings.outputDir || parentDirectory(entry.path);
     try {
@@ -1538,13 +1606,15 @@ function App() {
         destination = await downloadDir();
       } catch {
         setHistoryRetryPending(null);
+        historyPreparationInFlight.current = false;
+        setPendingStart(false);
         setActiveView("download");
         setFormError("Не вдалося відкрити попередню папку або системну папку Завантаження");
         return;
       }
     }
     setOutputDir(destination);
-    localStorage.setItem("outputDir", destination);
+    try { localStorage.setItem("outputDir", destination); } catch { /* Keep working in memory. */ }
     setMode(entry.settings.mode);
     setQuality(entry.settings.quality);
     setAudioFormat(entry.settings.audioFormat);
@@ -1553,6 +1623,10 @@ function App() {
     cancelledDownloadRestore.current = { url: entry.sourceUrl, playlist: entry.settings.playlist };
     setUrl(entry.sourceUrl);
     setActiveView("download");
+    // Publish the trigger in the same render as the complete restored form.
+    setHistoryRetryPending(entry.id);
+    historyPreparationInFlight.current = false;
+    setPendingStart(false);
   }
 
   function dismissVpnWarning() {
@@ -1596,11 +1670,15 @@ function App() {
     setCancelError("");
     try {
       await invoke("cancel_download", { id: jobId });
-      historyContexts.current.delete(jobId);
+      // The process can still emit completed playlist files in its terminal event.
+      // Retain the context until that event is persisted in History.
       cancelledDownloadRestore.current = { url: cancelledUrl, playlist: cancelledPlaylist };
       setUrl(cancelledUrl);
       setCancelConfirmOpen(false);
-      setJob((current) => current?.id === jobId ? null : current);
+      // Keep the app busy (and awake) until the backend has reaped the child
+      // and persisted the terminal event, including any completed playlist files.
+      setJob((current) => current?.id === jobId && ["starting", "downloading", "postprocessing", "converting"].includes(current.status)
+        ? { ...current, message: "Зупиняємо процес і завершуємо прибирання тимчасових файлів…" } : current);
     } catch (error) {
       setCancelError(String(error));
     } finally {
@@ -1672,7 +1750,7 @@ function App() {
   async function startQueue() {
     if (queueInput.trim()) addQueueText(queueInput);
     const current = downloadQueueRef.current;
-    if (!current?.items.length || active || current.activeItemId || queueLaunchInFlight.current) return;
+    if (!current?.items.length || active || pendingStart || current.activeItemId || queueLaunchInFlight.current) return;
     if (runtimeBusy || !runtimeReady) {
       setQueueNotice("Компоненти ще готуються. Зачекайте кілька секунд.");
       return;
@@ -1866,9 +1944,11 @@ function App() {
         subtitles: queue.settings.subtitles,
         multiItem: queue.settings.multiItem,
         cookiesBrowser: queue.settings.cookiesBrowser,
+        discoverySession: discoverySelections.current.get(item.id)?.pageUrl === normalized ? discoverySelections.current.get(item.id)?.sessionId : null,
         expectedRequiredSpace: null,
       },
     }).catch((error) => {
+      recordFailedStart(jobId, String(error));
       historyContexts.current.delete(jobId);
       const message = String(error);
       const blocking = /вільн(ого|е) місц|folder|папк/i.test(message);
@@ -1885,6 +1965,7 @@ function App() {
         void invoke("request_user_attention").catch(() => undefined);
       }
     }).finally(() => {
+      discoverySelections.current.delete(item.id);
       queueLaunchInFlight.current = false;
     });
   }, [active, downloadQueue, updateQueue]);
@@ -1963,6 +2044,7 @@ function App() {
       </aside>
 
       <main ref={mainContentRef} className={`main-content ${mainScrollable || activeView !== "download" ? "is-scrollable" : "is-fixed"}`}>
+        <RecoveryNotice ready={!startupBusy && !anyProcessActive && !runtimeBusy}/>
         <header className="topbar">
           {activeView === "download"
             ? <div><p className="eyebrow">ІНСТРУМЕНТ / 01</p><h1>Завантажити</h1><p>Відео, аудіо й субтитри з YouTube, Instagram, Twitter — і майже звідусіль, звідки захочете.</p></div>
@@ -2052,7 +2134,7 @@ function App() {
         {activeView === "history" && <HistoryView
           entries={historyEntries}
           retryingId={historyRetryPending}
-          retryDisabled={Boolean(active || queueBusy)}
+          retryDisabled={Boolean(active || queueBusy || pendingStart)}
           onRetry={retryHistoryDownload}
           onClear={() => {
             if (!window.confirm("Очистити історію? Завантажені файли залишаться на диску.")) return;
@@ -2064,6 +2146,20 @@ function App() {
 
       </main>
 
+      <MediaCandidatePicker busy={anyProcessActive || pendingStart || runtimeBusy || startupBusy}
+      isCurrent={(candidate) => job?.id === candidate.jobId || Boolean(downloadQueueRef.current?.items.some((item) => item.jobId === candidate.jobId && ["failed", "interrupted"].includes(item.status)))}
+      onSelected={({ pageUrl, jobId, sessionId }) => {
+        const item = downloadQueueRef.current?.items.find((item) => item.jobId === jobId && ["failed", "interrupted"].includes(item.status));
+        if (item) {
+          discoverySelections.current.set(item.id, { sessionId, pageUrl });
+          updateQueue((queue) => queue ? { ...queue, status: "paused", items: queue.items.map((i) => i.id === item.id ? { ...i, status: "pending", errorCode: null, percent: 0, jobId: null } : i) } : queue);
+          setQueueNotice("Джерело обрано. Натисніть Продовжити, щоб повторити завантаження.");
+          setQueueMonitorOpen(true);
+        } else if (job?.id === jobId) {
+          discoverySelections.current.set("single", { sessionId, pageUrl });
+          setJob(null); setUrl(pageUrl); setHistoryRetryPending("discovery");
+        }
+      }}/>
       {runtimeBusy && !startupBusy && <RuntimePreparationOverlay stage={runtimeStage} runtime={runtime} progress={runtimeInstallProgress} />}
 
       {job && job.status !== "auth_required" && <div className="download-progress-backdrop" role="presentation">
@@ -2078,6 +2174,7 @@ function App() {
           <div className="job-body">
             <div className="job-title"><div ref={jobTitleTextRef}><strong id="download-progress-title">{job.title}</strong><small>{job.status === "completed" ? "Готово" : job.status === "failed" ? job.message || "Помилка завантаження" : job.status === "cancelled" ? "Скасовано" : job.message}</small></div><span style={{ fontSize: `${jobValueFontSize}px` }}>{job.status === "postprocessing" || job.status === "converting" ? job.outputFormat : `${Math.round(job.percent)}%`}</span></div>
             <div className="job-source" title={job.url}><Icon name="link" size={12}/><span>{job.url}</span></div>
+            {!active && job.status === "failed" && <DownloadTools url={job.url} jobId={job.id} canDiscover={canOfferBrowserDiscovery(job.errorCode)}/>}
             {job.storage && <div className={`storage-estimate ${job.storage.sufficient === false ? "warning" : job.storage.sufficient === true ? "ready" : "unknown"}`}>
               {job.storage.sufficient === false ? <Icon name="shield" size={15}/> : <span className="storage-estimate-dot"/>}
               <span>{job.storage.sufficient === false
@@ -2337,6 +2434,7 @@ function QueueProgressModal({ queue, alert, singleDownloadActive, onClose, onPau
             <div className="queue-progress-copy">
               <strong title={item.title || item.url}>{item.title || item.url}</strong>
               <small>{queueStatusLabel(item)}{item.message && item.message !== queueStatusLabel(item) ? ` · ${item.message}` : ""}</small>
+              {!activeItem && ["failed", "interrupted"].includes(item.status) && item.jobId && <DownloadTools url={item.url} jobId={item.jobId} canDiscover={canOfferBrowserDiscovery(item.errorCode)}/>}
               {active && <div className={`queue-item-progress ${item.status === "postprocessing" ? "indeterminate" : ""}`}><span style={item.status === "postprocessing" ? undefined : { width: `${item.percent}%` }}/></div>}
             </div>
             <span className={`queue-progress-status ${item.status}`}>{item.finalSize > 0 ? <>{formatByteSize(item.finalSize)}{item.status !== "completed" && <small>{queueStatusLabel(item)}</small>}</> : ["downloading", "converting"].includes(item.status) ? `${Math.round(item.percent)}%` : queueStatusLabel(item)}</span>
@@ -2349,23 +2447,6 @@ function QueueProgressModal({ queue, alert, singleDownloadActive, onClose, onPau
         {queue.status === "completed" && <>{failedCount > 0 && <button className="secondary-button" onClick={onRetry}>Проблемні ще раз ({failedCount})</button>}<button className="primary-button compact" onClick={onReplay}><Icon name="refresh"/>Повторити чергу</button><button className="queue-new-button" onClick={onNew}>Нова черга</button></>}
       </footer>
     </DialogSurface>
-  </div>;
-}
-
-function HistoryThumbnail({ entry }: { entry: HistoryEntry }) {
-  const cachedSource = entry.cachedThumbnailPath ? convertFileSrc(entry.cachedThumbnailPath) : null;
-  const [source, setSource] = useState(cachedSource || entry.thumbnail);
-
-  useEffect(() => {
-    setSource(cachedSource || entry.thumbnail);
-  }, [cachedSource, entry.thumbnail]);
-
-  return <div className="history-thumb">
-    <span><Icon name="download" size={24}/></span>
-    {source && <img src={source} alt="" onError={() => {
-      if (source === cachedSource && entry.thumbnail) setSource(entry.thumbnail);
-      else setSource(null);
-    }} />}
   </div>;
 }
 
@@ -2433,12 +2514,13 @@ function HistoryView({ entries, retryingId, retryDisabled, onRetry, onClear }: {
             <div className="history-copy">
               <div className="history-title-row"><strong>{entry.title}</strong><time dateTime={entry.downloadedAt}>{new Intl.DateTimeFormat("uk-UA", { hour: "2-digit", minute: "2-digit" }).format(new Date(entry.downloadedAt))}</time></div>
               <p>{[entry.uploader, entry.extractor, formatByteSize(entry.size)].filter(Boolean).join(" · ")}</p>
-              <div className="history-location" title={entry.path}><span className={`history-state-dot ${entry.available ? "ready" : "missing"}`}/><span>{entry.available ? "Файл на місці" : "Файл недоступний"}</span><Icon name="folder" size={14}/><code>{entry.path}</code></div>
+              {entry.path ? <div className="history-location" title={entry.path}><span className={`history-state-dot ${entry.available ? "ready" : "missing"}`}/><span>{entry.available ? "Файл на місці" : "Файл недоступний"}</span><Icon name="folder" size={14}/><code>{entry.path}</code></div> : <p>{entry.outcome === "cancelled" ? "Скасовано" : entry.outcome === "auth_required" ? "Потрібен вхід" : "Не вдалося завантажити"} · {entry.message}</p>}
             </div>
             <div className="history-actions">
               <button type="button" className="history-retry-button" disabled={retryDisabled || retryingId !== null} onClick={() => onRetry(entry)}>{retryingId === entry.id ? "Готуємо…" : "Завантажити ще раз"}</button>
-              <button type="button" disabled={!entry.available} onClick={() => revealItemInDir(entry.path)}>Показати</button>
+              {entry.path && <button type="button" disabled={!entry.available} onClick={() => revealItemInDir(entry.path)}>Показати</button>}
               <button type="button" onClick={() => openUrl(entry.sourceUrl)}>Джерело</button>
+              <HistoryDetails title={entry.title} diagnostics={entry.diagnostics}/>
             </div>
           </article>)}
         </div>

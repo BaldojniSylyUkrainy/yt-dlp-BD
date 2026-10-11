@@ -428,6 +428,7 @@ select:focus { border-color: var(--pink); }
 .job-stage strong { font-family: var(--font-poster); font-size: 54px; font-weight: 900; letter-spacing: -.04em; }
 .job-card.completed .job-icon { background: var(--success); }
 .job-card.failed .job-icon { border-right-color: #9d6b25; color: #1c1004; background: var(--warning); }
+.job-card.failed { max-height: calc(100vh - 60px); overflow-y: auto; }
 .job-body { min-width: 0; padding: 25px 24px; }
 .job-title { display: flex; align-items: stretch; justify-content: space-between; gap: 18px; }
 .job-title > div { min-width: 0; flex: 1; }
@@ -536,3 +537,20 @@ select:focus { border-color: var(--pink); }
   *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
   .progress-track.indeterminate span { width: 65%; animation: none !important; opacity: .75; }
 }
+/* Local recovery and media-discovery tools share the existing quiet palette. */
+.download-tools { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.download-tools button, .utility-dialog button, .recovery-notice button { padding: 10px 14px; background: #292729; color: #f3efed; border: 1px solid #71686e; cursor: pointer; }
+.download-tools button:disabled, .utility-dialog button:disabled { opacity: .55; cursor: wait; }
+.download-tools details, .download-tools small { width: 100%; }
+.discovery-help { width: 100%; padding: 14px; background: #211c20; border-left: 3px solid #ba789b; font-size: 14px; line-height: 1.5; text-transform: none; }
+.discovery-help strong { color: #f3efed; }
+.discovery-help ol { margin: 10px 0; padding-left: 22px; }
+.discovery-help small { color: #c4bfc2; }
+.utility-dialog textarea { width: 100%; min-height: 180px; color: #eee; background: #171617; font: 13px monospace; resize: vertical; }
+.utility-backdrop { position: fixed; inset: 0; background: #000b; z-index: 200; display: grid; place-items: center; padding: 24px; }
+.utility-dialog { width: min(760px, 100%); max-height: 85vh; overflow: auto; background: #151415; border: 1px solid #ba789b; padding: 24px; display: flex; flex-direction: column; gap: 12px; }
+.utility-dialog h2 { margin: 0; }
+.utility-dialog button { text-align: left; overflow-wrap: anywhere; }
+.recovery-notice { background: #201d20; border: 1px solid #71686e; padding: 16px; margin-bottom: 20px; }
+.recovery-notice div { display: flex; gap: 12px; align-items: center; margin-bottom: 10px; }
+.recovery-notice code { overflow-wrap: anywhere; font-size: 12px; }

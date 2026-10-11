@@ -255,6 +255,18 @@ describe("download history grouping", () => {
       playlist: false,
     });
   });
+
+  it("keeps bounded diagnostic snapshots only for the newest twenty history entries", () => {
+    const entries = Array.from({ length: 25 }, (_, index) => ({
+      ...entry(String(index), new Date(2026, 6, 27, 12, 0, 25 - index)),
+      diagnostics: "x".repeat(5000),
+    }));
+    const parsed = parseHistoryStorage(JSON.stringify(entries));
+    expect(parsed).toHaveLength(25);
+    expect(parsed.filter((item) => item.diagnostics)).toHaveLength(20);
+    expect(parsed[0].diagnostics).toHaveLength(4000);
+    expect(parsed[20].diagnostics).toBeUndefined();
+  });
 });
 
 describe("playlist intent detection", () => {
