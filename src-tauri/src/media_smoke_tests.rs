@@ -31,6 +31,48 @@ fn video_hash(ffmpeg: &Path, path: &Path) -> Vec<u8> {
 
 #[test]
 #[ignore = "requires an explicit managed FFmpeg path"]
+fn local_media_cannot_open_embedded_network_sources() {
+    let ffmpeg = PathBuf::from(std::env::var("BALDOJ_TEST_FFMPEG").expect("BALDOJ_TEST_FFMPEG"));
+    let receiver = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    receiver.set_nonblocking(true).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // Local media can contain nested sources. Even a valid playlist must not
+    // make app-managed probes/conversion contact a private endpoint.
+    let input = dir.path().join("nested.m3u8");
+    fs::write(
+        &input,
+        format!(
+            "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\nhttp://{}/segment.ts\n#EXT-X-ENDLIST\n",
+            receiver.local_addr().unwrap()
+        ),
+    )
+    .unwrap();
+    assert!(conversion::probe(&ffmpeg, &input).is_err());
+    assert!(media_info(&ffmpeg, &input).is_err());
+    assert!(media_duration(&ffmpeg, &input).is_err());
+    let output = process_runner::capture(
+        Command::new(&ffmpeg)
+            .args(["-v", "error", "-nostdin"])
+            .args(LOCAL_INPUT_PROTOCOLS)
+            .arg("-i")
+            .arg(&input)
+            .args(["-f", "null", "-"]),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("not on whitelist"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        matches!(receiver.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+}
+
+#[test]
+#[ignore = "requires an explicit managed FFmpeg path"]
 fn remux_preserves_every_decoded_video_pixel_in_cyrillic_path() {
     let ffmpeg = PathBuf::from(std::env::var("BALDOJ_TEST_FFMPEG").expect("BALDOJ_TEST_FFMPEG"));
     let dir = std::env::temp_dir().join(format!(
@@ -98,7 +140,11 @@ fn remux_preserves_every_decoded_video_pixel_in_cyrillic_path() {
         ..ready.clone()
     };
     let error = requires_app_conversion(&corrupt, "mp4", &ffmpeg).unwrap_err();
-    assert!(error.contains("ffprobe") && error.contains("exit status"));
+    // ExitStatus is displayed as "exit code" on Windows, "exit status" on Unix.
+    assert!(
+        error.contains("ffprobe") && error.contains("exit"),
+        "{error}"
+    );
     assert!(!error.contains(&dir.to_string_lossy().to_string()));
     assert_eq!(fs::read(&corrupt_path).unwrap(), b"not an mp4");
     let ten_bit = dir.join("10 bit.mp4");

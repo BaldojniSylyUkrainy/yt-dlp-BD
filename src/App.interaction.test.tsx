@@ -118,7 +118,7 @@ describe("single-download lifecycle", () => {
     const id = await startSingle();
     events.get("download-event")?.({payload: {id, kind: "failed", errorCode: "selection_required"}});
     events.get("media-candidates")?.({payload: {jobId: id, sessionId: "single-session", pageUrl: "https://example.com/video", urls: ["https://cdn.example.com/movie.mp4"]}});
-    fireEvent.click(await screen.findByText(/cdn.example.com/));
+    fireEvent.click(await screen.findByText(/cdn\.example\.com/));
     await waitFor(() => expect(vi.mocked(invoke).mock.calls.filter(([name]) => name === "start_download")).toHaveLength(2));
     const requests = vi.mocked(invoke).mock.calls.filter(([name]) => name === "start_download");
     expect(requests[1][1]).toMatchObject({request: {discoverySession: "single-session"}});
@@ -143,7 +143,7 @@ describe("single-download lifecycle", () => {
     const id = (vi.mocked(invoke).mock.calls.find(([name]) => name === "start_download")?.[1] as {request: {id: string}}).request.id;
     events.get("download-event")?.({payload: {id, kind: "failed", errorCode: "selection_required"}});
     events.get("media-candidates")?.({payload: {jobId: id, sessionId: "queue-session", pageUrl: "https://example.com/video", urls: ["https://cdn.example.com/movie.mp4"]}});
-    fireEvent.click(await screen.findByText(/cdn.example.com/));
+    fireEvent.click(await screen.findByText(/cdn\.example\.com/));
     await waitFor(() => {
       const queue = JSON.parse(localStorage.getItem(QUEUE_STORAGE_KEY) || "{}");
       expect(queue.items[0].status).toBe("completed");

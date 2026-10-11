@@ -181,8 +181,7 @@ async fn handshake(client: &mut TcpStream) -> io::Result<TcpStream> {
     client.write_all(&[5, 0]).await?;
     let mut request = [0; 4];
     client.read_exact(&mut request).await?;
-    // CONNECT only. Never support BIND or UDP ASSOCIATE.
-    if request[0..3] != [5, 1, 0] {
+    if request[0] != 5 || request[2] != 0 {
         return Err(denied());
     }
     let host = match request[3] {
@@ -205,6 +204,12 @@ async fn handshake(client: &mut TcpStream) -> io::Result<TcpStream> {
         _ => return Err(denied()),
     };
     let port = client.read_u16().await?;
+    // Consume the bounded destination before rejecting BIND/UDP. Closing with
+    // unread request bytes can reset the socket on Windows and discard REP=2.
+    // No destination resolution or connection occurs for unsupported commands.
+    if request[1] != 1 {
+        return Err(denied());
+    }
     let remote = connect_public(&host, port).await?;
     client.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
     Ok(remote)

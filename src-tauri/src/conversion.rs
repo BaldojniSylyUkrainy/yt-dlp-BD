@@ -1,6 +1,10 @@
 //! Decide processing from streams, not website names or filename extensions.
 use super::*;
 
+// Inputs are already downloaded files. A disguised playlist/container must
+// never open a network connection outside the downloader's guarded transport.
+pub(crate) const LOCAL_INPUT_PROTOCOLS: [&str; 2] = ["-protocol_whitelist", "file,pipe"];
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ProcessingPlan {
     pub copy_video: bool,
@@ -58,6 +62,7 @@ pub(crate) fn probe(ffmpeg: &Path, input: &Path) -> Result<ProcessingPlan, Strin
 
 fn probe_uncached(ffmpeg: &Path, input: &Path) -> Result<ProcessingPlan, String> {
     let mut command = Command::new(ffprobe_path(ffmpeg));
+    command.args(LOCAL_INPUT_PROTOCOLS);
     command
         .args([
             "-v",
@@ -94,6 +99,7 @@ fn probe_uncached(ffmpeg: &Path, input: &Path) -> Result<ProcessingPlan, String>
         if transfer_unknown && high_depth {
             let frame_output = process_runner::capture(
                 Command::new(ffprobe_path(ffmpeg))
+                    .args(LOCAL_INPUT_PROTOCOLS)
                     .args([
                         "-v",
                         "error",
@@ -566,8 +572,9 @@ pub(super) fn run_conversion_attempt(
             "0.25",
             "-progress",
             "pipe:1",
-            "-i",
         ])
+        .args(LOCAL_INPUT_PROTOCOLS)
+        .arg("-i")
         .arg(input);
     if let Some(media) = media {
         let bitrate = target_video_bitrate(Some(media.height), Some(media.fps), None);

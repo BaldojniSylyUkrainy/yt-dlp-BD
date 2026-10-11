@@ -68,7 +68,9 @@ pub(crate) fn windows_arguments(address: SocketAddr) -> String {
     // a proxy for localhost/link-local. No DIRECT fallback, PAC or system proxy.
     // SOCKS5 in Chromium is TCP-only. WebRTC must not use non-proxied UDP;
     // QUIC/WebTransport are disabled. Keep SmartScreen/site isolation ENABLED.
-    format!("--proxy-server=socks5://{address} --proxy-bypass-list=<-loopback> --force-webrtc-ip-handling-policy=disable_non_proxied_udp --disable-quic --disable-blink-features=WebTransport,DirectSockets --disable-features=WebTransport,DirectSockets --no-first-run")
+    // WebView2 uses the normal Chromium switch. The headless-only `force-`
+    // variant is ignored here and allowed STUN packets in the native smoke test.
+    format!("--proxy-server=socks5://{address} --proxy-bypass-list=<-loopback> --webrtc-ip-handling-policy=disable_non_proxied_udp --disable-quic --disable-blink-features=WebTransport,DirectSockets --disable-features=WebTransport,DirectSockets --no-first-run")
 }
 
 pub(crate) async fn configure(
@@ -295,7 +297,7 @@ mod tests {
         for required in [
             "--proxy-server=socks5://127.0.0.1:12345",
             "--proxy-bypass-list=<-loopback>",
-            "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+            "--webrtc-ip-handling-policy=disable_non_proxied_udp",
             "--disable-quic",
             "--disable-blink-features=WebTransport,DirectSockets",
         ] {

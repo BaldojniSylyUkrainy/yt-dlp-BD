@@ -3554,6 +3554,7 @@ fn parse_frame_rate(value: &str) -> Option<f64> {
 
 fn media_info(ffmpeg_path: &Path, input: &Path) -> Result<MediaInfo, String> {
     let mut command = Command::new(ffprobe_path(ffmpeg_path));
+    command.args(LOCAL_INPUT_PROTOCOLS);
     configure_command(&mut command);
     let output = process_runner::capture(
         command
@@ -3602,6 +3603,7 @@ fn media_info(ffmpeg_path: &Path, input: &Path) -> Result<MediaInfo, String> {
 
 fn media_duration(ffmpeg_path: &Path, input: &Path) -> Result<f64, String> {
     let mut command = Command::new(ffprobe_path(ffmpeg_path));
+    command.args(LOCAL_INPUT_PROTOCOLS);
     configure_command(&mut command);
     let output = process_runner::capture(
         command

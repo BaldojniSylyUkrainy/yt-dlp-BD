@@ -53,7 +53,7 @@ describe("interactive recovery and diagnostic controls", () => {
     const selected = vi.fn();
     render(<MediaCandidatePicker busy={false} onSelected={selected}/>);
     mocks.callback?.({payload: {sessionId: "session", jobId: "job", pageUrl: "https://example.com/post", urls: ["https://cdn.example.com/movie.mp4?token=SECRET"]}});
-    const button = await screen.findByText(/cdn.example.com/);
+    const button = await screen.findByText(/cdn\.example\.com/);
     expect(button.textContent).not.toContain("SECRET");
     expect(selected).not.toHaveBeenCalled();
     fireEvent.click(button);
