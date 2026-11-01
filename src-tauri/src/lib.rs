@@ -35,6 +35,7 @@ mod media_identity;
 mod media_smoke_tests;
 mod probe_cache;
 mod process_runner;
+mod progress_speed;
 mod recovery;
 mod runtime;
 mod runtime_check;
@@ -518,16 +519,25 @@ struct DownloadProgress {
     message: Option<String>,
 }
 
-/// `percent|speed|eta|item|items|title`. Inside a playlist or carousel the bar
-/// covers the whole collection instead of restarting on every file.
-fn parse_download_progress(payload: &str) -> DownloadProgress {
-    let mut values = payload.splitn(6, '|').map(str::trim);
+/// `percent|speed|eta|item|items|downloaded|total|title`. Inside a playlist or
+/// carousel the bar covers the whole collection instead of restarting on every
+/// file. Speed and time left are averaged over the last seconds by `smoother`.
+fn parse_download_progress(
+    payload: &str,
+    smoother: &mut progress_speed::SpeedSmoother,
+    now: Instant,
+) -> DownloadProgress {
+    let mut values = payload.splitn(8, '|').map(str::trim);
     let mut text = || values.next().filter(|value| !value.is_empty());
     let percent = text().and_then(|value| value.trim_end_matches('%').trim().parse::<f32>().ok());
-    let speed = text().map(str::to_string);
-    let eta = text().map(str::to_string);
+    let raw_speed = text();
+    let raw_eta = text();
     let item = text().and_then(|value| value.parse::<u32>().ok());
     let items = text().and_then(|value| value.parse::<u32>().ok());
+    let downloaded = progress_speed::parse_byte_count(text());
+    let total = progress_speed::parse_byte_count(text());
+    let progress_speed::SpeedReading { speed, eta } =
+        smoother.sample(now, downloaded, total, raw_speed, raw_eta);
     let collection = item
         .zip(items)
         .filter(|(item, items)| *items > 1 && item <= items);
@@ -579,13 +589,13 @@ fn terminal_kind(
     }
 }
 
-fn emit_line(app: &AppHandle, id: &str, line: &str) {
+fn emit_line(app: &AppHandle, id: &str, line: &str, smoother: &mut progress_speed::SpeedSmoother) {
     if !line.starts_with(PROGRESS_MARKER) {
         diagnostics::record(id, line);
     }
     const POSTPROCESS_MARKER: &str = "__YTDLP_POSTPROCESS__";
     if let Some(payload) = line.strip_prefix(PROGRESS_MARKER) {
-        let progress = parse_download_progress(payload);
+        let progress = parse_download_progress(payload, smoother, Instant::now());
         let _ = app.emit(
             "download-event",
             DownloadEvent {
@@ -1036,9 +1046,10 @@ fn read_output<R: Read + Send + 'static>(
     thread::spawn(move || {
         let mut reader = BufReader::new(reader);
         let mut buffer = Vec::new();
+        let mut smoother = progress_speed::SpeedSmoother::default();
         while let Ok(Some(line)) = read_lossy_line(&mut reader, &mut buffer) {
             if line.starts_with(PROGRESS_MARKER) || line.starts_with("__YTDLP_POSTPROCESS__") {
-                emit_line(&app, &id, &line);
+                emit_line(&app, &id, &line, &mut smoother);
                 continue;
             }
             if let Some((_, payload)) = line.split_once("__YTDLP_CANDIDATES__") {
@@ -1106,7 +1117,7 @@ fn read_output<R: Read + Send + 'static>(
                     *error = Some(line.trim().trim_start_matches("ERROR:").trim().to_string());
                 }
             }
-            emit_line(&app, &id, &line);
+            emit_line(&app, &id, &line, &mut smoother);
         }
     })
 }
@@ -1485,7 +1496,7 @@ async fn start_download(
         "--progress-delta",
         "0.25",
         "--progress-template",
-        "__YTDLP_PROGRESS__%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(info.playlist_autonumber)s|%(info.n_entries)s|%(info.title)s",
+        "__YTDLP_PROGRESS__%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(info.playlist_autonumber)s|%(info.n_entries)s|%(progress.downloaded_bytes)s|%(progress.total_bytes,progress.total_bytes_estimate)s|%(info.title)s",
         "--progress-template",
         "postprocess:__YTDLP_POSTPROCESS__%(progress.status)s|%(progress.postprocessor)s|%(info.title)s",
         "-o",
@@ -3025,11 +3036,20 @@ mod tests {
 
     #[test]
     fn collection_progress_covers_the_whole_carousel() {
-        let progress = parse_download_progress(" 50.0%|1.00MiB/s|00:03|3|10|Назва | із рискою");
+        let now = Instant::now();
+        let progress = parse_download_progress(
+            " 50.0%|1.00MiB/s|00:03|3|10|1048576|2097152|Назва | із рискою",
+            &mut progress_speed::SpeedSmoother::default(),
+            now,
+        );
         assert_eq!(progress.percent, Some(25.0));
         assert_eq!(progress.message.as_deref(), Some("Файл 3 із 10"));
         assert_eq!(progress.speed.as_deref(), Some("1.00MiB/s"));
-        let single = parse_download_progress(" 50.0%|1.00MiB/s|00:03|NA|NA|Назва");
+        let single = parse_download_progress(
+            " 50.0%|1.00MiB/s|00:03|NA|NA|NA|NA|Назва",
+            &mut progress_speed::SpeedSmoother::default(),
+            now,
+        );
         assert_eq!(single.percent, Some(50.0));
         assert_eq!(single.message, None);
     }
