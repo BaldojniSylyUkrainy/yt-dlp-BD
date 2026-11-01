@@ -96,7 +96,7 @@ Current automated coverage includes size confidence, protected-reserve arithmeti
 
 ### Prepared 0.9.0.0 implementation (internal 0.9.0)
 
-- Instagram photo/carousel support on branch `feat/instagram-photos`, PR #49. The user confirmed in the local macOS dev app (2026-11-01) that carousels download in full, including with `img_index` in the URL. The full-application review fixes of 2026-11-01 are in the same unpublished 0.9.0.0. The macOS yt-dlp folder migration ran in the live dev app (launch 0.25-0.37 s) and the user accepted a manual macOS pass. A collaborator tests on native Windows and the PR merges only after that; nothing has been verified on native Windows yet. `zip 4.6.1` remains only through `tauri-plugin-updater`; its advisories concern `ZipArchive::extract` on archives that the updater accepts only after signature verification.
+- Instagram photo/carousel support on branch `feat/instagram-photos`, PR #49. The user confirmed in the local macOS dev app (2026-11-01) that carousels download in full, including with `img_index` in the URL. The full-application review fixes of 2026-11-01 are in the same unpublished 0.9.0.0. The macOS yt-dlp folder migration ran in the live dev app (launch 0.25-0.37 s) and the user accepted a manual macOS pass. A collaborator tests on native Windows and the PR merges only after that; nothing has been verified on native Windows yet. `tauri-plugin-updater` 2.14.1 removes `zip 4.6.1`; a real app update through it has not been exercised yet. `.gitattributes` keeps the signed fixtures byte-exact, because Windows CRLF checkout breaks their signature.
 
 ## Remaining Verification / Known Risks
 

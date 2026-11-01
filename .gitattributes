@@ -1,0 +1,2 @@
+# Signed upstream fixtures must keep their exact bytes on every platform.
+src-tauri/src/testdata/* -text
