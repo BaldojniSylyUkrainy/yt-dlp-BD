@@ -891,15 +891,18 @@ enum DiskGuard {
     Unavailable,
 }
 
-/// Free space alone cannot tell a full disk from a missing one: both fail the
-/// space query. A folder that no longer exists is reported as unavailable; any
-/// other unknown state still stops the job to protect the disk.
+/// Free space alone cannot tell a full disk from a missing one: an unplugged
+/// drive fails the space query, while on Windows a deleted folder on a present
+/// drive still reports the drive's space. The folder is checked first (jobs only
+/// start in an existing folder); any other unknown state still stops the job to
+/// protect the disk.
 fn disk_guard(path: &Path) -> DiskGuard {
+    if !destination_present(path) {
+        return DiskGuard::Unavailable;
+    }
     match available_disk_space(path) {
-        Some(available) if low_disk_guard_triggered(available) => DiskGuard::Low,
-        Some(_) => DiskGuard::Ok,
-        None if !destination_present(path) => DiskGuard::Unavailable,
-        None => DiskGuard::Low,
+        Some(available) if !low_disk_guard_triggered(available) => DiskGuard::Ok,
+        _ => DiskGuard::Low,
     }
 }
 
