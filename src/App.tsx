@@ -357,6 +357,7 @@ function App() {
   const [runtimeError, setRuntimeError] = useState("");
   const [runtimeFailures, setRuntimeFailures] = useState(new Set<Exclude<RuntimeStage, null>>());
   const [runtimeInstallProgress, setRuntimeInstallProgress] = useState<RuntimeInstallProgress | null>(null);
+  const [runtimePending, setRuntimePending] = useState<Exclude<RuntimeStage, null>[]>([]);
   const [url, setUrl] = useState("");
   const urlInputRef = useRef<HTMLInputElement>(null);
   const [activeView, setActiveView] = useState<"download" | "queue" | "history">("download");
@@ -671,9 +672,11 @@ function App() {
     maintenanceChecking.current = true;
     setRuntimeError("");
     const issues: string[] = [];
+    setRuntimePending(due.map(({ stage }) => stage));
     try {
       for (const component of due) {
         setRuntimeStage(component.stage);
+        setRuntimePending((current) => current.filter((stage) => stage !== component.stage));
         setRuntimeInstallProgress(null);
         try {
           localStorage.setItem(`${component.key}.attempt`, String(now));
@@ -683,9 +686,10 @@ function App() {
               localStorage.removeItem(`${component.key}.attempt`);
               continue; // Installation is deferred until the next idle check.
             }
+            // Stays busy until the whole run ends so the overlay does not flicker
+            // between components; the finally block below clears it.
             setRuntimeBusy(true);
             await invoke<void>(component.command);
-            setRuntimeBusy(false);
           }
           localStorage.setItem(component.key, String(now));
           localStorage.removeItem(`${component.key}.retryAt`);
@@ -695,7 +699,6 @@ function App() {
             return next;
           });
         } catch (error) {
-          setRuntimeBusy(false);
           localStorage.setItem(`${component.key}.retryAt`, String(maintenanceRetryAt(error, now)));
           issues.push(friendlyMaintenanceError(error));
           setRuntimeFailures((current) => new Set(current).add(component.stage));
@@ -706,6 +709,7 @@ function App() {
     } finally {
       maintenanceChecking.current = false;
       setRuntimeStage(null);
+      setRuntimePending([]);
       setRuntimeInstallProgress(null);
       setRuntimeBusy(false);
     }
@@ -739,8 +743,10 @@ function App() {
         return;
       }
       setRuntimeBusy(true);
+      setRuntimePending(missing.map(({ stage }) => stage));
       for (const [index, component] of missing.entries()) {
         setRuntimeStage(component.stage);
+        setRuntimePending((current) => current.filter((stage) => stage !== component.stage));
         setStartupMessage(`Встановлюємо ${component.label}…`);
         setStartupProgress(62 + Math.round((index / missing.length) * 30));
         try {
@@ -762,6 +768,7 @@ function App() {
       setRuntimeError(String(error));
     } finally {
       setRuntimeStage(null);
+      setRuntimePending([]);
       setRuntimeBusy(false);
       setStartupProgress(100);
       setStartupMessage("Готово");
@@ -1884,7 +1891,7 @@ function App() {
           setJob(null); setUrl(pageUrl); setHistoryRetryPending("discovery");
         }
       }}/>
-      {runtimeBusy && !startupBusy && <RuntimePreparationOverlay stage={runtimeStage} runtime={runtime} progress={runtimeInstallProgress} />}
+      {runtimeBusy && !startupBusy && <RuntimePreparationOverlay stage={runtimeStage} runtime={runtime} progress={runtimeInstallProgress} pending={runtimePending} />}
 
       {job && job.status !== "auth_required" && <div className="download-progress-backdrop" role="presentation">
         <DialogSurface className={`job-card ${job.status}`} labelledBy="download-progress-title" onEscape={!active ? () => setJob(null) : undefined}>
