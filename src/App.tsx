@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ClipboardEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { HistoryThumbnail } from "./HistoryThumbnail";
 import { listen } from "@tauri-apps/api/event";
 import { downloadDir } from "@tauri-apps/api/path";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -8,15 +7,17 @@ import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import brandLogo from "./assets/logo-call-me-hands.png";
-import loadingHandOne from "./assets/logo-call-me-hand-frame-1.png";
-import loadingHandTwo from "./assets/logo-call-me-hand-frame-2.png";
-import loadingHandThree from "./assets/logo-call-me-hand-frame-3.png";
 import packageMetadata from "../package.json";
 import { maintenanceDue, maintenanceRetryAt, friendlyMaintenanceError } from "./maintenance";
 import { DialogSurface } from "./DialogSurface";
-import { canOfferBrowserDiscovery, DownloadTools, HistoryDetails, MediaCandidatePicker, RecoveryNotice } from "./MediaTools";
+import { canOfferBrowserDiscovery, DownloadTools, MediaCandidatePicker, RecoveryNotice } from "./MediaTools";
+import { formatByteSize } from "./format";
+import { applyHistoryFileStatuses, applyHistoryThumbnailCache, fileTitle, HISTORY_LIMIT, historyPaths, limitHistoryDiagnostics, loadHistory, parentDirectory, shouldDeleteUnusedHistoryThumbnail, type HistoryDownloadSettings, type HistoryEntry, type HistoryFileStatus } from "./history";
+import { HistoryView } from "./HistoryView";
+import { Icon } from "./Icon";
+import { QueueProgressModal, QueueView } from "./QueueViews";
+import { RuntimePreparationOverlay, RuntimeRow, StartupOverlay, type RuntimeInstallProgress, type RuntimeStage, type RuntimeStatus } from "./RuntimeViews";
 import {
-  canEditQueueItem,
   commitQueueInput,
   nextPendingQueueItem,
   normalizeCookieBrowser,
@@ -37,7 +38,6 @@ import "./App.css";
 
 const APP_RELEASE_VERSION = packageMetadata.releaseVersion;
 const HISTORY_STORAGE_KEY = "downloadHistory.v1";
-const HISTORY_LIMIT = 500;
 export const UPDATE_CHECK_DELAYS = [0, 5_000, 30_000] as const;
 const UPDATE_CHECK_INTERVAL = 6 * 60 * 60 * 1_000;
 
@@ -48,21 +48,6 @@ export function shouldPlayCompletionSound(kind: DownloadEvent["kind"]): boolean 
 export function shouldPlayQueueCompletionSound(items: QueueItem[]): boolean {
   return items.some((item) => item.status === "completed");
 }
-
-type ComponentStatus = {
-  installed: boolean;
-  version: string | null;
-  path: string | null;
-  managed: boolean;
-};
-
-type RuntimeStatus = {
-  ytDlp: ComponentStatus;
-  ffmpeg: ComponentStatus;
-  deno: ComponentStatus;
-  runtimeDir: string;
-  platform: string;
-};
 
 type VpnStatus = {
   detected: boolean;
@@ -97,42 +82,17 @@ type DownloadOutput = {
   extractor?: string | null;
 };
 
+/** The low-space warning stays on screen through every stage, so name the stage that is still running. */
+export function storageWarningContinuation(status: string): string {
+  if (status === "converting") return " Конвертація продовжується.";
+  if (status === "postprocessing") return " Обробка продовжується.";
+  if (status === "starting" || status === "downloading") return " Завантаження продовжується.";
+  return "";
+}
+
 export function isBlockingQueueFailure(kind: string, code?: string | null): boolean {
   return kind === "auth_required" || ["low_disk", "rate_limited", "selection_required", "auth_required", "destination_unavailable"].includes(code || "");
 }
-
-export type HistoryEntry = {
-  id: string;
-  outcome?: "failed" | "cancelled" | "auth_required";
-  message?: string;
-  diagnostics?: string;
-  sourceUrl: string;
-  title: string;
-  thumbnail: string | null;
-  cachedThumbnailPath: string | null;
-  uploader: string | null;
-  extractor: string | null;
-  size: number;
-  downloadedAt: string;
-  path: string;
-  available: boolean;
-  settings: HistoryDownloadSettings;
-};
-
-export type HistoryDownloadSettings = {
-  outputDir: string;
-  mode: "video" | "audio";
-  quality: string;
-  audioFormat: string;
-  subtitles: boolean;
-  playlist: boolean;
-};
-
-export type HistoryFileStatus = {
-  path: string;
-  available: boolean;
-  size: number | null;
-};
 
 type HistoryContext = {
   sourceUrl: string;
@@ -151,25 +111,12 @@ type StorageEstimate = {
 };
 
 type PreflightResult = {
-  title: string;
-  itemCount: number;
-  intermediateSize: number | null;
-  finalOutputSize: number | null;
-  protectedReserve: number;
-  requiredSpace: number | null;
   availableSpace: number;
-  confidence: "exact" | "approximate" | "unknown";
   sufficient: boolean;
 };
 
 export function preflightAllowsStart(result: PreflightResult): boolean {
   return result.sufficient;
-}
-
-export function preflightConfidenceLabel(confidence: PreflightResult["confidence"]): string {
-  if (confidence === "exact") return "Точні дані";
-  if (confidence === "approximate") return "Орієнтовно";
-  return "Розмір частково невідомий";
 }
 
 export function runtimeInstallCommand(stage: Exclude<RuntimeStage, null>): string {
@@ -179,12 +126,8 @@ export function runtimeInstallCommand(stage: Exclude<RuntimeStage, null>): strin
 }
 
 export function runtimeUpdateKey(stage: Exclude<RuntimeStage, null>): string {
-  if (stage === "ytDlp") return "runtimeUpdate.ytDlpNightly.v1";
+  if (stage === "ytDlp") return "runtimeUpdate.ytDlpNightly.v2";
   return `runtimeUpdate.${stage}`;
-}
-
-export function shouldShowRuntimeRetry(loading: boolean, hasRetry: boolean): boolean {
-  return !loading && hasRetry;
 }
 
 export function defaultCookieBrowser(platform: string, stored: string | null): string {
@@ -206,6 +149,7 @@ export type Job = {
   storage: StorageEstimate | null;
   playlist: boolean;
   outputFormat: string;
+  outputPaths?: string[];
 };
 
 type AppCloseRequest = {
@@ -258,6 +202,7 @@ export function applyDownloadEvent(current: Job, payload: DownloadEvent): Job | 
       speed: payload.speed ?? current.speed,
       eta: payload.eta ?? current.eta,
       title: payload.title || current.title,
+      message: payload.message || (current.status === "starting" ? "Завантажуємо…" : current.message),
     };
   }
   if (payload.kind === "postprocess") {
@@ -274,7 +219,7 @@ export function applyDownloadEvent(current: Job, payload: DownloadEvent): Job | 
       ...current,
       status: "converting",
       percent: payload.percent ?? current.percent,
-      speed: payload.speed || "VideoToolbox",
+      speed: payload.speed || "FFmpeg",
       eta: payload.eta || "—",
       message: payload.message || "Створюємо сумісний MP4… Не закривайте застосунок",
     };
@@ -287,50 +232,11 @@ export function applyDownloadEvent(current: Job, payload: DownloadEvent): Job | 
     status: payload.kind,
     errorCode: payload.errorCode,
     percent: payload.kind === "completed" ? 100 : current.percent,
-    message: payload.kind === "auth_required" ? "Потрібен вхід через браузер" : payload.message || current.message,
+    outputPaths: payload.outputs?.map((output) => output.path) ?? current.outputPaths,
+    message: payload.kind === "auth_required"
+      ? "Потрібен вхід через браузер"
+      : payload.kind === "completed" ? payload.message || "Готово" : payload.message || current.message,
   };
-}
-
-type RuntimeStage = "ytDlp" | "ffmpeg" | "deno" | null;
-
-type RuntimeInstallProgress = {
-  component: Exclude<RuntimeStage, null>;
-  downloaded: number;
-  total: number | null;
-};
-
-type IconName =
-  | "download"
-  | "clock"
-  | "settings"
-  | "folder"
-  | "link"
-  | "shield"
-  | "warning"
-  | "check"
-  | "x"
-  | "refresh"
-  | "list"
-  | "stop"
-  | "chevron";
-
-function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
-  const paths: Record<IconName, React.ReactNode> = {
-    download: <><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></>,
-    clock: <><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></>,
-    settings: <><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.86 2.86-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1.1V21H9.5v-.1A1.7 1.7 0 0 0 8.4 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06-2.86-2.86.06-.06A1.7 1.7 0 0 0 4 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1.1-.4H2.2V9.5h.1A1.7 1.7 0 0 0 4 8.4a1.7 1.7 0 0 0-.34-1.88l-.06-.06L6.46 3.6l.06.06A1.7 1.7 0 0 0 8.4 4a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1.1v-.1h4.1v.1A1.7 1.7 0 0 0 15 4a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.86 2.86-.06.06A1.7 1.7 0 0 0 19.4 8.4a1.7 1.7 0 0 0 .6 1 1.7 1.7 0 0 0 1.1.4h.1v4.1h-.1A1.7 1.7 0 0 0 19.4 15Z"/></>,
-    folder: <path d="M3 6.5A1.5 1.5 0 0 1 4.5 5H9l2 2h8.5A1.5 1.5 0 0 1 21 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5Z"/>,
-    link: <><path d="M10 13a5 5 0 0 0 7.1.1l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1"/><path d="M14 11a5 5 0 0 0-7.1-.1l-2 2A5 5 0 0 0 12 20l1.1-1.1"/></>,
-    shield: <><path d="M12 3 5 6v5c0 4.6 2.8 8 7 10 4.2-2 7-5.4 7-10V6Z"/><path d="m9 12 2 2 4-4"/></>,
-    warning: <><path d="M10.3 4.3 2.7 17.5A2 2 0 0 0 4.4 20h15.2a2 2 0 0 0 1.7-2.5L13.7 4.3a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></>,
-    check: <path d="m5 12 4 4L19 6"/>,
-    x: <><path d="m7 7 10 10"/><path d="M17 7 7 17"/></>,
-    refresh: <><path d="M20 7v5h-5"/><path d="M4 17v-5h5"/><path d="M6.1 8A7 7 0 0 1 18 6l2 6M4 12l2 6a7 7 0 0 0 11.9-2"/></>,
-    list: <><path d="M8 6h12M8 12h12M8 18h12"/><path d="M4 6h.01M4 12h.01M4 18h.01"/></>,
-    stop: <rect x="6" y="6" width="12" height="12" rx="2"/>,
-    chevron: <path d="m9 18 6-6-6-6"/>,
-  };
-  return <svg aria-hidden="true" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
 }
 
 function hostFromInput(value: string): string | null {
@@ -371,6 +277,20 @@ export function isLikelyMultiItemUrl(value: string): boolean {
   }
 }
 
+/** The address names only a collection: yt-dlp's `--no-playlist` has no single item to pick. */
+export function isWholeCollectionUrl(value: string): boolean {
+  if (!isLikelyMultiItemUrl(value)) return false;
+  try {
+    const parsed = new URL(/^https?:\/\//i.test(value.trim()) ? value.trim() : `https://${value.trim()}`);
+    const host = parsed.hostname.toLowerCase();
+    if (host === "youtu.be" || host.endsWith(".youtu.be")) return false;
+    if (host === "youtube.com" || host.endsWith(".youtube.com")) return !parsed.searchParams.has("v");
+    return !(host === "threads.com" || host.endsWith(".threads.com") || host === "threads.net" || host.endsWith(".threads.net"));
+  } catch {
+    return false;
+  }
+}
+
 export function shouldShowMultiItemIntent(value: string, itemCount?: number | null): boolean {
   return isLikelyMultiItemUrl(value) || Boolean(itemCount && itemCount > 1);
 }
@@ -385,6 +305,10 @@ export function DownloadCollectionIntent({ url, intent, onIntentChange }: {
   onIntentChange: (intent: "single" | "playlist") => void;
 }) {
   if (!shouldShowMultiItemIntent(url)) return null;
+  if (isWholeCollectionUrl(url)) return <div className="collection-intent">
+    <span className="field-label">Це ціла добірка</span>
+    <small>Завантажаться всі доступні елементи з безпечними паузами між ними.</small>
+  </div>;
   return <div className="collection-intent">
     <span className="field-label">Що взяти з добірки</span>
     <div className="segmented">
@@ -393,194 +317,6 @@ export function DownloadCollectionIntent({ url, intent, onIntentChange }: {
     </div>
     <small>{intent === "single" ? "За замовчуванням завантажиться лише поточний ролик." : "Завантажаться всі доступні елементи з безпечними паузами між ними."}</small>
   </div>;
-}
-
-function shortVersion(value: string | null): string {
-  if (!value) return "Не встановлено";
-  return value.replace(/^nightly@/, "").split("\n")[0];
-}
-
-function formatByteSize(value: number): string {
-  if (!Number.isFinite(value) || value < 0) return "—";
-  const units = ["Б", "КБ", "МБ", "ГБ", "ТБ"];
-  let size = value;
-  let unit = 0;
-  while (size >= 1024 && unit < units.length - 1) {
-    size /= 1024;
-    unit += 1;
-  }
-  return `${new Intl.NumberFormat("uk-UA", { maximumFractionDigits: unit === 0 ? 0 : 1 }).format(size)} ${units[unit]}`;
-}
-
-function historyDayKey(value: string): string {
-  const date = new Date(value);
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-}
-
-function historyDayLabel(key: string, now = new Date()): string {
-  const today = historyDayKey(now.toISOString());
-  const yesterday = new Date(now);
-  yesterday.setDate(yesterday.getDate() - 1);
-  if (key === today) return "Сьогодні";
-  if (key === historyDayKey(yesterday.toISOString())) return "Вчора";
-  return new Intl.DateTimeFormat("uk-UA", { day: "numeric", month: "long", year: "numeric" })
-    .format(new Date(`${key}T12:00:00`));
-}
-
-export function groupHistoryEntries(entries: HistoryEntry[], now = new Date()) {
-  const groups = new Map<string, HistoryEntry[]>();
-  [...entries]
-    .sort((left, right) => Date.parse(right.downloadedAt) - Date.parse(left.downloadedAt))
-    .forEach((entry) => {
-      const key = historyDayKey(entry.downloadedAt);
-      groups.set(key, [...(groups.get(key) || []), entry]);
-    });
-  return Array.from(groups, ([key, items]) => ({ key, label: historyDayLabel(key, now), items }));
-}
-
-function fileTitle(path: string): string {
-  const filename = path.split(/[\\/]/).filter(Boolean).pop() || path;
-  return filename.replace(/\.[^.]+$/, "") || filename;
-}
-
-function parentDirectory(path: string): string {
-  const separator = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
-  return separator > 0 ? path.slice(0, separator) : "";
-}
-
-function fallbackHistorySettings(path: string): HistoryDownloadSettings {
-  const extension = path.split(".").pop()?.toLowerCase() || "";
-  const audio = ["mp3", "m4a", "opus", "wav"].includes(extension);
-  return {
-    outputDir: parentDirectory(path),
-    mode: audio ? "audio" : "video",
-    quality: "best",
-    audioFormat: audio ? extension : "mp3",
-    subtitles: false,
-    playlist: false,
-  };
-}
-
-function nonEmptyString(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value : null;
-}
-
-function normalizeHistorySettings(value: unknown, path: string): HistoryDownloadSettings {
-  const fallback = fallbackHistorySettings(path);
-  const settings = value && typeof value === "object" ? value as Record<string, unknown> : {};
-  const quality = nonEmptyString(settings.quality);
-  const audioFormat = nonEmptyString(settings.audioFormat)?.toLowerCase() || null;
-  return {
-    outputDir: nonEmptyString(settings.outputDir) || fallback.outputDir,
-    mode: settings.mode === "video" || settings.mode === "audio" ? settings.mode : fallback.mode,
-    quality: quality && ["best", "2160", "1080", "720", "480"].includes(quality) ? quality : "best",
-    audioFormat: audioFormat && ["mp3", "m4a", "opus", "wav"].includes(audioFormat)
-      ? audioFormat
-      : fallback.audioFormat,
-    subtitles: typeof settings.subtitles === "boolean" ? settings.subtitles : false,
-    playlist: typeof settings.playlist === "boolean" ? settings.playlist : false,
-  };
-}
-
-function normalizeHistoryEntry(value: unknown): HistoryEntry | null {
-  if (!value || typeof value !== "object") return null;
-  const entry = value as Record<string, unknown>;
-  const id = nonEmptyString(entry.id);
-  const outcome = ["failed", "cancelled", "auth_required"].includes(String(entry.outcome)) ? entry.outcome as HistoryEntry["outcome"] : undefined;
-  const path = nonEmptyString(entry.path) || (outcome ? "" : null);
-  const title = nonEmptyString(entry.title);
-  const sourceUrl = nonEmptyString(entry.sourceUrl);
-  const downloadedAt = nonEmptyString(entry.downloadedAt);
-  if (!id || path === null || !title || !sourceUrl || !downloadedAt || !Number.isFinite(Date.parse(downloadedAt))) {
-    return null;
-  }
-  const normalizedSourceUrl = normalizeInputUrl(sourceUrl);
-  if (!normalizedSourceUrl || !/^https?:/i.test(normalizedSourceUrl)) return null;
-  const size = typeof entry.size === "number" && Number.isFinite(entry.size) && entry.size >= 0
-    ? entry.size
-    : 0;
-  return {
-    id,
-    outcome,
-    message: nonEmptyString(entry.message)?.slice(0, 1000) || undefined,
-    sourceUrl: normalizedSourceUrl,
-    title,
-    thumbnail: nonEmptyString(entry.thumbnail),
-    cachedThumbnailPath: nonEmptyString(entry.cachedThumbnailPath),
-    uploader: nonEmptyString(entry.uploader),
-    extractor: nonEmptyString(entry.extractor),
-    size,
-    downloadedAt,
-    path,
-    available: Boolean(path) && (typeof entry.available === "boolean" ? entry.available : true),
-    settings: normalizeHistorySettings(entry.settings, path),
-    ...(typeof entry.diagnostics === "string" ? { diagnostics: entry.diagnostics.slice(0, 4000) } : {}),
-  };
-}
-
-export function limitHistoryDiagnostics(entries: HistoryEntry[]): HistoryEntry[] {
-  return entries.map((entry, index) => {
-    if (index < 20 || !entry.diagnostics) return entry;
-    const { diagnostics: _diagnostics, ...rest } = entry;
-    return rest;
-  });
-}
-
-export function parseHistoryStorage(raw: string | null): HistoryEntry[] {
-  try {
-    const parsed: unknown = JSON.parse(raw || "[]");
-    if (!Array.isArray(parsed)) return [];
-    return limitHistoryDiagnostics(parsed.flatMap((entry) => {
-      const normalized = normalizeHistoryEntry(entry);
-      return normalized ? [normalized] : [];
-    }).slice(0, HISTORY_LIMIT));
-  } catch {
-    return [];
-  }
-}
-
-function loadHistory(): HistoryEntry[] {
-  try {
-    return parseHistoryStorage(localStorage.getItem(HISTORY_STORAGE_KEY));
-  } catch {
-    return [];
-  }
-}
-
-export function historyPaths(entries: HistoryEntry[]): string[] {
-  return Array.from(new Set(entries.map((entry) => entry.path).filter(Boolean)));
-}
-
-export function applyHistoryFileStatuses(entries: HistoryEntry[], statuses: HistoryFileStatus[]): HistoryEntry[] {
-  const byPath = new Map(statuses.map((status) => [status.path, status]));
-  let changed = false;
-  const next = entries.map((entry) => {
-    const status = byPath.get(entry.path);
-    if (!status) return entry;
-    const size = status.size ?? entry.size;
-    if (entry.available === status.available && entry.size === size) return entry;
-    changed = true;
-    return { ...entry, available: status.available, size };
-  });
-  return changed ? next : entries;
-}
-
-export function shouldCacheHistoryThumbnail(kind: DownloadEvent["kind"], outputs: DownloadOutput[] | null, thumbnail: string | null): boolean {
-  return ["completed", "failed", "cancelled"].includes(kind) && Boolean(outputs?.length) && Boolean(thumbnail);
-}
-
-export function applyHistoryThumbnailCache(entries: HistoryEntry[], targetIds: Set<string>, cachedThumbnailPath: string): HistoryEntry[] {
-  let changed = false;
-  const next = entries.map((entry) => {
-    if (!targetIds.has(entry.id) || entry.cachedThumbnailPath === cachedThumbnailPath) return entry;
-    changed = true;
-    return { ...entry, cachedThumbnailPath };
-  });
-  return changed ? next : entries;
-}
-
-export function shouldDeleteUnusedHistoryThumbnail(entries: HistoryEntry[], sourceThumbnail: string, cachedThumbnailPath: string): boolean {
-  return !entries.some((entry) => entry.thumbnail === sourceThumbnail || entry.cachedThumbnailPath === cachedThumbnailPath);
 }
 
 function jobStageNumber(status: Job["status"]): string | null {
@@ -629,6 +365,7 @@ function App() {
   const [runtimeError, setRuntimeError] = useState("");
   const [runtimeFailures, setRuntimeFailures] = useState(new Set<Exclude<RuntimeStage, null>>());
   const [runtimeInstallProgress, setRuntimeInstallProgress] = useState<RuntimeInstallProgress | null>(null);
+  const [runtimePending, setRuntimePending] = useState<Exclude<RuntimeStage, null>[]>([]);
   const [url, setUrl] = useState("");
   const urlInputRef = useRef<HTMLInputElement>(null);
   const [activeView, setActiveView] = useState<"download" | "queue" | "history">("download");
@@ -639,6 +376,7 @@ function App() {
   const historyPreparationInFlight = useRef(false);
   const [outputDir, setOutputDir] = useState("");
   const [outputFreeSpace, setOutputFreeSpace] = useState<number | null>(null);
+  const [unavailableOutputDir, setUnavailableOutputDir] = useState<string | null>(null);
   const [mode, setMode] = useState<"video" | "audio">("video");
   const [quality, setQuality] = useState("best");
   const [audioFormat, setAudioFormat] = useState("mp3");
@@ -942,9 +680,11 @@ function App() {
     maintenanceChecking.current = true;
     setRuntimeError("");
     const issues: string[] = [];
+    setRuntimePending(due.map(({ stage }) => stage));
     try {
       for (const component of due) {
         setRuntimeStage(component.stage);
+        setRuntimePending((current) => current.filter((stage) => stage !== component.stage));
         setRuntimeInstallProgress(null);
         try {
           localStorage.setItem(`${component.key}.attempt`, String(now));
@@ -954,9 +694,10 @@ function App() {
               localStorage.removeItem(`${component.key}.attempt`);
               continue; // Installation is deferred until the next idle check.
             }
+            // Stays busy until the whole run ends so the overlay does not flicker
+            // between components; the finally block below clears it.
             setRuntimeBusy(true);
             await invoke<void>(component.command);
-            setRuntimeBusy(false);
           }
           localStorage.setItem(component.key, String(now));
           localStorage.removeItem(`${component.key}.retryAt`);
@@ -966,7 +707,6 @@ function App() {
             return next;
           });
         } catch (error) {
-          setRuntimeBusy(false);
           localStorage.setItem(`${component.key}.retryAt`, String(maintenanceRetryAt(error, now)));
           issues.push(friendlyMaintenanceError(error));
           setRuntimeFailures((current) => new Set(current).add(component.stage));
@@ -977,6 +717,7 @@ function App() {
     } finally {
       maintenanceChecking.current = false;
       setRuntimeStage(null);
+      setRuntimePending([]);
       setRuntimeInstallProgress(null);
       setRuntimeBusy(false);
     }
@@ -1010,8 +751,10 @@ function App() {
         return;
       }
       setRuntimeBusy(true);
+      setRuntimePending(missing.map(({ stage }) => stage));
       for (const [index, component] of missing.entries()) {
         setRuntimeStage(component.stage);
+        setRuntimePending((current) => current.filter((stage) => stage !== component.stage));
         setStartupMessage(`Встановлюємо ${component.label}…`);
         setStartupProgress(62 + Math.round((index / missing.length) * 30));
         try {
@@ -1033,6 +776,7 @@ function App() {
       setRuntimeError(String(error));
     } finally {
       setRuntimeStage(null);
+      setRuntimePending([]);
       setRuntimeBusy(false);
       setStartupProgress(100);
       setStartupMessage("Готово");
@@ -1171,12 +915,10 @@ function App() {
         if (!disposed) setOutputFreeSpace(null);
         try {
           const fallback = await downloadDir();
-          if (!disposed) {
-            setOutputDir((current) => {
-              if (current !== outputDir) return current;
-              localStorage.setItem("outputDir", fallback);
-              return fallback;
-            });
+          if (!disposed && fallback !== outputDir) {
+            // The saved choice stays: the folder returns as soon as its disk does.
+            setUnavailableOutputDir((current) => current || outputDir);
+            setOutputDir((current) => current === outputDir ? fallback : current);
           }
         } catch {
           // Keep the unavailable path visible only if the system Downloads folder is also unavailable.
@@ -1192,6 +934,22 @@ function App() {
       window.clearInterval(timer);
     };
   }, [outputDir, job?.status]);
+
+  useEffect(() => {
+    if (!unavailableOutputDir) return;
+    let disposed = false;
+    const timer = window.setInterval(() => {
+      void invoke<number>("folder_free_space", { path: unavailableOutputDir }).then(() => {
+        if (disposed) return;
+        setOutputDir(unavailableOutputDir);
+        setUnavailableOutputDir(null);
+      }).catch(() => undefined);
+    }, 2_500);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [unavailableOutputDir]);
 
   useEffect(() => {
     const destination = downloadQueue?.settings.outputDir;
@@ -1347,13 +1105,13 @@ function App() {
                 sufficient: payload.storage.sufficient,
               } : item.storage,
             };
-            if (payload.kind === "progress") return { ...item, status: "downloading" as const, percent: payload.percent ?? item.percent, speed: payload.speed || item.speed, eta: payload.eta || item.eta, title: payload.title || item.title, message: "Завантаження…" };
+            if (payload.kind === "progress") return { ...item, status: "downloading" as const, percent: payload.percent ?? item.percent, speed: payload.speed || item.speed, eta: payload.eta || item.eta, title: payload.title || item.title, message: payload.message || "Завантаження…" };
             if (payload.kind === "postprocess") return { ...item, status: "postprocessing" as const, message: payload.message || "Об’єднуємо потоки…" };
             if (payload.kind === "conversion_progress") return { ...item, status: "converting" as const, percent: payload.percent ?? item.percent, speed: payload.speed || item.speed, eta: payload.eta || item.eta, message: payload.message || "Створюємо сумісний файл…" };
             if (payload.kind === "retrying") return { ...item, status: "starting" as const, message: payload.message || "Повторюємо спробу…" };
             if (payload.kind === "completed") {
               const outputs = payload.outputs || [];
-              return { ...item, status: "completed" as const, percent: 100, message: "Готово", outputs, finalSize: outputs.reduce((sum, output) => sum + output.size, 0), errorCode: null };
+              return { ...item, status: "completed" as const, percent: 100, message: payload.message || "Готово", outputs, finalSize: outputs.reduce((sum, output) => sum + output.size, 0), errorCode: null };
             }
             if (payload.kind === "cancelled") {
               const status = cancellationIntent === "skip" ? "skipped" as const : "interrupted" as const;
@@ -1412,6 +1170,7 @@ function App() {
   async function chooseFolder() {
     const selected = await open({ directory: true, multiple: false, title: "Оберіть папку для завантажень" });
     if (typeof selected === "string") {
+      setUnavailableOutputDir(null);
       setOutputDir(selected);
       localStorage.setItem("outputDir", selected);
     }
@@ -1438,7 +1197,7 @@ function App() {
     }).catch(() => undefined);
   }
 
-  async function launchDownload(downloadUrl: string, parsedHost: string, preflightResult: PreflightResult, cookiesBrowser?: string, playlist = playlistIntentToMultiItem(playlistIntent)) {
+  async function launchDownload(downloadUrl: string, parsedHost: string, cookiesBrowser?: string, playlist = playlistIntentToMultiItem(playlistIntent)) {
     const id = crypto.randomUUID();
     const normalizedDownloadUrl = normalizeInputUrl(downloadUrl) || downloadUrl;
     const thumbnail = youtubeThumbnailFromInput(normalizedDownloadUrl);
@@ -1467,12 +1226,7 @@ function App() {
       speed: "—",
       eta: "—",
       message: cookiesBrowser ? `Вхід через ${cookiesBrowser}…` : "Підключення…",
-      storage: preflightResult.requiredSpace === null ? null : {
-        estimatedSize: preflightResult.finalOutputSize || 0,
-        requiredSpace: preflightResult.requiredSpace,
-        availableSpace: preflightResult.availableSpace,
-        sufficient: preflightResult.sufficient,
-      },
+      storage: null,
       playlist,
       outputFormat: mode === "video" ? "MP4" : audioFormat.toUpperCase(),
     };
@@ -1492,7 +1246,6 @@ function App() {
           multiItem: playlist,
           cookiesBrowser: cookiesBrowser || null,
           discoverySession: discoverySelections.current.get("single")?.pageUrl === normalizedDownloadUrl ? discoverySelections.current.get("single")?.sessionId : null,
-          expectedRequiredSpace: preflightResult.requiredSpace,
         },
       });
       setUrl("");
@@ -1512,28 +1265,13 @@ function App() {
     try {
       const normalized = normalizeInputUrl(downloadUrl);
       if (!normalized) throw new Error("Вставте коректне посилання");
-      const result = await invoke<PreflightResult>("preflight_download", {
-        request: {
-          url: normalized,
-          outputDir,
-          mode,
-          quality,
-          audioFormat,
-          multiItem: playlist,
-          title: null,
-          duration: null,
-          itemCount: null,
-          durationIsTotal: null,
-        },
-      });
+      const result = await invoke<PreflightResult>("preflight_download", { url: normalized, outputDir });
       setOutputFreeSpace(result.availableSpace);
       if (!preflightAllowsStart(result)) {
-        setFormError(result.requiredSpace === null
-          ? "Недостатньо вільного місця: перед стартом потрібно залишити щонайменше 500 МіБ резерву."
-          : `Недостатньо вільного місця: потрібно ${formatByteSize(result.requiredSpace)}, доступно ${formatByteSize(result.availableSpace)}.`);
+        setFormError("Недостатньо вільного місця: перед стартом потрібно залишити щонайменше 500 МіБ резерву.");
         return;
       }
-      await launchDownload(downloadUrl, parsedHost, result, cookiesBrowser, playlist);
+      await launchDownload(downloadUrl, parsedHost, cookiesBrowser, playlist);
     } catch (error) {
       setFormError(String(error));
     } finally {
@@ -1583,7 +1321,7 @@ function App() {
       }
     }
 
-    await runPreflight(normalized, parsedHost);
+    await runPreflight(normalized, parsedHost, undefined, isWholeCollectionUrl(normalized) || playlistIntentToMultiItem(playlistIntent));
   }
 
   function clearUrl() {
@@ -1613,6 +1351,7 @@ function App() {
         return;
       }
     }
+    setUnavailableOutputDir(null);
     setOutputDir(destination);
     try { localStorage.setItem("outputDir", destination); } catch { /* Keep working in memory. */ }
     setMode(entry.settings.mode);
@@ -1930,7 +1669,7 @@ function App() {
         quality: queue.settings.quality,
         audioFormat: queue.settings.audioFormat,
         subtitles: queue.settings.subtitles,
-        playlist: queue.settings.multiItem,
+        playlist: queue.settings.multiItem || isWholeCollectionUrl(normalized),
       },
     });
     void invoke<void>("start_download", {
@@ -1942,10 +1681,9 @@ function App() {
         quality: queue.settings.quality,
         audioFormat: queue.settings.audioFormat,
         subtitles: queue.settings.subtitles,
-        multiItem: queue.settings.multiItem,
+        multiItem: queue.settings.multiItem || isWholeCollectionUrl(normalized),
         cookiesBrowser: queue.settings.cookiesBrowser,
         discoverySession: discoverySelections.current.get(item.id)?.pageUrl === normalized ? discoverySelections.current.get(item.id)?.sessionId : null,
-        expectedRequiredSpace: null,
       },
     }).catch((error) => {
       recordFailedStart(jobId, String(error));
@@ -2101,6 +1839,7 @@ function App() {
             <div className="folder-copy"><span className="field-label">Зберегти у</span><div className="folder-value"><Icon name="folder" size={18}/><span>{outputDir || "Папку не обрано"}</span></div>{outputDir && <small className="folder-space">{outputFreeSpace === null ? "Перевіряємо вільне місце…" : `Вільно ${formatByteSize(outputFreeSpace)}`}</small>}</div>
             <button className="secondary-button" onClick={chooseFolder}>Змінити</button>
           </div>
+          {unavailableOutputDir && <div className="inline-notice" role="status">Папка «{unavailableOutputDir}» зараз недоступна. Поки зберігаємо у «Завантаження»; вона повернеться, щойно диск з’явиться.</div>}
 
           {formError && <div className="inline-error">{formError}</div>}
           <button className="primary-button" disabled={urlState !== "valid" || anyProcessActive || queueBusy || pendingStart || runtimeBusy || !runtimeReady} onClick={() => beginDownload()}><Icon name="download" />{runtimeBusy ? "Встановлюємо компоненти…" : pendingStart ? "Починаємо…" : anyProcessActive || queueBusy ? "Інше завантаження триває" : "Завантажити"}</button>
@@ -2160,7 +1899,7 @@ function App() {
           setJob(null); setUrl(pageUrl); setHistoryRetryPending("discovery");
         }
       }}/>
-      {runtimeBusy && !startupBusy && <RuntimePreparationOverlay stage={runtimeStage} runtime={runtime} progress={runtimeInstallProgress} />}
+      {runtimeBusy && !startupBusy && <RuntimePreparationOverlay stage={runtimeStage} runtime={runtime} progress={runtimeInstallProgress} pending={runtimePending} />}
 
       {job && job.status !== "auth_required" && <div className="download-progress-backdrop" role="presentation">
         <DialogSurface className={`job-card ${job.status}`} labelledBy="download-progress-title" onEscape={!active ? () => setJob(null) : undefined}>
@@ -2172,13 +1911,14 @@ function App() {
             <div className="job-icon" aria-label={`Етап ${jobStageNumber(job.status)}`}><span className="job-stage"><small>ЕТАП</small><strong>{jobStageNumber(job.status)}</strong></span></div>
           )}
           <div className="job-body">
-            <div className="job-title"><div ref={jobTitleTextRef}><strong id="download-progress-title">{job.title}</strong><small>{job.status === "completed" ? "Готово" : job.status === "failed" ? job.message || "Помилка завантаження" : job.status === "cancelled" ? "Скасовано" : job.message}</small></div><span style={{ fontSize: `${jobValueFontSize}px` }}>{job.status === "postprocessing" || job.status === "converting" ? job.outputFormat : `${Math.round(job.percent)}%`}</span></div>
+            <div className="job-title"><div ref={jobTitleTextRef}><strong id="download-progress-title">{job.title}</strong><small>{job.status === "completed" ? job.message || "Готово" : job.status === "failed" ? job.message || "Помилка завантаження" : job.status === "cancelled" ? "Скасовано" : job.message}</small></div><span style={{ fontSize: `${jobValueFontSize}px` }}>{job.status === "postprocessing" || job.status === "converting" ? job.outputFormat : `${Math.round(job.percent)}%`}</span></div>
             <div className="job-source" title={job.url}><Icon name="link" size={12}/><span>{job.url}</span></div>
+            {job.status === "completed" && job.outputPaths?.[0] && <button type="button" className="secondary-button job-reveal" onClick={() => void revealItemInDir(job.outputPaths![0]).catch((error) => setFormError(String(error)))}><Icon name="folder" size={16}/>Показати у папці</button>}
             {!active && job.status === "failed" && <DownloadTools url={job.url} jobId={job.id} canDiscover={canOfferBrowserDiscovery(job.errorCode)}/>}
             {job.storage && <div className={`storage-estimate ${job.storage.sufficient === false ? "warning" : job.storage.sufficient === true ? "ready" : "unknown"}`}>
               {job.storage.sufficient === false ? <Icon name="shield" size={15}/> : <span className="storage-estimate-dot"/>}
               <span>{job.storage.sufficient === false
-                ? `Може не вистачити місця: вільно ${job.storage.availableSpace === null ? "невідомо" : formatByteSize(job.storage.availableSpace)} · потрібно до ${formatByteSize(job.storage.requiredSpace)}. Завантаження продовжується.`
+                ? `Може не вистачити місця: вільно ${job.storage.availableSpace === null ? "невідомо" : formatByteSize(job.storage.availableSpace)} · потрібно до ${formatByteSize(job.storage.requiredSpace)}.${storageWarningContinuation(job.status)}`
                 : `${job.storage.availableSpace === null ? "Вільне місце невідоме" : `Вільно ${formatByteSize(job.storage.availableSpace)}`} · потрібно до ${formatByteSize(job.storage.requiredSpace)}`}</span>
             </div>}
             <div className={`progress-track ${job.status === "postprocessing" ? "indeterminate" : ""}`} role="progressbar" aria-label={job.status === "postprocessing" ? "Об’єднання завантажених потоків" : job.status === "converting" ? "Конвертація відео" : "Завантаження відео"} aria-valuenow={job.status === "postprocessing" ? undefined : Math.round(job.percent)}><span style={job.status === "postprocessing" ? undefined : { width: `${job.percent}%` }}/></div>
@@ -2208,7 +1948,7 @@ function App() {
           <div className="modal-icon cancel"><Icon name="stop" size={28}/></div>
           <p className="eyebrow">АКТИВНЕ ЗАВАНТАЖЕННЯ</p>
           <h2 id="cancel-title">Скасувати процес?</h2>
-          <p id="cancel-description">Завантаження або конвертація зупиниться. Після підтвердження це вікно одразу закриється.</p>
+          <p id="cancel-description">Завантаження або конвертація зупиниться, а тимчасові файли буде прибрано. Це вікно закриється, щойно все завершиться.</p>
           {cancelError && <div className="modal-detail cancel-error">{cancelError}</div>}
           <div className="modal-actions"><button className="secondary-button" disabled={cancelBusy} onClick={() => setCancelConfirmOpen(false)}>Продовжити</button><button className="cancel-confirm-button" disabled={cancelBusy} onClick={cancelJob}>{cancelBusy ? "Зупиняємо…" : "Так, скасувати"}</button></div>
         </DialogSurface>
@@ -2271,185 +2011,6 @@ function App() {
   );
 }
 
-function queueStatusLabel(item: QueueItem): string {
-  if (item.status === "pending") return "Очікує";
-  if (item.status === "starting") return "Підключення";
-  if (item.status === "downloading") return `Завантаження ${Math.round(item.percent)}%`;
-  if (item.status === "postprocessing") return "Об’єднання";
-  if (item.status === "converting") return `Конвертація ${Math.round(item.percent)}%`;
-  if (item.status === "completed") return "Готово";
-  if (item.status === "failed") return "Помилка";
-  if (item.status === "skipped") return "Пропущено";
-  return "Перервано";
-}
-
-function queueStorageLabel(item: QueueItem): string | null {
-  if (!item.storage) return null;
-  const available = item.storage.availableSpace === null ? "вільне місце невідоме" : `вільно ${formatByteSize(item.storage.availableSpace)}`;
-  return `${available} · потрібно до ${formatByteSize(item.storage.requiredSpace)}`;
-}
-
-function QueueView({ queue, input, notice, runtimeReady, singleDownloadActive, onInput, onPaste, onAdd, onChangeItem, onRemoveItem, onSettings, onChooseFolder, onStart, onPause, onResume, onSkip, onStop, onRetry, onReplay, onNew }: {
-  queue: DownloadQueue | null;
-  input: string;
-  notice: string;
-  runtimeReady: boolean;
-  singleDownloadActive: boolean;
-  onInput: (value: string) => void;
-  onPaste: (event: ClipboardEvent<HTMLInputElement | HTMLTextAreaElement>) => void;
-  onAdd: () => void;
-  onChangeItem: (id: string, value: string) => void;
-  onRemoveItem: (id: string) => void;
-  onSettings: (patch: Partial<QueueSettings>) => void;
-  onChooseFolder: () => void;
-  onStart: () => void;
-  onPause: () => void;
-  onResume: () => void;
-  onSkip: () => void;
-  onStop: () => void;
-  onRetry: () => void;
-  onReplay: () => void;
-  onNew: () => void;
-}) {
-  const progress = queueProgress(queue?.items || []);
-  const activeItem = queue?.items.find((item) => item.id === queue.activeItemId) || null;
-  const failedCount = queue?.items.filter((item) => item.status === "failed" || item.status === "interrupted").length || 0;
-  const settingsEditable = !queue || queue.status === "draft" || (queue.status === "paused" && !queue.activeItemId) || (queue.status === "completed" && failedCount > 0);
-  const settings = queue?.settings;
-  const [settingsOpen, setSettingsOpen] = useState(false);
-
-  return <section className="queue-panel">
-    {settings && <details className="queue-settings-disclosure" open={settingsOpen} onToggle={(event) => setSettingsOpen(event.currentTarget.open)}>
-      <summary>
-        <span><small>Спільні для всієї черги</small><strong>Налаштування завантаження</strong></span>
-        <span className="queue-settings-current">{settings.mode === "video" ? "Відео" : settings.audioFormat.toUpperCase()} · {settings.multiItem ? "Уся добірка" : "Один матеріал"}<Icon name="chevron" size={18}/></span>
-      </summary>
-      <div className="queue-settings">
-        <div className="choice-grid">
-          <div><span className="field-label">Що завантажуємо</span><div className="segmented"><button className={settings.mode === "video" ? "selected" : ""} disabled={!settingsEditable} onClick={() => onSettings({ mode: "video" })}>Відео</button><button className={settings.mode === "audio" ? "selected" : ""} disabled={!settingsEditable} onClick={() => onSettings({ mode: "audio" })}>Тільки аудіо</button></div></div>
-          <div><label className="field-label" htmlFor="queue-quality">{settings.mode === "video" ? "Якість" : "Формат аудіо"}</label>{settings.mode === "video"
-            ? <select id="queue-quality" disabled={!settingsEditable} value={settings.quality} onChange={(event) => onSettings({ quality: event.target.value })}><option value="best">Найкраща доступна (MP4)</option><option value="2160">До 4K</option><option value="1080">До 1080p</option><option value="720">До 720p</option><option value="480">До 480p</option></select>
-            : <select id="queue-quality" disabled={!settingsEditable} value={settings.audioFormat} onChange={(event) => onSettings({ audioFormat: event.target.value })}><option value="mp3">MP3</option><option value="m4a">M4A</option><option value="opus">Opus</option><option value="wav">WAV</option></select>}</div>
-        </div>
-        <div className="queue-options">
-          <label><input type="checkbox" disabled={!settingsEditable} checked={settings.subtitles} onChange={(event) => onSettings({ subtitles: event.target.checked })}/> Субтитри, якщо доступні</label>
-          <label><input type="checkbox" disabled={!settingsEditable} checked={settings.multiItem} onChange={(event) => onSettings({ multiItem: event.target.checked })}/> Завантажувати всю добірку за кожним посиланням</label>
-        </div>
-        <label className="queue-browser-picker">Авторизація через браузер<select disabled={!settingsEditable} value={settings.cookiesBrowser || ""} onChange={(event) => onSettings({ cookiesBrowser: event.target.value || null })}><option value="">Не використовувати cookies</option><option value="edge">Microsoft Edge</option><option value="chrome">Google Chrome</option><option value="firefox">Firefox</option><option value="brave">Brave</option><option value="vivaldi">Vivaldi</option></select><small>Потрібно лише для сайтів, які просять увійти або підтвердити вік.</small></label>
-        <div className="folder-row"><div className="folder-copy"><span className="field-label">Зберегти все у</span><div className="folder-value"><Icon name="folder" size={18}/><span>{settings.outputDir || "Папку не обрано"}</span></div></div><button className="secondary-button" disabled={!settingsEditable} onClick={onChooseFolder}>Змінити</button></div>
-      </div>
-    </details>}
-
-    <div className={`queue-links-header ${queue?.status || "draft"}`}>
-      <div>
-        <small>Посилання для завантаження</small>
-        <p>Кожне з нового рядка · список можна вставити цілком</p>
-      </div>
-      <span className="queue-links-count"><strong>{progress.total}</strong><small>із {QUEUE_LIMIT}</small></span>
-      {queue?.status !== "draft" && <div className="queue-summary-progress"><span style={{ width: `${progress.percent}%` }}/></div>}
-    </div>
-
-    <div className="queue-items">
-      {queue?.items.map((item, index) => {
-        const itemEditable = canEditQueueItem(queue, item);
-        const storageLabel = queueStorageLabel(item);
-        return <article className={`queue-item ${item.status}`} key={item.id}>
-        <span className="queue-item-index">{String(index + 1).padStart(2, "0")}</span>
-        <div className="queue-item-copy">
-          {itemEditable
-            ? <input value={item.url} aria-label={`Посилання ${index + 1}`} onChange={(event) => onChangeItem(item.id, event.target.value)} />
-            : <strong title={item.url}>{item.title || item.url}</strong>}
-          <small className={normalizeHttpUrl(item.url) ? "" : "invalid"}>{queueStatusLabel(item)}{item.message && item.message !== queueStatusLabel(item) ? ` · ${item.message}` : ""}</small>
-          {storageLabel && <small className={item.storage?.sufficient === false ? "invalid" : "queue-storage"}>{storageLabel}</small>}
-          {item.id === activeItem?.id && <div className={`queue-item-progress ${item.status === "postprocessing" ? "indeterminate" : ""}`}><span style={item.status === "postprocessing" ? undefined : { width: `${item.percent}%` }}/></div>}
-        </div>
-        {item.status === "completed" ? <span className="queue-item-result">{formatByteSize(item.finalSize)}<Icon name="check" size={16}/></span>
-          : item.finalSize > 0 ? <span className={`queue-item-result partial ${item.status}`}>{formatByteSize(item.finalSize)}<small>{queueStatusLabel(item)}</small></span>
-          : itemEditable ? <button className="queue-remove" aria-label={`Видалити рядок ${index + 1}`} onClick={() => onRemoveItem(item.id)}><Icon name="x" size={16}/></button>
-            : <span className={`queue-state ${item.status}`}>{queueStatusLabel(item)}</span>}
-      </article>})}
-      {settingsEditable && queue?.status !== "completed" && progress.total < QUEUE_LIMIT && <article className="queue-item queue-item-new">
-        <span className="queue-item-index">{String(progress.total + 1).padStart(2, "0")}</span>
-        <div className="queue-item-copy">
-          <input id="queue-links" value={input} aria-label="Нове посилання" onChange={(event) => onInput(event.target.value)} onPaste={onPaste} onBlur={() => { if (input.trim()) onAdd(); }} onKeyDown={(event) => {
-            if (event.key === "Enter") { event.preventDefault(); onAdd(); }
-          }} placeholder={progress.total ? "Вставте наступне посилання…" : "Вставте сюди перше посилання…"} />
-          <small>Вставте URL і натисніть Enter · можна вставити одразу кілька посилань</small>
-        </div>
-        <span className="queue-new-mark">+</span>
-      </article>}
-    </div>
-    <p className="queue-limit">{progress.total} із {QUEUE_LIMIT}. Посилання перевірятимуться вже під час завантаження.</p>
-
-    {notice && <div className="inline-error queue-notice">{notice}</div>}
-    <div className="queue-actions">
-      {(!queue || queue.status === "draft") && <button className="primary-button" disabled={(!queue?.items.length && !input.trim()) || !runtimeReady || singleDownloadActive} onClick={onStart}><Icon name="download"/>Почати пакетне завантаження</button>}
-      {queue?.status === "running" && <><button className="secondary-button" onClick={onPause}>Пауза після поточного</button><button className="secondary-button" disabled={!activeItem} onClick={onSkip}>Пропустити поточне</button><button className="cancel-confirm-button" onClick={onStop}>Зупинити все</button></>}
-      {queue?.status === "paused" && <><button className="primary-button compact" disabled={singleDownloadActive || Boolean(activeItem)} onClick={onResume}><Icon name="download"/>{activeItem ? "Завершуємо поточний файл…" : "Продовжити"}</button>{activeItem && <button className="secondary-button" onClick={onSkip}>Пропустити поточне</button>}<button className="queue-new-button" disabled={Boolean(activeItem)} onClick={onNew}>Нова черга</button></>}
-      {queue?.status === "completed" && <>{failedCount > 0 && <button className="secondary-button" onClick={onRetry}>Спробувати проблемні ({failedCount})</button>}<button className="primary-button compact" onClick={onReplay}><Icon name="refresh"/>Повторити чергу</button><button className="queue-new-button" onClick={onNew}>Нова черга</button></>}
-    </div>
-  </section>;
-}
-
-function QueueProgressModal({ queue, alert, singleDownloadActive, onClose, onPause, onResume, onSkip, onStop, onRetry, onReplay, onNew }: {
-  queue: DownloadQueue;
-  alert: { title: string; message: string } | null;
-  singleDownloadActive: boolean;
-  onClose: () => void;
-  onPause: () => void;
-  onResume: () => void;
-  onSkip: () => void;
-  onStop: () => void;
-  onRetry: () => void;
-  onReplay: () => void;
-  onNew: () => void;
-}) {
-  const progress = queueProgress(queue.items);
-  const activeItem = queue.items.find((item) => item.id === queue.activeItemId) || null;
-  const failedCount = queue.items.filter((item) => item.status === "failed" || item.status === "interrupted").length;
-  const skippedCount = queue.items.filter((item) => item.status === "skipped").length;
-  const statusTitle = queue.status === "running"
-    ? activeItem ? "Завантажуємо чергу" : "Готуємо наступне посилання"
-    : queue.status === "paused" ? "Чергу призупинено" : "Чергу оброблено";
-
-  return <div className="download-progress-backdrop queue-progress-backdrop" role="presentation">
-    <DialogSurface className={`queue-progress-modal ${queue.status}`} labelledBy="queue-progress-title" onEscape={onClose}>
-      <header className="queue-progress-header">
-        <div className="queue-progress-symbol"><Icon name={queue.status === "completed" ? "check" : "list"} size={24}/></div>
-        <div>
-          <p className="eyebrow">ПАКЕТНЕ ЗАВАНТАЖЕННЯ</p>
-          <h2 id="queue-progress-title">{statusTitle}</h2>
-          <p>{progress.done} із {progress.total} оброблено{failedCount ? ` · проблемних ${failedCount}` : ""}{skippedCount ? ` · пропущено ${skippedCount}` : ""}</p>
-        </div>
-        <strong className="queue-progress-value">{progress.percent}%</strong>
-        <button type="button" className="queue-progress-close" aria-label="Згорнути стан черги" title="Згорнути" onClick={onClose}><Icon name="x" size={18}/></button>
-      </header>
-      <div className="queue-modal-progress" role="progressbar" aria-label="Загальний прогрес черги" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress.percent}><span style={{ width: `${progress.percent}%` }}/></div>
-      {alert && <div className="queue-progress-alert"><Icon name={queue.status === "completed" ? "check" : "shield"} size={18}/><span><strong>{alert.title}</strong><small>{alert.message}</small></span></div>}
-      <div className="queue-progress-list">
-        {queue.items.map((item, index) => {
-          const active = item.id === activeItem?.id;
-          return <article className={`queue-progress-row ${item.status} ${active ? "active" : ""}`} key={item.id}>
-            <span className="queue-progress-index">{String(index + 1).padStart(2, "0")}</span>
-            <div className="queue-progress-copy">
-              <strong title={item.title || item.url}>{item.title || item.url}</strong>
-              <small>{queueStatusLabel(item)}{item.message && item.message !== queueStatusLabel(item) ? ` · ${item.message}` : ""}</small>
-              {!activeItem && ["failed", "interrupted"].includes(item.status) && item.jobId && <DownloadTools url={item.url} jobId={item.jobId} canDiscover={canOfferBrowserDiscovery(item.errorCode)}/>}
-              {active && <div className={`queue-item-progress ${item.status === "postprocessing" ? "indeterminate" : ""}`}><span style={item.status === "postprocessing" ? undefined : { width: `${item.percent}%` }}/></div>}
-            </div>
-            <span className={`queue-progress-status ${item.status}`}>{item.finalSize > 0 ? <>{formatByteSize(item.finalSize)}{item.status !== "completed" && <small>{queueStatusLabel(item)}</small>}</> : ["downloading", "converting"].includes(item.status) ? `${Math.round(item.percent)}%` : queueStatusLabel(item)}</span>
-          </article>;
-        })}
-      </div>
-      <footer className="queue-modal-actions">
-        {queue.status === "running" && <><button className="secondary-button" onClick={onPause}>Пауза після поточного</button><button className="secondary-button" disabled={!activeItem} onClick={onSkip}>Пропустити поточне</button><button className="cancel-confirm-button" onClick={onStop}>Зупинити все</button></>}
-        {queue.status === "paused" && <><button className="primary-button compact" disabled={singleDownloadActive || Boolean(activeItem)} onClick={onResume}><Icon name="download"/>{activeItem ? "Завершуємо поточний файл…" : "Продовжити"}</button>{activeItem && <button className="secondary-button" onClick={onSkip}>Пропустити поточне</button>}<button className="queue-new-button" disabled={Boolean(activeItem)} onClick={onNew}>Нова черга</button></>}
-        {queue.status === "completed" && <>{failedCount > 0 && <button className="secondary-button" onClick={onRetry}>Проблемні ще раз ({failedCount})</button>}<button className="primary-button compact" onClick={onReplay}><Icon name="refresh"/>Повторити чергу</button><button className="queue-new-button" onClick={onNew}>Нова черга</button></>}
-      </footer>
-    </DialogSurface>
-  </div>;
-}
-
 function UpdateReleaseNotes({ notes }: { notes: string }) {
   return <div className="modal-detail update-notes">
     {notes.split(/\r?\n/).map((line, index) => {
@@ -2463,122 +2024,6 @@ function UpdateReleaseNotes({ notes }: { notes: string }) {
   </div>;
 }
 
-function HistoryView({ entries, retryingId, retryDisabled, onRetry, onClear }: {
-  entries: HistoryEntry[];
-  retryingId: string | null;
-  retryDisabled: boolean;
-  onRetry: (entry: HistoryEntry) => void;
-  onClear: () => void;
-}) {
-  const groups = groupHistoryEntries(entries);
-  const [openGroups, setOpenGroups] = useState<Set<string>>(() => new Set(groups[0] ? [groups[0].key] : []));
-
-  useEffect(() => {
-    const firstKey = groups[0]?.key;
-    if (!firstKey) return;
-    setOpenGroups((current) => current.size ? current : new Set([firstKey]));
-  }, [groups[0]?.key]);
-
-  if (!entries.length) {
-    return <section className="history-panel empty-history">
-      <div className="empty-history-mark"><Icon name="clock" size={34}/></div>
-      <p className="eyebrow">ПОКИ ПОРОЖНЬО</p>
-      <h2>Завантаження з’являться тут</h2>
-      <p>Після успішного завершення ми збережемо прев’ю, точний розмір, час і шлях до файла. Самі файли нікуди не копіюються.</p>
-    </section>;
-  }
-
-  return <section className="history-panel">
-    <div className="history-toolbar">
-      <div><strong>{entries.length}</strong><span>{entries.length === 1 ? "файл в історії" : "файлів в історії"}</span></div>
-      <button type="button" onClick={onClear}>Очистити історію</button>
-    </div>
-    <div className="history-groups">
-      {groups.map((group) => <details
-        key={group.key}
-        open={openGroups.has(group.key)}
-        onToggle={(event) => {
-          const isOpen = event.currentTarget.open;
-          setOpenGroups((current) => {
-            if (current.has(group.key) === isOpen) return current;
-            const next = new Set(current);
-            if (isOpen) next.add(group.key); else next.delete(group.key);
-            return next;
-          });
-        }}
-      >
-        <summary><span>{group.label}</span><small>{group.items.length}</small><Icon name="chevron" size={17}/></summary>
-        <div className="history-list">
-          {group.items.map((entry) => <article className={`history-item ${entry.available ? "available" : "missing"}`} key={entry.id}>
-            <HistoryThumbnail entry={entry}/>
-            <div className="history-copy">
-              <div className="history-title-row"><strong>{entry.title}</strong><time dateTime={entry.downloadedAt}>{new Intl.DateTimeFormat("uk-UA", { hour: "2-digit", minute: "2-digit" }).format(new Date(entry.downloadedAt))}</time></div>
-              <p>{[entry.uploader, entry.extractor, formatByteSize(entry.size)].filter(Boolean).join(" · ")}</p>
-              {entry.path ? <div className="history-location" title={entry.path}><span className={`history-state-dot ${entry.available ? "ready" : "missing"}`}/><span>{entry.available ? "Файл на місці" : "Файл недоступний"}</span><Icon name="folder" size={14}/><code>{entry.path}</code></div> : <p>{entry.outcome === "cancelled" ? "Скасовано" : entry.outcome === "auth_required" ? "Потрібен вхід" : "Не вдалося завантажити"} · {entry.message}</p>}
-            </div>
-            <div className="history-actions">
-              <button type="button" className="history-retry-button" disabled={retryDisabled || retryingId !== null} onClick={() => onRetry(entry)}>{retryingId === entry.id ? "Готуємо…" : "Завантажити ще раз"}</button>
-              {entry.path && <button type="button" disabled={!entry.available} onClick={() => revealItemInDir(entry.path)}>Показати</button>}
-              <button type="button" onClick={() => openUrl(entry.sourceUrl)}>Джерело</button>
-              <HistoryDetails title={entry.title} diagnostics={entry.diagnostics}/>
-            </div>
-          </article>)}
-        </div>
-      </details>)}
-    </div>
-  </section>;
-}
-
-function RuntimeRow({ label, component, loading = false, retry }: { label: string; component?: ComponentStatus; loading?: boolean; retry?: () => void }) {
-  const ready = component?.installed;
-  const showRetry = shouldShowRuntimeRetry(loading, Boolean(retry));
-  return <div className="runtime-row"><span className={`component-dot ${loading ? "loading" : ready ? "ready" : "missing"}`}/><div><strong>{label}</strong><small>{loading ? "Завантажуємо й перевіряємо…" : ready ? shortVersion(component.version) : "Компонент недоступний"}</small></div>{showRetry ? <button type="button" className="runtime-retry" aria-label={`Повторити встановлення ${label}`} onClick={retry}><Icon name="refresh" size={14}/></button> : ready && !loading ? <Icon name="check" size={15}/> : null}</div>;
-}
-
-function StartupOverlay({ progress, message }: { progress: number; message: string }) {
-  return <div className="startup-overlay" role="status" aria-live="polite">
-    <div className="startup-body">
-      <div className="startup-hands" aria-hidden="true">
-        <img src={loadingHandOne} alt="" />
-        <img src={loadingHandTwo} alt="" />
-        <img src={loadingHandThree} alt="" />
-      </div>
-      <p className="eyebrow">YT-DLP BD</p>
-      <h1>Запускаємо застосунок</h1>
-      <p>{message}</p>
-      <div className="startup-progress" aria-label="Прогрес запуску" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(progress)} role="progressbar"><span style={{ width: `${progress}%` }}/></div>
-      <small>{Math.round(progress)}%</small>
-    </div>
-  </div>;
-}
-
-function RuntimePreparationOverlay({ stage, runtime, progress }: { stage: RuntimeStage; runtime: RuntimeStatus | null; progress: RuntimeInstallProgress | null }) {
-  const components = [
-    { key: "ytDlp", label: "yt-dlp", component: runtime?.ytDlp },
-    { key: "ffmpeg", label: "ffmpeg", component: runtime?.ffmpeg },
-    { key: "deno", label: "Deno", component: runtime?.deno },
-  ] as const;
-
-  return <div className="runtime-preparation-backdrop" role="presentation">
-    <DialogSurface className="runtime-preparation-modal" labelledBy="runtime-preparation-title" describedBy="runtime-preparation-description">
-      <div className="runtime-preparation-spinner" aria-hidden="true"><span/></div>
-      <p className="eyebrow">ПІДГОТОВКА ДО РОБОТИ</p>
-      <h2 id="runtime-preparation-title">Готуємо компоненти</h2>
-      <p id="runtime-preparation-description">Перевіряємо та за потреби оновлюємо компоненти, необхідні для завантаження.</p>
-      <div className="runtime-preparation-list" aria-label="Стан компонентів">
-        {components.map(({ key, label, component }) => {
-          const activeStage = stage === key;
-          const ready = Boolean(component?.installed) && !activeStage;
-          return <div className={activeStage ? "active" : ready ? "ready" : "waiting"} key={key}>
-            <span className="runtime-preparation-status">{ready ? <Icon name="check" size={14}/> : <i/>}</span>
-            <strong>{label}</strong>
-            <small>{activeStage ? progress?.component === key && progress.total ? `${Math.min(100, Math.round((progress.downloaded / progress.total) * 100))}%` : "Встановлюємо…" : ready ? "Готово" : "Очікує"}</small>
-          </div>;
-        })}
-      </div>
-      <p className="runtime-wait-note">Будь ласка, зачекайте й не закривайте застосунок. Завантаження стане доступним автоматично.</p>
-    </DialogSurface>
-  </div>;
-}
-
+export { applyHistoryFileStatuses, applyHistoryThumbnailCache, groupHistoryEntries, historyPaths, limitHistoryDiagnostics, parseHistoryStorage, shouldCacheHistoryThumbnail, shouldDeleteUnusedHistoryThumbnail, type HistoryEntry, type HistoryFileStatus } from "./history";
+export { shouldShowRuntimeRetry } from "./RuntimeViews";
 export default App;

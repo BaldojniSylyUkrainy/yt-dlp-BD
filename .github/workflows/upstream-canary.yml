@@ -1,0 +1,31 @@
+name: Upstream yt-dlp canary
+
+# The app follows yt-dlp nightly on its own, and the Instagram plugin overrides
+# upstream internals. This run reports a breaking upstream change before users do.
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  instagram-plugin:
+    name: Instagram plugin on current yt-dlp
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Fetch current yt-dlp source
+        run: git clone --depth 1 https://github.com/yt-dlp/yt-dlp.git "$RUNNER_TEMP/yt-dlp"
+      - name: Run plugin checks against real yt-dlp
+        env:
+          YT_DLP_SOURCE: ${{ runner.temp }}/yt-dlp
+        run: |
+          python scripts/instagram-photo-test.py
+          python scripts/instagram-photo-integration-test.py

@@ -22,20 +22,14 @@ pub(crate) async fn runtime_update_available(
             serde_json::from_slice(&bytes).map_err(|_| "Некоректна відповідь nightly")?;
         let version = fs::read_to_string(directory.join(".yt-dlp.version")).ok();
         ensure_ytdlp_nightly_not_rollback(&release.tag_name, version.as_deref().map(str::trim))?;
-        let asset = select_nightly_asset(
-            &release,
-            if cfg!(windows) {
-                "yt-dlp.exe"
-            } else {
-                "yt-dlp_macos"
-            },
-        )?;
+        let asset = select_nightly_asset(&release, nightly_asset_name())?;
         let digest = github_asset_sha256(&asset)?;
         let accepted = fs::read_to_string(directory.join(".yt-dlp.sha256")).ok();
-        let path = yt_dlp_path(&app)?;
-        let actual = tauri::async_runtime::spawn_blocking(move || sha256_file(&path).ok())
-            .await
-            .map_err(|e| e.to_string())?;
+        let digest_app = app.clone();
+        let actual =
+            tauri::async_runtime::spawn_blocking(move || installed_ytdlp_asset_digest(&digest_app))
+                .await
+                .map_err(|e| e.to_string())??;
         return Ok(!verified_nightly_is_current(
             &release.tag_name,
             version.as_deref(),

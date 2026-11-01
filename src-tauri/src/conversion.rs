@@ -141,6 +141,38 @@ fn probe_uncached(ffmpeg: &Path, input: &Path) -> Result<ProcessingPlan, String>
     Ok(from_streams(&value))
 }
 
+/// Audio already in the requested codec only needs a new container, not a
+/// lossy second encode. Any probe failure simply falls back to encoding.
+fn audio_stream_copyable(ffmpeg: &Path, input: &Path, output_format: &str) -> bool {
+    let mut command = Command::new(ffprobe_path(ffmpeg));
+    command.args(LOCAL_INPUT_PROTOCOLS).args([
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=codec_name",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+    ]);
+    process_runner::capture(command.arg(input), Duration::from_secs(15))
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| {
+            audio_codec_matches_format(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                output_format,
+            )
+        })
+}
+
+fn audio_codec_matches_format(codec: &str, output_format: &str) -> bool {
+    matches!(
+        (codec, output_format),
+        ("aac", "m4a") | ("mp3", "mp3") | ("opus", "opus")
+    )
+}
+
 fn redacted_probe_stderr(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr)
         .lines()
@@ -387,27 +419,6 @@ pub(super) fn remember_windows_video_encoder(ffmpeg_path: &Path, encoder: VideoE
     }
 }
 
-#[cfg(test)]
-pub(super) fn parse_media_codecs(metadata: &serde_json::Value) -> Option<(String, Vec<String>)> {
-    let streams = metadata.get("streams")?.as_array()?;
-    let video = streams.iter().find_map(|stream| {
-        if stream.get("codec_type")?.as_str()? != "video" {
-            return None;
-        }
-        Some(stream.get("codec_name")?.as_str()?.to_ascii_lowercase())
-    })?;
-    let audio = streams
-        .iter()
-        .filter_map(|stream| {
-            if stream.get("codec_type")?.as_str()? != "audio" {
-                return None;
-            }
-            Some(stream.get("codec_name")?.as_str()?.to_ascii_lowercase())
-        })
-        .collect();
-    Some((video, audio))
-}
-
 pub(super) fn is_ready_compatible_mp4(
     media: &DownloadedMedia,
     ffmpeg_path: &Path,
@@ -436,6 +447,9 @@ pub(super) fn is_ready_compatible_mp4(
 }
 
 pub(super) fn conversion_error_code(error: &str) -> &'static str {
+    if error.contains(DESTINATION_UNAVAILABLE_MESSAGE) {
+        return "destination_unavailable";
+    }
     if error.to_lowercase().contains("недостатньо вільного місця") {
         return "low_disk";
     }
@@ -457,11 +471,31 @@ fn storage_errors_survive_conversion_classification() {
     assert_eq!(conversion_error_code("Encoder failed"), "conversion_failed");
 }
 
+const PHOTO_EXTENSIONS: [&str; 6] = ["jpg", "jpeg", "png", "webp", "heic", "avif"];
+
+/// A still photo from the Instagram plugin is kept exactly as downloaded. The
+/// extension check keeps the metadata flag from ever bypassing video handling.
+pub(super) fn is_downloaded_photo(media: &DownloadedMedia) -> bool {
+    media.photo
+        && media
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                PHOTO_EXTENSIONS
+                    .iter()
+                    .any(|allowed| extension.eq_ignore_ascii_case(allowed))
+            })
+}
+
 pub(super) fn requires_app_conversion(
     media: &DownloadedMedia,
     output_format: &str,
     ffmpeg_path: &Path,
 ) -> Result<bool, String> {
+    if is_downloaded_photo(media) {
+        return Ok(false);
+    }
     if output_format != "mp4" {
         return Ok(true);
     }
@@ -582,6 +616,12 @@ pub(super) fn run_conversion_attempt(
     } else {
         command.args(["-map", "0:a:0", "-vn", "-map_metadata", "0"]);
         match output_format {
+            _ if processing.copy_audio => {
+                command.args(["-c:a", "copy"]);
+                if output_format == "m4a" {
+                    command.args(["-movflags", "+faststart"]);
+                }
+            }
             "m4a" => {
                 command.args(["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]);
             }
@@ -627,12 +667,10 @@ pub(super) fn run_conversion_attempt(
     let mut out_time_us = 0.0;
     let mut speed_value = 0.0;
     let format_label = output_format.to_ascii_uppercase();
-    let encoder_label = if processing.copy_video {
-        if processing.copy_audio {
-            "Без перекодування"
-        } else {
-            "Копіюємо відео · AAC"
-        }
+    let encoder_label = if processing.copy_audio && (processing.copy_video || media.is_none()) {
+        "Без перекодування"
+    } else if processing.copy_video {
+        "Копіюємо відео · AAC"
     } else if media.is_some() {
         encoder.label()
     } else {
@@ -640,6 +678,7 @@ pub(super) fn run_conversion_attempt(
     };
     let mut speed_label = encoder_label.to_string();
     let mut low_disk = false;
+    let mut destination_unavailable = false;
     if let Some(stdout) = stdout {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             if let Some(value) = line.strip_prefix("out_time_us=") {
@@ -656,11 +695,10 @@ pub(super) fn run_conversion_attempt(
                     .parse::<f64>()
                     .unwrap_or(speed_value);
             } else if line.starts_with("progress=") {
-                if available_disk_space(output_dir)
-                    .map(low_disk_guard_triggered)
-                    .unwrap_or(true)
-                {
+                let guard = disk_guard(output_dir);
+                if guard != DiskGuard::Ok {
                     low_disk = true;
+                    destination_unavailable = guard == DiskGuard::Unavailable;
                     let _ = stop_child_process_group(&child);
                     break;
                 }
@@ -689,13 +727,7 @@ pub(super) fn run_conversion_attempt(
                         } else {
                             format!("Створюємо {format_label}… Не закривайте застосунок")
                         }),
-                        storage: None,
-                        outputs: None,
-                        title: None,
-                        thumbnail: None,
-                        uploader: None,
-                        extractor: None,
-                        error_code: None,
+                        ..Default::default()
                     },
                 );
             }
@@ -724,6 +756,9 @@ pub(super) fn run_conversion_attempt(
     if download_was_cancelled(manager, id) {
         return Err(ConversionAttemptError::Cancelled);
     }
+    if destination_unavailable || (!status.success() && !destination_present(output_dir)) {
+        return Err(ConversionAttemptError::DestinationUnavailable);
+    }
     if low_disk {
         return Err(ConversionAttemptError::LowDisk);
     }
@@ -739,6 +774,19 @@ pub(super) fn run_conversion_attempt(
     Ok(())
 }
 
+/// Where the finished file goes. A job's own source with the same name is
+/// replaced by its result, so no needless ` (1)` appears; a file that was
+/// already in the folder is never touched.
+pub(super) fn conversion_output_path(input: &Path, extension: &str, source_owned: bool) -> PathBuf {
+    let preferred = input.with_extension(extension);
+    if source_owned && preferred == input {
+        preferred
+    } else {
+        available_output_path(input, extension)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn convert_downloaded_media(
     app: &AppHandle,
     manager: &DownloadManager,
@@ -747,6 +795,7 @@ pub(super) fn convert_downloaded_media(
     downloaded: &DownloadedMedia,
     file_position: (usize, usize),
     output_format: &str,
+    source_owned: bool,
 ) -> Result<PathBuf, String> {
     let input = &downloaded.path;
     if download_was_cancelled(manager, id) {
@@ -757,7 +806,10 @@ pub(super) fn convert_downloaded_media(
     let processing = if is_video {
         conversion::probe(ffmpeg_path, input)?
     } else {
-        conversion::ProcessingPlan::default()
+        conversion::ProcessingPlan {
+            copy_audio: audio_stream_copyable(ffmpeg_path, input, output_format),
+            ..Default::default()
+        }
     };
     let media = is_video
         .then(|| {
@@ -779,18 +831,19 @@ pub(super) fn convert_downloaded_media(
     } else {
         media_duration(ffmpeg_path, input)?
     };
-    let output = available_output_path(input, output_format);
+    let output = conversion_output_path(input, output_format, source_owned);
     let output_dir = output
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
-    if available_disk_space(&output_dir)
-        .map(low_disk_guard_triggered)
-        .unwrap_or(true)
-    {
-        return Err(
-            "Недостатньо вільного місця. Конвертацію не розпочато, щоб захистити диск.".into(),
-        );
+    match disk_guard(&output_dir) {
+        DiskGuard::Ok => {}
+        DiskGuard::Unavailable => return Err(DESTINATION_UNAVAILABLE_MESSAGE.into()),
+        DiskGuard::Low => {
+            return Err(
+                "Недостатньо вільного місця. Конвертацію не розпочато, щоб захистити диск.".into(),
+            )
+        }
     }
     let temporary = output_dir
         .join(format!(".yt-dlp-bd-{id}.tmp"))
@@ -840,13 +893,7 @@ pub(super) fn convert_downloaded_media(
                         "Апаратний кодер не завершив обробку — продовжуємо через {}…",
                         encoder.label()
                     )),
-                    storage: None,
-                    outputs: None,
-                    title: None,
-                    thumbnail: None,
-                    uploader: None,
-                    extractor: None,
-                    error_code: None,
+                    ..Default::default()
                 },
             );
         }
@@ -877,12 +924,18 @@ pub(super) fn convert_downloaded_media(
                         "Не вдалося зберегти готовий {format_label}: {error}"
                     ));
                 }
-                let _ = fs::remove_file(input);
+                if source_owned && output != *input {
+                    let _ = fs::remove_file(input);
+                }
                 return Ok(output);
             }
             Err(ConversionAttemptError::Cancelled) => {
                 cleanup_failed_conversion(&temporary);
                 return Err("Завантаження скасовано".into());
+            }
+            Err(ConversionAttemptError::DestinationUnavailable) => {
+                cleanup_failed_conversion(&temporary);
+                return Err(DESTINATION_UNAVAILABLE_MESSAGE.into());
             }
             Err(ConversionAttemptError::LowDisk) => {
                 cleanup_failed_conversion(&temporary);
@@ -929,11 +982,33 @@ mod tests {
             fps: None,
             video_codec: Some("h264".into()),
             audio_codec: Some("aac".into()),
+            photo: false,
         };
         let error = requires_app_conversion(&media, "mp4", &missing.join("ffmpeg"))
             .expect_err("A failed probe must never request speculative conversion");
         assert!(error.contains("ffprobe"));
         assert!(!friendly_conversion_error(&error).contains("пошкоджений"));
+    }
+
+    #[test]
+    fn same_codec_audio_is_copied_and_keeps_its_plain_name() {
+        assert!(audio_codec_matches_format("aac", "m4a"));
+        assert!(audio_codec_matches_format("opus", "opus"));
+        assert!(!audio_codec_matches_format("opus", "mp3"));
+        assert!(!audio_codec_matches_format("aac", "wav"));
+
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("song [id].m4a");
+        fs::write(&input, b"source").unwrap();
+        assert_eq!(conversion_output_path(&input, "m4a", true), input);
+        assert_eq!(
+            conversion_output_path(&input, "m4a", false),
+            directory.path().join("song [id] (1).m4a")
+        );
+        assert_eq!(
+            conversion_output_path(&input, "mp3", false),
+            directory.path().join("song [id].mp3")
+        );
     }
 
     #[test]

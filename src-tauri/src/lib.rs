@@ -28,37 +28,44 @@ mod browser_security;
 mod browser_smoke;
 mod diagnostics;
 mod discovery;
+mod errors;
 mod job_process;
 mod media_identity;
 #[cfg(test)]
 mod media_smoke_tests;
 mod probe_cache;
 mod process_runner;
+mod progress_speed;
 mod recovery;
+mod runtime;
 mod runtime_check;
 mod runtime_transaction;
+mod thumbnails;
+mod vpn;
+mod ytdlp_onedir;
+mod ytdlp_signature;
+use errors::*;
 use media_identity::MediaIdentity;
+use runtime::*;
+use thumbnails::*;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-const RUNTIME_MANIFEST_URL: &str = "https://github.com/BaldojniSylyUkrainy/yt-dlp-BD/releases/latest/download/runtime-components.json";
-const RUNTIME_MANIFEST_SIGNATURE_URL: &str = "https://github.com/BaldojniSylyUkrainy/yt-dlp-BD/releases/latest/download/runtime-components.json.sig";
-const YT_DLP_NIGHTLY_RELEASE_API: &str =
-    "https://api.github.com/repos/yt-dlp/yt-dlp-nightly-builds/releases/latest";
-const MAX_RUNTIME_METADATA_BYTES: usize = 1024 * 1024;
-const MAX_YT_DLP_BINARY_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_DENO_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_FFMPEG_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-const RUNTIME_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
-const RUNTIME_DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-const YT_DLP_VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(35);
-const TAURI_CONFIG_SOURCE: &str = include_str!("../tauri.conf.json");
+// The first start of a new binary waits for the system scan: about 30 s on Mac.
 const MIN_FREE_SPACE_RESERVE: u64 = 500 * 1024 * 1024;
 const DISK_GUARD_TRIGGER: u64 = MIN_FREE_SPACE_RESERVE + 128 * 1024 * 1024;
-const MAX_HISTORY_THUMBNAIL_BYTES: u64 = 8 * 1024 * 1024;
-const HISTORY_THUMBNAIL_CACHE_LIMIT: usize = 550;
 const THREADS_EXTRACTOR_SOURCE: &str = include_str!("../resources/threads_extractor.py");
+const DISCOVERY_EXTRACTOR_SOURCE: &str = include_str!("../resources/discovery_extractor.py");
+const INSTAGRAM_PHOTOS_SOURCE: &str = include_str!("../resources/instagram_photos.py");
+/// yt-dlp format id that the Instagram plugin gives to a still photo (spelled
+/// out in `format_selector`). It only exists on media items without any video.
+#[cfg(test)]
+const INSTAGRAM_PHOTO_FORMAT_ID: &str = "baldojnyi-photo";
+const INSTAGRAM_PHOTO_ONLY_MARKER: &str = "BALDOJNYI_PHOTO_ONLY";
+const INSTAGRAM_PHOTOS_SKIPPED_MARKER: &str = "BALDOJNYI_PHOTOS_SKIPPED";
+const PHOTOS_SKIPPED_NOTICE: &str =
+    "Готово. Фото з поста пропущено: режим «Аудіо» зберігає лише звук.";
 const YTDLP_OUTPUT_TEMPLATE: &str = "%(title).140B [%(id).40B].%(ext)s";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -77,136 +84,10 @@ const ES_CONTINUOUS: u32 = 0x8000_0000;
 #[cfg(target_os = "windows")]
 const ES_SYSTEM_REQUIRED: u32 = 0x0000_0001;
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ComponentStatus {
-    installed: bool,
-    version: Option<String>,
-    path: Option<String>,
-    managed: bool,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RuntimeStatus {
-    yt_dlp: ComponentStatus,
-    ffmpeg: ComponentStatus,
-    deno: ComponentStatus,
-    runtime_dir: String,
-    platform: String,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RuntimeInstallProgress {
-    component: String,
-    downloaded: u64,
-    total: Option<u64>,
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RuntimeAssetManifest {
-    version: String,
-    url: String,
-    sha256: String,
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RuntimeFfmpegManifest {
-    version: String,
-    archive: Option<RuntimeAssetManifest>,
-    ffmpeg: Option<RuntimeAssetManifest>,
-    ffprobe: Option<RuntimeAssetManifest>,
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RuntimePlatformManifest {
-    yt_dlp: RuntimeAssetManifest,
-    deno: RuntimeAssetManifest,
-    ffmpeg: RuntimeFfmpegManifest,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RuntimeManifest {
-    schema_version: u32,
-    release_version: String,
-    generated_at: String,
-    platforms: HashMap<String, RuntimePlatformManifest>,
-}
-
-#[derive(Deserialize)]
-struct GithubRelease {
-    tag_name: String,
-    assets: Vec<GithubReleaseAsset>,
-}
-
-#[derive(Clone, Deserialize)]
-struct GithubReleaseAsset {
-    name: String,
-    browser_download_url: String,
-    digest: Option<String>,
-    size: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RuntimeManifestState {
-    release_version: String,
-    generated_at: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct VpnStatus {
-    detected: bool,
-    interface_name: Option<String>,
-    confidence: String,
-    detail: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MediaPreview {
-    title: String,
-    thumbnail: Option<String>,
-    duration: Option<f64>,
-    duration_is_total: bool,
-    uploader: Option<String>,
-    extractor: Option<String>,
-    webpage_url: Option<String>,
-    item_count: Option<u64>,
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PreflightRequest {
-    url: String,
-    output_dir: String,
-    mode: String,
-    quality: String,
-    audio_format: String,
-    multi_item: bool,
-    title: Option<String>,
-    duration: Option<f64>,
-    item_count: Option<u64>,
-    duration_is_total: Option<bool>,
-}
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PreflightResult {
-    title: String,
-    item_count: u64,
-    intermediate_size: Option<u64>,
-    final_output_size: Option<u64>,
-    protected_reserve: u64,
-    required_space: Option<u64>,
     available_space: u64,
-    confidence: String,
     sufficient: bool,
 }
 
@@ -223,10 +104,9 @@ struct DownloadRequest {
     subtitles: bool,
     multi_item: bool,
     cookies_browser: Option<String>,
-    expected_required_space: Option<u64>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DownloadEvent {
     id: String,
@@ -303,6 +183,8 @@ struct DownloadedMedia {
     fps: Option<f64>,
     video_codec: Option<String>,
     audio_codec: Option<String>,
+    /// A still photo saved by the Instagram plugin; never probed or converted.
+    photo: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -351,6 +233,7 @@ impl VideoEncoder {
 enum ConversionAttemptError {
     Cancelled,
     LowDisk,
+    DestinationUnavailable,
     Failed(String),
 }
 
@@ -367,6 +250,8 @@ struct OutputReaderState {
     storage_tracker: Option<StorageTracker>,
     last_error: Arc<Mutex<Option<String>>>,
     auth_retry: AuthRetryPolicy,
+    /// Set when the Instagram plugin dropped photo slides in audio mode.
+    photos_skipped: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Default)]
@@ -377,32 +262,12 @@ struct DownloadManager {
     auth_required: Arc<Mutex<HashSet<String>>>,
 }
 
-#[derive(Clone, Default)]
-struct ProbeManager {
-    active: Arc<Mutex<Option<(String, tokio::task::AbortHandle)>>>,
-}
-
 #[derive(Default)]
 struct SleepPrevention {
     #[cfg(target_os = "macos")]
     process: Mutex<Option<Child>>,
     #[cfg(target_os = "windows")]
     stop: Mutex<Option<std::sync::mpsc::Sender<()>>>,
-}
-
-#[derive(Default)]
-struct HistoryThumbnailCache {
-    operation: tokio::sync::Mutex<()>,
-}
-
-#[derive(Default)]
-struct RuntimeMaintenance {
-    operation: tokio::sync::Mutex<()>,
-    manifest: tokio::sync::Mutex<Option<(Instant, RuntimePlatformManifest)>>,
-}
-
-struct RuntimeProcessLock {
-    file: fs::File,
 }
 
 impl Drop for RuntimeProcessLock {
@@ -475,1767 +340,6 @@ fn confirm_app_close(app: AppHandle, confirmation: State<'_, AppExitConfirmation
     app.exit(0);
 }
 
-fn ensure_runtime_idle(manager: &DownloadManager) -> Result<(), String> {
-    let active = manager
-        .jobs
-        .lock()
-        .map_err(|_| "Не вдалося перевірити активні завантаження".to_string())?;
-    if active.is_empty() {
-        Ok(())
-    } else {
-        Err("Компоненти оновляться після завершення активного завантаження".into())
-    }
-}
-
-fn acquire_runtime_process_lock(app: &AppHandle) -> Result<RuntimeProcessLock, String> {
-    let path = runtime_dir(app)?.join(".runtime-maintenance.lock");
-    try_lock_runtime_file(&path)
-}
-
-fn try_lock_runtime_file(path: &Path) -> Result<RuntimeProcessLock, String> {
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|error| format!("Не вдалося відкрити блокування runtime: {error}"))?;
-    fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::WouldBlock {
-            "Інша копія застосунку вже обслуговує runtime-компоненти".to_string()
-        } else {
-            format!("Не вдалося заблокувати runtime-компоненти: {error}")
-        }
-    })?;
-    Ok(RuntimeProcessLock { file })
-}
-
-fn runtime_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let directory = app
-        .path()
-        .app_local_data_dir()
-        .map_err(|error| format!("Не вдалося знайти папку застосунку: {error}"))?
-        .join("runtime");
-    fs::create_dir_all(&directory)
-        .map_err(|error| format!("Не вдалося створити runtime-папку: {error}"))?;
-    Ok(directory)
-}
-
-fn yt_dlp_path(app: &AppHandle) -> Result<PathBuf, String> {
-    #[cfg(target_os = "windows")]
-    let filename = "yt-dlp.exe";
-    #[cfg(not(target_os = "windows"))]
-    let filename = "yt-dlp";
-    Ok(runtime_dir(app)?.join(filename))
-}
-
-fn install_threads_plugin_at(plugin_root: &Path) -> Result<PathBuf, String> {
-    let extractor_directory = plugin_root
-        .join("baldojnyi")
-        .join("yt_dlp_plugins")
-        .join("extractor");
-    fs::create_dir_all(&extractor_directory)
-        .map_err(|error| format!("Не вдалося підготувати Threads-модуль: {error}"))?;
-    let discovery_destination = extractor_directory.join("discovery_baldojnyi.py");
-    let discovery_source = include_str!("../resources/discovery_extractor.py");
-    if fs::read(&discovery_destination).ok().as_deref() != Some(discovery_source.as_bytes()) {
-        let temporary = extractor_directory.join(format!(".discovery-{}.tmp", Uuid::new_v4()));
-        fs::write(&temporary, discovery_source).map_err(|e| e.to_string())?;
-        replace_runtime_file(&temporary, &discovery_destination, "модуль пошуку")?;
-    }
-    let destination = extractor_directory.join("threads_baldojnyi.py");
-    if fs::read(&destination)
-        .map(|content| content == THREADS_EXTRACTOR_SOURCE.as_bytes())
-        .unwrap_or(false)
-    {
-        return Ok(plugin_root.to_path_buf());
-    }
-    let temporary = extractor_directory.join(format!(".threads_baldojnyi-{}.tmp", Uuid::new_v4()));
-    fs::write(&temporary, THREADS_EXTRACTOR_SOURCE)
-        .map_err(|error| format!("Не вдалося записати Threads-модуль: {error}"))?;
-    if let Err(error) = replace_runtime_file(&temporary, &destination, "Threads-модуль") {
-        let _ = fs::remove_file(temporary);
-        return Err(error);
-    }
-    Ok(plugin_root.to_path_buf())
-}
-
-fn threads_plugin_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    static INSTALL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let _guard = INSTALL_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .map_err(|_| "Не вдалося підготувати Threads-модуль".to_string())?;
-    install_threads_plugin_at(&runtime_dir(app)?.join("plugins"))
-}
-
-fn configure_command(command: &mut Command) {
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    #[cfg(not(target_os = "windows"))]
-    let _ = command;
-}
-
-fn configure_tokio_command(command: &mut tokio::process::Command) {
-    #[cfg(target_os = "windows")]
-    command.creation_flags(CREATE_NO_WINDOW);
-    #[cfg(not(target_os = "windows"))]
-    let _ = command;
-}
-
-#[cfg(any(target_os = "windows", test))]
-fn windows_powershell_script(script: &str) -> String {
-    format!("{WINDOWS_POWERSHELL_UTF8_PREFIX}{script}")
-}
-
-fn command_version(path: &Path, args: &[&str]) -> Option<String> {
-    probe_cache::version(path, args, || command_version_uncached(path, args))
-}
-fn command_version_uncached(path: &Path, args: &[&str]) -> Option<String> {
-    let mut command = Command::new(path);
-    configure_command(&mut command);
-    let output = process_runner::capture(command.args(args), Duration::from_secs(5)).ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!text.is_empty()).then_some(text)
-}
-
-async fn command_version_bounded(
-    path: &Path,
-    args: &[&str],
-    timeout_duration: Duration,
-) -> Result<Option<String>, String> {
-    let mut command = tokio::process::Command::new(path);
-    configure_tokio_command(&mut command);
-    command.args(args).kill_on_drop(true);
-    let output = tokio::time::timeout(timeout_duration, command.output())
-        .await
-        .map_err(|_| "Перевірка нового yt-dlp тривала надто довго".to_string())?
-        .map_err(|error| format!("Не вдалося запустити новий yt-dlp: {error}"))?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok((!text.is_empty()).then_some(text))
-}
-
-fn parsed_yt_dlp_version(value: &str) -> Option<Vec<u64>> {
-    let parts = value
-        .trim()
-        .split('.')
-        .map(str::parse::<u64>)
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?;
-    (parts.len() == 3 || parts.len() == 4).then_some(parts)
-}
-
-fn ensure_ytdlp_nightly_not_rollback(incoming: &str, accepted: Option<&str>) -> Result<(), String> {
-    let incoming = parsed_yt_dlp_version(incoming)
-        .filter(|parts| parts.len() == 4)
-        .ok_or_else(|| "Офіційний nightly має неправильну версію".to_string())?;
-    let Some(accepted) = accepted.and_then(parsed_yt_dlp_version) else {
-        return Ok(());
-    };
-    if incoming < accepted {
-        return Err("Офіційний nightly старіший за вже прийняту версію".into());
-    }
-    Ok(())
-}
-
-fn ensure_ytdlp_bootstrap_not_rollback(
-    incoming: &str,
-    accepted: Option<&str>,
-    installed: bool,
-) -> Result<(), String> {
-    if !installed {
-        return Ok(());
-    }
-    let Some(incoming) = parsed_yt_dlp_version(incoming) else {
-        return Err("Підписаний yt-dlp має неправильну версію".into());
-    };
-    let Some(accepted) = accepted.and_then(parsed_yt_dlp_version) else {
-        return Ok(());
-    };
-    if incoming < accepted {
-        return Err("Підписаний yt-dlp старіший за вже прийняту версію".into());
-    }
-    Ok(())
-}
-
-fn verified_nightly_is_current(
-    release_tag: &str,
-    accepted_version: Option<&str>,
-    github_digest: &str,
-    accepted_digest: Option<&str>,
-    installed_digest: Option<&str>,
-) -> bool {
-    accepted_version.is_some_and(|version| version.trim() == release_tag)
-        && accepted_digest.is_some_and(|digest| digest.trim() == github_digest)
-        && installed_digest == Some(github_digest)
-}
-
-fn github_asset_sha256(asset: &GithubReleaseAsset) -> Result<String, String> {
-    let digest = asset
-        .digest
-        .as_deref()
-        .and_then(|value| value.strip_prefix("sha256:"))
-        .ok_or_else(|| format!("GitHub не надав SHA-256 для {}", asset.name))?;
-    if digest.len() != 64 || !digest.chars().all(|value| value.is_ascii_hexdigit()) {
-        return Err(format!(
-            "GitHub надав неправильний SHA-256 для {}",
-            asset.name
-        ));
-    }
-    Ok(digest.to_ascii_lowercase())
-}
-
-fn validate_nightly_asset_url(asset: &GithubReleaseAsset, tag: &str) -> Result<(), String> {
-    let url = Url::parse(&asset.browser_download_url)
-        .map_err(|_| format!("Nightly містить неправильний URL для {}", asset.name))?;
-    let expected_path = format!(
-        "/yt-dlp/yt-dlp-nightly-builds/releases/download/{tag}/{}",
-        asset.name
-    );
-    if url.scheme() != "https"
-        || url.host_str() != Some("github.com")
-        || url.path() != expected_path
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(format!(
-            "Nightly містить небезпечний URL для {}",
-            asset.name
-        ));
-    }
-    Ok(())
-}
-
-fn select_nightly_asset(release: &GithubRelease, name: &str) -> Result<GithubReleaseAsset, String> {
-    if parsed_yt_dlp_version(&release.tag_name)
-        .filter(|parts| parts.len() == 4)
-        .is_none()
-    {
-        return Err("Офіційний nightly має неправильну версію".into());
-    }
-    let mut matches = release.assets.iter().filter(|asset| asset.name == name);
-    let asset = matches
-        .next()
-        .cloned()
-        .ok_or_else(|| format!("Офіційний nightly не містить {name}"))?;
-    if matches.next().is_some() {
-        return Err(format!("Офіційний nightly містить кілька {name}"));
-    }
-    validate_nightly_asset_url(&asset, &release.tag_name)?;
-    github_asset_sha256(&asset)?;
-    Ok(asset)
-}
-
-fn nightly_checksum_for_asset(checksum_file: &[u8], asset_name: &str) -> Result<String, String> {
-    let checksums = std::str::from_utf8(checksum_file)
-        .map_err(|_| "Офіційний файл SHA-256 має неправильний формат".to_string())?;
-    let matches = checksums
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            Some((parts.next()?, parts.next()?))
-        })
-        .filter_map(|(hash, filename)| {
-            let normalized = filename.trim_start_matches('*').trim_start_matches("./");
-            (normalized == asset_name
-                && hash.len() == 64
-                && hash.chars().all(|value| value.is_ascii_hexdigit()))
-            .then(|| hash.to_ascii_lowercase())
-        })
-        .collect::<Vec<_>>();
-    if matches.len() != 1 {
-        return Err(format!(
-            "Офіційний файл SHA-256 містить неправильний запис для {asset_name}"
-        ));
-    }
-    Ok(matches[0].clone())
-}
-
-fn yt_dlp_nightly_temporary_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let filename = if cfg!(target_os = "windows") {
-        ".yt-dlp-nightly-download.exe"
-    } else {
-        ".yt-dlp-nightly-download"
-    };
-    Ok(runtime_dir(app)?.join(filename))
-}
-
-fn find_ffmpeg(app: &AppHandle) -> Result<ComponentStatus, String> {
-    let directory = runtime_dir(app)?;
-    let managed_path = directory.join(if cfg!(target_os = "windows") {
-        "ffmpeg.exe"
-    } else {
-        "ffmpeg"
-    });
-    let probe_path = directory.join(if cfg!(target_os = "windows") {
-        "ffprobe.exe"
-    } else {
-        "ffprobe"
-    });
-
-    if managed_path.is_file() && probe_path.is_file() {
-        if let (Some(version), Some(_)) = (
-            command_version(&managed_path, &["-version"]),
-            command_version(&probe_path, &["-version"]),
-        ) {
-            let first_line = version.lines().next().unwrap_or(&version).to_string();
-            return Ok(ComponentStatus {
-                installed: true,
-                version: Some(first_line),
-                path: Some(managed_path.to_string_lossy().to_string()),
-                managed: true,
-            });
-        }
-    }
-
-    Ok(ComponentStatus {
-        installed: false,
-        version: None,
-        path: None,
-        managed: true,
-    })
-}
-
-fn find_deno(app: &AppHandle) -> Result<ComponentStatus, String> {
-    let managed_path = runtime_dir(app)?.join(if cfg!(target_os = "windows") {
-        "deno.exe"
-    } else {
-        "deno"
-    });
-    if managed_path.is_file() {
-        if let Some(version) = command_version(&managed_path, &["--version"]) {
-            return Ok(ComponentStatus {
-                installed: true,
-                version: Some(version.lines().next().unwrap_or(&version).to_string()),
-                path: Some(managed_path.to_string_lossy().to_string()),
-                managed: true,
-            });
-        }
-    }
-
-    Ok(ComponentStatus {
-        installed: false,
-        version: None,
-        path: None,
-        managed: true,
-    })
-}
-
-fn runtime_status_blocking(app: &AppHandle) -> Result<RuntimeStatus, String> {
-    let directory = runtime_dir(app)?;
-    let path = yt_dlp_path(app)?;
-    let installed = path.is_file();
-    let version = installed.then(|| {
-        fs::read_to_string(directory.join(".yt-dlp.version"))
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "Встановлено".into())
-    });
-
-    Ok(RuntimeStatus {
-        yt_dlp: ComponentStatus {
-            installed,
-            version,
-            path: installed.then(|| path.to_string_lossy().to_string()),
-            managed: true,
-        },
-        ffmpeg: find_ffmpeg(app)?,
-        deno: find_deno(app)?,
-        runtime_dir: directory.to_string_lossy().to_string(),
-        platform: std::env::consts::OS.into(),
-    })
-}
-
-#[tauri::command]
-async fn runtime_status(app: AppHandle) -> Result<RuntimeStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || runtime_status_blocking(&app))
-        .await
-        .map_err(|error| format!("Не вдалося перевірити локальні компоненти: {error}"))?
-}
-
-async fn fetch_bytes_with_final_url(
-    client: &reqwest::Client,
-    url: &str,
-) -> Result<(Vec<u8>, Url), String> {
-    let mut response = tokio::time::timeout(
-        RUNTIME_RESPONSE_TIMEOUT,
-        client
-            .get(url)
-            .header("User-Agent", "yt-dlp-desktop")
-            .send(),
-    )
-    .await
-    .map_err(|_| "Сервер runtime-компонентів не відповів вчасно".to_string())?
-    .map_err(|error| format!("Помилка мережі: {error}"))?;
-    if response.status().as_u16() == 429
-        || (response.status().as_u16() == 403
-            && response
-                .headers()
-                .get("x-ratelimit-remaining")
-                .is_some_and(|v| v == "0"))
-    {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let header_number = |name: &str| {
-            response
-                .headers()
-                .get(name)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok())
-        };
-        let retry_at = header_number("x-ratelimit-reset")
-            .unwrap_or(now + header_number("retry-after").unwrap_or(3600))
-            .clamp(now + 60, now + 86400);
-        return Err(format!("GitHub тимчасово обмежив перевірку оновлень. Встановлений компонент залишається доступним. [retry_at={retry_at}]"));
-    }
-    response = response
-        .error_for_status()
-        .map_err(|error| format!("Сервер повернув помилку: {error}"))?;
-    let final_url = response.url().clone();
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_RUNTIME_METADATA_BYTES as u64)
-    {
-        return Err("Службовий runtime-файл перевищує дозволений розмір".into());
-    }
-    let mut bytes = Vec::new();
-    loop {
-        let chunk = tokio::time::timeout(RUNTIME_DOWNLOAD_IDLE_TIMEOUT, response.chunk())
-            .await
-            .map_err(|_| "Службовий runtime-файл перестав завантажуватися".to_string())?
-            .map_err(|error| format!("Не вдалося прочитати відповідь: {error}"))?;
-        let Some(chunk) = chunk else { break };
-        if bytes.len().saturating_add(chunk.len()) > MAX_RUNTIME_METADATA_BYTES {
-            return Err("Службовий runtime-файл перевищує дозволений розмір".into());
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok((bytes, final_url))
-}
-
-async fn fetch_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
-    Ok(fetch_bytes_with_final_url(client, url).await?.0)
-}
-
-#[cfg(test)]
-fn release_version_from_download_url(url: &Url) -> Option<String> {
-    if url.scheme() != "https" || url.host_str() != Some("github.com") {
-        return None;
-    }
-    let segments = url.path_segments()?.collect::<Vec<_>>();
-    let releases = segments
-        .windows(2)
-        .position(|pair| pair == ["releases", "download"])?;
-    let version = *segments.get(releases + 2)?;
-    let file = *segments.get(releases + 3)?;
-    if file.is_empty() {
-        return None;
-    }
-    (!version.is_empty() && version != "latest").then(|| version.to_string())
-}
-
-fn download_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .connect_timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|error| format!("Не вдалося підготувати завантаження: {error}"))
-}
-
-fn verify_runtime_manifest_signature(
-    manifest: &[u8],
-    encoded_signature: &[u8],
-) -> Result<(), String> {
-    let config: serde_json::Value = serde_json::from_str(TAURI_CONFIG_SOURCE)
-        .map_err(|_| "Вбудована конфігурація updater пошкоджена".to_string())?;
-    let encoded_public_key = config
-        .pointer("/plugins/updater/pubkey")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "У конфігурації updater немає публічного ключа".to_string())?;
-    let public_key_text = BASE64_STANDARD
-        .decode(encoded_public_key.trim())
-        .map_err(|_| "Публічний ключ updater має неправильний формат".to_string())?;
-    let public_key_text = std::str::from_utf8(&public_key_text)
-        .map_err(|_| "Публічний ключ updater має неправильне кодування".to_string())?;
-    let public_key = MinisignPublicKey::decode(public_key_text)
-        .map_err(|_| "Не вдалося прочитати публічний ключ updater".to_string())?;
-
-    let encoded_signature = std::str::from_utf8(encoded_signature)
-        .map_err(|_| "Підпис manifest має неправильне кодування".to_string())?;
-    let signature_text = BASE64_STANDARD
-        .decode(encoded_signature.trim())
-        .map_err(|_| "Підпис manifest має неправильний формат".to_string())?;
-    let signature_text = std::str::from_utf8(&signature_text)
-        .map_err(|_| "Підпис manifest має неправильне кодування".to_string())?;
-    let signature = MinisignSignature::decode(signature_text)
-        .map_err(|_| "Не вдалося прочитати підпис runtime manifest".to_string())?;
-    public_key
-        .verify(manifest, &signature, true)
-        .map_err(|_| "Підпис runtime manifest не пройшов перевірку".to_string())
-}
-
-fn validate_runtime_asset(asset: &RuntimeAssetManifest, label: &str) -> Result<(), String> {
-    if asset.version.trim().is_empty() {
-        return Err(format!("Runtime manifest не містить версію {label}"));
-    }
-    if asset.sha256.len() != 64 || !asset.sha256.chars().all(|value| value.is_ascii_hexdigit()) {
-        return Err(format!(
-            "Runtime manifest містить неправильний SHA-256 для {label}"
-        ));
-    }
-    let url = Url::parse(&asset.url)
-        .map_err(|_| format!("Runtime manifest містить неправильний URL для {label}"))?;
-    if url.scheme() != "https"
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.port().is_some()
-    {
-        return Err(format!(
-            "Runtime manifest містить небезпечний URL для {label}"
-        ));
-    }
-    let allowed = match url.host_str() {
-        Some("github.com") => {
-            url.path().starts_with("/yt-dlp/yt-dlp/releases/download/")
-                || url
-                    .path()
-                    .starts_with("/yt-dlp/yt-dlp-nightly-builds/releases/download/")
-                || url
-                    .path()
-                    .starts_with("/yt-dlp/FFmpeg-Builds/releases/download/")
-                || url.path().starts_with("/denoland/deno/releases/download/")
-                || url
-                    .path()
-                    .starts_with("/BaldojniSylyUkrainy/yt-dlp-BD/releases/download/")
-        }
-        Some("ffmpeg.martin-riedl.de") => url.path().starts_with("/download/macos/arm64/"),
-        _ => false,
-    };
-    if !allowed {
-        return Err(format!(
-            "Runtime manifest вказує неочікуване джерело для {label}"
-        ));
-    }
-    Ok(())
-}
-
-fn require_yt_dlp_asset_source(asset: &RuntimeAssetManifest) -> Result<(), String> {
-    let url = Url::parse(&asset.url)
-        .map_err(|_| "Runtime manifest містить неправильний URL для yt-dlp".to_string())?;
-    let allowed = url.host_str() == Some("github.com")
-        && (url.path().starts_with("/yt-dlp/yt-dlp/releases/download/")
-            || url
-                .path()
-                .starts_with("/yt-dlp/yt-dlp-nightly-builds/releases/download/"));
-    if !allowed {
-        return Err("Runtime manifest вказує неправильне джерело для yt-dlp".into());
-    }
-    Ok(())
-}
-
-fn require_runtime_asset_source(
-    asset: &RuntimeAssetManifest,
-    host: &str,
-    path_prefix: &str,
-    label: &str,
-) -> Result<(), String> {
-    let url = Url::parse(&asset.url)
-        .map_err(|_| format!("Runtime manifest містить неправильний URL для {label}"))?;
-    if url.host_str() != Some(host) || !url.path().starts_with(path_prefix) {
-        return Err(format!(
-            "Runtime manifest вказує неправильне джерело для {label}"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_runtime_platform_manifest(manifest: &RuntimePlatformManifest) -> Result<(), String> {
-    validate_runtime_asset(&manifest.yt_dlp, "yt-dlp")?;
-    require_yt_dlp_asset_source(&manifest.yt_dlp)?;
-    validate_runtime_asset(&manifest.deno, "Deno")?;
-    require_runtime_asset_source(
-        &manifest.deno,
-        "github.com",
-        "/denoland/deno/releases/download/",
-        "Deno",
-    )?;
-    if manifest.ffmpeg.version.trim().is_empty() {
-        return Err("Runtime manifest не містить версію FFmpeg".into());
-    }
-    #[cfg(target_os = "macos")]
-    {
-        if manifest.ffmpeg.archive.is_some() {
-            return Err("Runtime manifest містить неправильний macOS FFmpeg-пакет".into());
-        }
-        let ffmpeg = manifest
-            .ffmpeg
-            .ffmpeg
-            .as_ref()
-            .ok_or_else(|| "Runtime manifest не містить macOS FFmpeg".to_string())?;
-        let ffprobe = manifest
-            .ffmpeg
-            .ffprobe
-            .as_ref()
-            .ok_or_else(|| "Runtime manifest не містить macOS FFprobe".to_string())?;
-        validate_runtime_asset(ffmpeg, "macOS FFmpeg")?;
-        require_runtime_asset_source(
-            ffmpeg,
-            "ffmpeg.martin-riedl.de",
-            "/download/macos/arm64/",
-            "macOS FFmpeg",
-        )?;
-        validate_runtime_asset(ffprobe, "macOS FFprobe")?;
-        require_runtime_asset_source(
-            ffprobe,
-            "ffmpeg.martin-riedl.de",
-            "/download/macos/arm64/",
-            "macOS FFprobe",
-        )?;
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if manifest.ffmpeg.ffmpeg.is_some() || manifest.ffmpeg.ffprobe.is_some() {
-            return Err("Runtime manifest містить неправильний Windows FFmpeg-пакет".into());
-        }
-        let archive = manifest
-            .ffmpeg
-            .archive
-            .as_ref()
-            .ok_or_else(|| "Runtime manifest не містить Windows FFmpeg".to_string())?;
-        validate_runtime_asset(archive, "Windows FFmpeg")?;
-        require_runtime_asset_source(
-            archive,
-            "github.com",
-            "/BaldojniSylyUkrainy/yt-dlp-BD/releases/download/",
-            "Windows FFmpeg",
-        )?;
-    }
-    Ok(())
-}
-
-fn parsed_runtime_release_version(value: &str) -> Result<[u64; 4], String> {
-    let parts = value
-        .split('.')
-        .map(|part| part.parse::<u64>())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| "Runtime manifest має неправильну версію релізу".to_string())?;
-    parts
-        .try_into()
-        .map_err(|_| "Runtime manifest має неправильну версію релізу".to_string())
-}
-
-fn validate_runtime_manifest_timestamp(value: &str) -> Result<(), String> {
-    let bytes = value.as_bytes();
-    let separators = [
-        (4, b'-'),
-        (7, b'-'),
-        (10, b'T'),
-        (13, b':'),
-        (16, b':'),
-        (19, b'.'),
-        (23, b'Z'),
-    ];
-    if bytes.len() != 24
-        || separators
-            .iter()
-            .any(|(index, expected)| bytes.get(*index) != Some(expected))
-        || bytes.iter().enumerate().any(|(index, value)| {
-            !separators.iter().any(|(separator, _)| *separator == index) && !value.is_ascii_digit()
-        })
-    {
-        return Err("Runtime manifest має неправильний час генерації".into());
-    }
-    Ok(())
-}
-
-fn ensure_runtime_manifest_is_current(
-    incoming: &RuntimeManifestState,
-    accepted: Option<&RuntimeManifestState>,
-) -> Result<(), String> {
-    let incoming_version = parsed_runtime_release_version(&incoming.release_version)?;
-    validate_runtime_manifest_timestamp(&incoming.generated_at)?;
-    let Some(accepted) = accepted else {
-        return Ok(());
-    };
-    let accepted_version = parsed_runtime_release_version(&accepted.release_version)
-        .map_err(|_| "Збережений стан runtime manifest пошкоджено".to_string())?;
-    validate_runtime_manifest_timestamp(&accepted.generated_at)
-        .map_err(|_| "Збережений стан runtime manifest пошкоджено".to_string())?;
-    if incoming_version < accepted_version
-        || (incoming_version == accepted_version && incoming.generated_at < accepted.generated_at)
-    {
-        return Err("Підписаний runtime manifest старіший за вже прийняту версію".into());
-    }
-    Ok(())
-}
-
-fn runtime_manifest_state_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(runtime_dir(app)?.join(".runtime-manifest-state.json"))
-}
-
-fn read_runtime_manifest_state(app: &AppHandle) -> Result<Option<RuntimeManifestState>, String> {
-    let path = runtime_manifest_state_path(app)?;
-    match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|_| "Збережений стан runtime manifest пошкоджено".to_string()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!(
-            "Не вдалося прочитати стан runtime manifest: {error}"
-        )),
-    }
-}
-
-fn write_runtime_manifest_state(
-    app: &AppHandle,
-    state: &RuntimeManifestState,
-) -> Result<(), String> {
-    let destination = runtime_manifest_state_path(app)?;
-    let temporary = destination.with_extension(format!("json.{}.tmp", Uuid::new_v4()));
-    let bytes = serde_json::to_vec(state)
-        .map_err(|error| format!("Не вдалося підготувати стан runtime manifest: {error}"))?;
-    fs::write(&temporary, bytes)
-        .map_err(|error| format!("Не вдалося записати стан runtime manifest: {error}"))?;
-    if let Err(error) = replace_runtime_file(&temporary, &destination, "стан runtime manifest")
-    {
-        let _ = fs::remove_file(temporary);
-        return Err(error);
-    }
-    Ok(())
-}
-
-async fn runtime_platform_manifest(
-    app: &AppHandle,
-    maintenance: &RuntimeMaintenance,
-) -> Result<RuntimePlatformManifest, String> {
-    let mut cached = maintenance.manifest.lock().await;
-    if let Some((checked, manifest)) = cached.as_ref() {
-        if probe_cache::manifest_fresh(*checked) {
-            return Ok(manifest.clone());
-        }
-    }
-    let client = download_client()?;
-    let (manifest_bytes, signature_bytes) = tokio::try_join!(
-        fetch_bytes(&client, RUNTIME_MANIFEST_URL),
-        fetch_bytes(&client, RUNTIME_MANIFEST_SIGNATURE_URL),
-    )?;
-    verify_runtime_manifest_signature(&manifest_bytes, &signature_bytes)?;
-    let manifest: RuntimeManifest = serde_json::from_slice(&manifest_bytes)
-        .map_err(|_| "Підписаний runtime manifest має неправильний формат".to_string())?;
-    if manifest.schema_version != 1 {
-        return Err("Підписаний runtime manifest має непідтримувану версію".into());
-    }
-    let incoming_state = RuntimeManifestState {
-        release_version: manifest.release_version.clone(),
-        generated_at: manifest.generated_at.clone(),
-    };
-    let accepted_state = read_runtime_manifest_state(app)?;
-    ensure_runtime_manifest_is_current(&incoming_state, accepted_state.as_ref())?;
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let platform = "darwin-aarch64";
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    let platform = "windows-x86_64";
-    #[cfg(not(any(
-        all(target_os = "macos", target_arch = "aarch64"),
-        all(target_os = "windows", target_arch = "x86_64")
-    )))]
-    return Err("Підписані runtime-компоненти недоступні для цієї платформи".into());
-
-    let platform_manifest = manifest
-        .platforms
-        .get(platform)
-        .cloned()
-        .ok_or_else(|| format!("Runtime manifest не містить платформу {platform}"))?;
-    validate_runtime_platform_manifest(&platform_manifest)?;
-    write_runtime_manifest_state(app, &incoming_state)?;
-    cached.replace((Instant::now(), platform_manifest.clone()));
-    Ok(platform_manifest)
-}
-
-fn is_public_thumbnail_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => {
-            let [a, b, c, _] = ip.octets();
-            !(ip.is_private()
-                || ip.is_loopback()
-                || ip.is_link_local()
-                || ip.is_multicast()
-                || ip.is_broadcast()
-                || ip.is_unspecified()
-                || a == 0
-                || a >= 240
-                || (a == 100 && (64..=127).contains(&b))
-                || (a == 192 && b == 0 && c == 0)
-                || (a == 192 && b == 0 && c == 2)
-                || (a == 198 && (b == 18 || b == 19))
-                || (a == 198 && b == 51 && c == 100)
-                || (a == 203 && b == 0 && c == 113))
-        }
-        IpAddr::V6(ip) => {
-            let segments = ip.segments();
-            if let Some(mapped) = ip.to_ipv4_mapped() {
-                return is_public_thumbnail_ip(IpAddr::V4(mapped));
-            }
-            !(ip.is_loopback()
-                || ip.is_multicast()
-                || ip.is_unspecified()
-                || (segments[0] & 0xfe00) == 0xfc00
-                || (segments[0] & 0xffc0) == 0xfe80
-                || (segments[0] & 0xffc0) == 0xfec0
-                || (segments[0] == 0x2001 && segments[1] == 0x0db8))
-        }
-    }
-}
-
-async fn public_thumbnail_client(url: &Url) -> Result<reqwest::Client, String> {
-    let host = url
-        .host_str()
-        .ok_or_else(|| "Посилання на прев’ю не містить адреси сервера".to_string())?
-        .to_string();
-    let port = url.port_or_known_default().unwrap_or(443);
-    let addresses: Vec<SocketAddr> = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::net::lookup_host((host.as_str(), port)),
-    )
-    .await
-    .map_err(|_| "Час перевірки адреси сервера вичерпано")?
-    .map_err(|error| format!("Не вдалося знайти сервер: {error}"))?
-    .collect();
-    if addresses.is_empty()
-        || addresses
-            .iter()
-            .any(|address| !is_public_thumbnail_ip(address.ip()))
-    {
-        return Err("Прев’ю вказує на локальну або службову мережеву адресу".into());
-    }
-    reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(20))
-        .resolve_to_addrs(&host, &addresses)
-        .build()
-        .map_err(|error| format!("Не вдалося підготувати безпечне завантаження прев’ю: {error}"))
-}
-
-async fn fetch_to_file(
-    app: &AppHandle,
-    client: &reqwest::Client,
-    url: &str,
-    destination: &Path,
-    component: &str,
-    expected_size: Option<u64>,
-    maximum_size: u64,
-) -> Result<(), String> {
-    use tokio::io::AsyncWriteExt;
-
-    let mut response = tokio::time::timeout(
-        RUNTIME_RESPONSE_TIMEOUT,
-        client
-            .get(url)
-            .header("User-Agent", "yt-dlp-desktop")
-            .send(),
-    )
-    .await
-    .map_err(|_| "Сервер runtime-компонентів не відповів вчасно".to_string())?
-    .map_err(|error| format!("Помилка мережі: {error}"))?
-    .error_for_status()
-    .map_err(|error| format!("Сервер повернув помилку: {error}"))?;
-    let total = response.content_length();
-    if total.is_some_and(|size| size == 0 || size > maximum_size) {
-        return Err("Runtime-компонент має неочікуваний розмір".into());
-    }
-    if let (Some(expected), Some(actual)) = (expected_size, total) {
-        if actual != expected {
-            return Err("Runtime-компонент повідомив неочікуваний розмір".into());
-        }
-    }
-    let mut file = tokio::fs::File::create(destination)
-        .await
-        .map_err(|error| format!("Не вдалося створити тимчасовий файл: {error}"))?;
-    let mut downloaded = 0_u64;
-    loop {
-        let chunk = tokio::time::timeout(RUNTIME_DOWNLOAD_IDLE_TIMEOUT, response.chunk())
-            .await
-            .map_err(|_| "Завантаження runtime-компонента перестало відповідати".to_string())?
-            .map_err(|error| format!("Не вдалося прочитати завантаження: {error}"))?;
-        let Some(chunk) = chunk else { break };
-        let next_size = checked_runtime_download_size(
-            downloaded,
-            chunk.len() as u64,
-            expected_size,
-            maximum_size,
-        )?;
-        file.write_all(&chunk)
-            .await
-            .map_err(|error| format!("Не вдалося записати завантаження: {error}"))?;
-        downloaded = next_size;
-        let _ = app.emit(
-            "runtime-install-progress",
-            RuntimeInstallProgress {
-                component: component.into(),
-                downloaded,
-                total,
-            },
-        );
-    }
-    if expected_size.is_some_and(|expected| downloaded != expected) {
-        return Err("Runtime-компонент завантажився не повністю".into());
-    }
-    file.flush()
-        .await
-        .map_err(|error| format!("Не вдалося завершити запис завантаження: {error}"))
-}
-
-fn checked_runtime_download_size(
-    downloaded: u64,
-    chunk_size: u64,
-    expected_size: Option<u64>,
-    maximum_size: u64,
-) -> Result<u64, String> {
-    let next_size = downloaded
-        .checked_add(chunk_size)
-        .ok_or_else(|| "Runtime-компонент перевищує дозволений розмір".to_string())?;
-    if next_size > maximum_size || expected_size.is_some_and(|expected| next_size > expected) {
-        return Err("Runtime-компонент перевищує дозволений розмір".into());
-    }
-    Ok(next_size)
-}
-
-fn sha256_file(path: &Path) -> Result<String, String> {
-    let file = fs::File::open(path)
-        .map_err(|error| format!("Не вдалося відкрити файл для перевірки: {error}"))?;
-    let mut reader = BufReader::new(file);
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = reader
-            .read(&mut buffer)
-            .map_err(|error| format!("Не вдалося перевірити завантажений файл: {error}"))?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", digest.finalize()))
-}
-
-fn verify_sha256_file_expected(path: &Path, expected: &str, label: &str) -> Result<(), String> {
-    let actual = sha256_file(path)?;
-    if actual != expected {
-        return Err(format!("Контрольна сума {label} не збігається"));
-    }
-    Ok(())
-}
-
-fn replace_runtime_file(temporary: &Path, destination: &Path, label: &str) -> Result<(), String> {
-    if !destination.exists() {
-        return fs::rename(temporary, destination)
-            .map_err(|error| format!("Не вдалося встановити {label}: {error}"));
-    }
-    let backup = destination.with_extension(format!("previous-{}", Uuid::new_v4()));
-    fs::rename(destination, &backup)
-        .map_err(|error| format!("Не вдалося підготувати заміну {label}: {error}"))?;
-    match fs::rename(temporary, destination) {
-        Ok(()) => {
-            let _ = fs::remove_file(backup);
-            Ok(())
-        }
-        Err(error) => {
-            let restore = fs::rename(&backup, destination);
-            if let Err(restore_error) = restore {
-                return Err(format!(
-                    "Не вдалося встановити {label}: {error}. Також не вдалося відновити попередню версію: {restore_error}"
-                ));
-            }
-            Err(format!("Не вдалося встановити {label}: {error}"))
-        }
-    }
-}
-
-fn write_runtime_text_atomic(destination: &Path, value: &str, label: &str) -> Result<(), String> {
-    let temporary = destination.with_extension(format!("tmp-{}", Uuid::new_v4()));
-    fs::write(&temporary, value)
-        .map_err(|error| format!("Не вдалося зберегти {label}: {error}"))?;
-    if let Err(error) = replace_runtime_file(&temporary, destination, label) {
-        let _ = fs::remove_file(temporary);
-        return Err(error);
-    }
-    Ok(())
-}
-
-fn commit_ytdlp_runtime_update(
-    temporary: &Path,
-    destination: &Path,
-    version_stamp: &Path,
-    hash_stamp: &Path,
-    version: &str,
-    hash: &str,
-    label: &str,
-) -> Result<(), String> {
-    replace_runtime_file(temporary, destination, label)?;
-    write_runtime_text_atomic(version_stamp, version, "версію yt-dlp")?;
-    write_runtime_text_atomic(hash_stamp, hash, "SHA-256 yt-dlp")
-}
-
-#[cfg(test)]
-fn checksum_for_asset(checksum_file: &[u8], asset_name: &str) -> Result<String, String> {
-    let checksums = String::from_utf8(checksum_file.to_vec())
-        .map_err(|_| "Файл контрольних сум FFmpeg має неправильний формат".to_string())?;
-    checksums
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            Some((parts.next()?, parts.next()?))
-        })
-        .find_map(|(hash, filename)| {
-            let normalized = filename.trim_start_matches('*').trim_start_matches("./");
-            (normalized == asset_name).then(|| hash.to_ascii_lowercase())
-        })
-        .ok_or_else(|| format!("Не знайдено контрольну суму для {asset_name}"))
-}
-
-#[cfg(test)]
-fn checksum_value(checksum_file: &[u8], label: &str) -> Result<String, String> {
-    let checksum = String::from_utf8(checksum_file.to_vec())
-        .map_err(|_| format!("Контрольна сума {label} має неправильний формат"))?;
-    let mut candidates = checksum
-        .split_whitespace()
-        .filter(|candidate| {
-            candidate.len() == 64 && candidate.chars().all(|value| value.is_ascii_hexdigit())
-        })
-        .map(str::to_ascii_lowercase);
-    let expected = candidates
-        .next()
-        .ok_or_else(|| format!("Контрольна сума {label} не містить SHA-256"))?;
-    if candidates.any(|candidate| candidate != expected) {
-        return Err(format!(
-            "Контрольна сума {label} містить кілька різних SHA-256"
-        ));
-    }
-    Ok(expected)
-}
-
-fn extract_binary_from_file(
-    archive_path: &Path,
-    binary_name: &str,
-    destination: &Path,
-) -> Result<(), String> {
-    let archive_file = fs::File::open(archive_path)
-        .map_err(|error| format!("Не вдалося відкрити архів {binary_name}: {error}"))?;
-    let mut archive = zip::ZipArchive::new(archive_file)
-        .map_err(|error| format!("Не вдалося відкрити архів {binary_name}: {error}"))?;
-    let index = (0..archive.len())
-        .find(|index| {
-            archive
-                .by_index(*index)
-                .ok()
-                .and_then(|file| {
-                    Path::new(file.name())
-                        .file_name()
-                        .map(|name| name == binary_name)
-                })
-                .unwrap_or(false)
-        })
-        .ok_or_else(|| format!("В архіві не знайдено {binary_name}"))?;
-    let mut archived_binary = archive
-        .by_index(index)
-        .map_err(|error| format!("Не вдалося прочитати {binary_name}: {error}"))?;
-    let temporary = destination.with_extension("download");
-    let mut output = fs::File::create(&temporary)
-        .map_err(|error| format!("Не вдалося створити {binary_name}: {error}"))?;
-    std::io::copy(&mut archived_binary, &mut output)
-        .map_err(|error| format!("Не вдалося розпакувати {binary_name}: {error}"))?;
-    output
-        .sync_all()
-        .map_err(|error| format!("Не вдалося завершити запис {binary_name}: {error}"))?;
-    drop(output);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755))
-            .map_err(|error| format!("Не вдалося дозволити запуск {binary_name}: {error}"))?;
-    }
-    replace_runtime_file(&temporary, destination, binary_name)
-}
-
-fn install_ffmpeg_set(
-    directory: &Path,
-    binaries: &[(&Path, &str, PathBuf)],
-    stamps: &[(PathBuf, &str)],
-) -> Result<(), String> {
-    let staging = tempfile::Builder::new()
-        .prefix(".ffmpeg-stage-")
-        .tempdir_in(directory)
-        .map_err(|e| e.to_string())?;
-    let mut files = Vec::new();
-    for (archive, name, destination) in binaries {
-        let staged = staging.path().join(name);
-        extract_binary_from_file(archive, name, &staged)?;
-        if command_version(&staged, &["-version"]).is_none() {
-            return Err(format!("Новий {name} не пройшов перевірку запуску"));
-        }
-        files.push((staged, destination.clone()));
-    }
-    for (index, (destination, digest)) in stamps.iter().enumerate() {
-        let staged = staging.path().join(format!("stamp-{index}"));
-        fs::write(&staged, digest).map_err(|e| e.to_string())?;
-        files.push((staged, destination.clone()));
-    }
-    runtime_transaction::commit(&files)
-}
-
-async fn install_ffmpeg_inner(
-    app: AppHandle,
-    manifest: &RuntimePlatformManifest,
-) -> Result<(), String> {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        let client = download_client()?;
-        let ffmpeg = manifest
-            .ffmpeg
-            .ffmpeg
-            .as_ref()
-            .ok_or_else(|| "Runtime manifest не містить macOS FFmpeg".to_string())?;
-        let ffprobe = manifest
-            .ffmpeg
-            .ffprobe
-            .as_ref()
-            .ok_or_else(|| "Runtime manifest не містить macOS FFprobe".to_string())?;
-        let directory = runtime_dir(&app)?;
-        let ffmpeg_path = directory.join("ffmpeg");
-        let ffprobe_path = directory.join("ffprobe");
-        let ffmpeg_stamp = directory.join(".ffmpeg.sha256");
-        let ffprobe_stamp = directory.join(".ffprobe.sha256");
-        let current = command_version(&ffmpeg_path, &["-version"]).is_some()
-            && command_version(&ffprobe_path, &["-version"]).is_some()
-            && fs::read_to_string(&ffmpeg_stamp)
-                .map(|value| value.trim() == ffmpeg.sha256.as_str())
-                .unwrap_or(false)
-            && fs::read_to_string(&ffprobe_stamp)
-                .map(|value| value.trim() == ffprobe.sha256.as_str())
-                .unwrap_or(false);
-        if current {
-            eprintln!("Керований ffmpeg вже актуальний");
-            return Ok(());
-        }
-
-        eprintln!("Завантажуємо керовані ffmpeg та ffprobe");
-        let ffmpeg_archive = directory.join(".ffmpeg.zip.download");
-        let ffprobe_archive = directory.join(".ffprobe.zip.download");
-        let download_result = tokio::try_join!(
-            fetch_to_file(
-                &app,
-                &client,
-                &ffmpeg.url,
-                &ffmpeg_archive,
-                "ffmpeg",
-                None,
-                MAX_FFMPEG_ARCHIVE_BYTES
-            ),
-            fetch_to_file(
-                &app,
-                &client,
-                &ffprobe.url,
-                &ffprobe_archive,
-                "ffmpeg",
-                None,
-                MAX_FFMPEG_ARCHIVE_BYTES
-            )
-        );
-        if let Err(error) = download_result {
-            let _ = fs::remove_file(&ffmpeg_archive);
-            let _ = fs::remove_file(&ffprobe_archive);
-            return Err(error);
-        }
-        let install_result = (|| {
-            verify_sha256_file_expected(&ffmpeg_archive, &ffmpeg.sha256, "ffmpeg")?;
-            verify_sha256_file_expected(&ffprobe_archive, &ffprobe.sha256, "ffprobe")?;
-            install_ffmpeg_set(
-                &directory,
-                &[
-                    (&ffmpeg_archive, "ffmpeg", ffmpeg_path),
-                    (&ffprobe_archive, "ffprobe", ffprobe_path),
-                ],
-                &[
-                    (ffmpeg_stamp, ffmpeg.sha256.as_str()),
-                    (ffprobe_stamp, ffprobe.sha256.as_str()),
-                ],
-            )
-        })();
-        let _ = fs::remove_file(&ffmpeg_archive);
-        let _ = fs::remove_file(&ffprobe_archive);
-        install_result
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let archive_asset = manifest
-            .ffmpeg
-            .archive
-            .as_ref()
-            .ok_or_else(|| "Runtime manifest не містить Windows FFmpeg".to_string())?;
-        let client = download_client()?;
-        let directory = runtime_dir(&app)?;
-        let ffmpeg_path = directory.join("ffmpeg.exe");
-        let ffprobe_path = directory.join("ffprobe.exe");
-        let stamp = directory.join(".ffmpeg.sha256");
-        let current = command_version(&ffmpeg_path, &["-version"]).is_some()
-            && command_version(&ffprobe_path, &["-version"]).is_some()
-            && fs::read_to_string(&stamp)
-                .map(|value| value.trim() == archive_asset.sha256.as_str())
-                .unwrap_or(false);
-        if current {
-            return Ok(());
-        }
-
-        eprintln!("Завантажуємо керовані FFmpeg та FFprobe для Windows");
-        let archive = directory.join(".ffmpeg.zip.download");
-        if let Err(error) = fetch_to_file(
-            &app,
-            &client,
-            &archive_asset.url,
-            &archive,
-            "ffmpeg",
-            None,
-            MAX_FFMPEG_ARCHIVE_BYTES,
-        )
-        .await
-        {
-            let _ = fs::remove_file(&archive);
-            return Err(error);
-        }
-        let install_result = (|| {
-            verify_sha256_file_expected(&archive, &archive_asset.sha256, "FFmpeg")?;
-            install_ffmpeg_set(
-                &directory,
-                &[
-                    (&archive, "ffmpeg.exe", ffmpeg_path),
-                    (&archive, "ffprobe.exe", ffprobe_path),
-                ],
-                &[(stamp, archive_asset.sha256.as_str())],
-            )
-        })();
-        let _ = fs::remove_file(&archive);
-        install_result
-    }
-
-    #[cfg(not(any(
-        all(target_os = "macos", target_arch = "aarch64"),
-        target_os = "windows"
-    )))]
-    Err("Portable FFmpeg поки підтримує лише macOS Apple Silicon та Windows".into())
-}
-
-#[tauri::command]
-async fn install_ffmpeg(
-    app: AppHandle,
-    maintenance: State<'_, RuntimeMaintenance>,
-    manager: State<'_, DownloadManager>,
-) -> Result<(), String> {
-    let _operation = maintenance.operation.lock().await;
-    let _process_lock = acquire_runtime_process_lock(&app)?;
-    ensure_runtime_idle(manager.inner())?;
-    let manifest = runtime_platform_manifest(&app, maintenance.inner()).await?;
-    install_ffmpeg_inner(app, &manifest).await
-}
-
-async fn install_deno_inner(
-    app: AppHandle,
-    manifest: &RuntimePlatformManifest,
-) -> Result<(), String> {
-    let asset = &manifest.deno;
-    let client = download_client()
-        .map_err(|error| format!("Не вдалося підготувати завантаження Deno: {error}"))?;
-    let filename = if cfg!(target_os = "windows") {
-        "deno.exe"
-    } else {
-        "deno"
-    };
-    let directory = runtime_dir(&app)?;
-    let destination = directory.join(filename);
-    let stamp = directory.join(".deno.sha256");
-    let current = command_version(&destination, &["--version"]).is_some()
-        && fs::read_to_string(&stamp)
-            .map(|value| value.trim() == asset.sha256.as_str())
-            .unwrap_or(false);
-    if current {
-        return Ok(());
-    }
-
-    let archive = directory.join(".deno.zip.download");
-    if let Err(error) = fetch_to_file(
-        &app,
-        &client,
-        &asset.url,
-        &archive,
-        "deno",
-        None,
-        MAX_DENO_ARCHIVE_BYTES,
-    )
-    .await
-    {
-        let _ = fs::remove_file(&archive);
-        return Err(error);
-    }
-    let install_result = (|| {
-        verify_sha256_file_expected(&archive, &asset.sha256, "Deno")?;
-        extract_binary_from_file(&archive, filename, &destination)
-    })();
-    let _ = fs::remove_file(&archive);
-    install_result?;
-    fs::write(stamp, &asset.sha256)
-        .map_err(|error| format!("Не вдалося зберегти версію Deno: {error}"))?;
-    Ok(())
-}
-
-#[tauri::command]
-async fn install_deno(
-    app: AppHandle,
-    maintenance: State<'_, RuntimeMaintenance>,
-    manager: State<'_, DownloadManager>,
-) -> Result<(), String> {
-    let _operation = maintenance.operation.lock().await;
-    let _process_lock = acquire_runtime_process_lock(&app)?;
-    ensure_runtime_idle(manager.inner())?;
-    let manifest = runtime_platform_manifest(&app, maintenance.inner()).await?;
-    install_deno_inner(app, &manifest).await
-}
-
-async fn install_ytdlp_inner(
-    app: AppHandle,
-    manifest: &RuntimePlatformManifest,
-) -> Result<(), String> {
-    let asset = &manifest.yt_dlp;
-    let client = download_client()?;
-    let destination = yt_dlp_path(&app)?;
-    let version_stamp = runtime_dir(&app)?.join(".yt-dlp.version");
-    let accepted_version = fs::read_to_string(&version_stamp).ok();
-    ensure_ytdlp_bootstrap_not_rollback(
-        &asset.version,
-        accepted_version.as_deref().map(str::trim),
-        destination.is_file(),
-    )?;
-    let current = fs::read(&destination)
-        .map(|binary| format!("{:x}", Sha256::digest(binary)) == asset.sha256.as_str())
-        .unwrap_or(false);
-    if current {
-        write_runtime_text_atomic(&version_stamp, &asset.version, "версію yt-dlp")?;
-        write_runtime_text_atomic(
-            &runtime_dir(&app)?.join(".yt-dlp.sha256"),
-            &asset.sha256,
-            "SHA-256 yt-dlp",
-        )?;
-        return Ok(());
-    }
-
-    eprintln!("Завантажуємо підписаний стартовий yt-dlp");
-    let temporary = destination.with_extension("download");
-    if let Err(error) = fetch_to_file(
-        &app,
-        &client,
-        &asset.url,
-        &temporary,
-        "ytDlp",
-        None,
-        MAX_YT_DLP_BINARY_BYTES,
-    )
-    .await
-    {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
-    let actual = sha256_file(&temporary)?;
-    if actual != asset.sha256.as_str() {
-        let _ = fs::remove_file(&temporary);
-        return Err("Контрольна сума yt-dlp не збігається. Файл не встановлено".into());
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755))
-            .map_err(|error| format!("Не вдалося дозволити запуск yt-dlp: {error}"))?;
-    }
-
-    commit_ytdlp_runtime_update(
-        &temporary,
-        &destination,
-        &version_stamp,
-        &runtime_dir(&app)?.join(".yt-dlp.sha256"),
-        &asset.version,
-        &asset.sha256,
-        "yt-dlp",
-    )?;
-
-    Ok(())
-}
-
-async fn update_ytdlp_to_latest_nightly(app: &AppHandle) -> Result<(), String> {
-    let client = download_client()?;
-    let (release_bytes, final_url) = tokio::time::timeout(
-        Duration::from_secs(8),
-        fetch_bytes_with_final_url(&client, YT_DLP_NIGHTLY_RELEASE_API),
-    )
-    .await
-    .map_err(|_| "Перевірка yt-dlp nightly тривала надто довго".to_string())??;
-    if final_url.as_str() != YT_DLP_NIGHTLY_RELEASE_API {
-        return Err("GitHub перенаправив перевірку nightly на неочікувану адресу".into());
-    }
-    let release: GithubRelease = serde_json::from_slice(&release_bytes)
-        .map_err(|_| "GitHub повернув неправильний опис nightly".to_string())?;
-    let version_stamp = runtime_dir(app)?.join(".yt-dlp.version");
-    let accepted_version = fs::read_to_string(&version_stamp).ok();
-    ensure_ytdlp_nightly_not_rollback(
-        &release.tag_name,
-        accepted_version.as_deref().map(str::trim),
-    )?;
-    let binary_name = if cfg!(target_os = "windows") {
-        "yt-dlp.exe"
-    } else {
-        "yt-dlp_macos"
-    };
-    let binary_asset = select_nightly_asset(&release, binary_name)?;
-    if binary_asset.size == 0 || binary_asset.size > MAX_YT_DLP_BINARY_BYTES {
-        return Err("Офіційний nightly має неочікуваний розмір".into());
-    }
-    let github_binary_digest = github_asset_sha256(&binary_asset)?;
-    let checksum_asset = select_nightly_asset(&release, "SHA2-256SUMS")?;
-    if checksum_asset.size == 0 || checksum_asset.size > MAX_RUNTIME_METADATA_BYTES as u64 {
-        return Err("Офіційний файл SHA-256 має неочікуваний розмір".into());
-    }
-
-    let destination = yt_dlp_path(app)?;
-    let hash_stamp = runtime_dir(app)?.join(".yt-dlp.sha256");
-    let accepted_hash = fs::read_to_string(&hash_stamp).ok();
-    let installed_hash = sha256_file(&destination).ok();
-    if verified_nightly_is_current(
-        &release.tag_name,
-        accepted_version.as_deref(),
-        &github_binary_digest,
-        accepted_hash.as_deref(),
-        installed_hash.as_deref(),
-    ) {
-        return Ok(());
-    }
-
-    let checksum_bytes = tokio::time::timeout(
-        Duration::from_secs(8),
-        fetch_bytes(&client, &checksum_asset.browser_download_url),
-    )
-    .await
-    .map_err(|_| "Перевірка SHA-256 yt-dlp тривала надто довго".to_string())??;
-    if checksum_bytes.len() as u64 != checksum_asset.size {
-        return Err("Офіційний файл SHA-256 завантажився не повністю".into());
-    }
-    let checksum_digest = format!("{:x}", Sha256::digest(&checksum_bytes));
-    if checksum_digest != github_asset_sha256(&checksum_asset)? {
-        return Err("GitHub SHA-256 для офіційного списку сум не збігається".into());
-    }
-    let expected = nightly_checksum_for_asset(&checksum_bytes, binary_name)?;
-    if expected != github_binary_digest {
-        return Err("Офіційні SHA-256 nightly не узгоджені між собою".into());
-    }
-
-    if installed_hash.as_deref() == Some(expected.as_str()) {
-        write_runtime_text_atomic(&hash_stamp, &expected, "SHA-256 yt-dlp")?;
-        write_runtime_text_atomic(&version_stamp, &release.tag_name, "версію yt-dlp")?;
-        return Ok(());
-    }
-    let temporary = yt_dlp_nightly_temporary_path(app)?;
-    let _ = fs::remove_file(&temporary);
-    if let Err(error) = fetch_to_file(
-        app,
-        &client,
-        &binary_asset.browser_download_url,
-        &temporary,
-        "ytDlp",
-        Some(binary_asset.size),
-        MAX_YT_DLP_BINARY_BYTES,
-    )
-    .await
-    {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
-    if let Err(error) = verify_sha256_file_expected(&temporary, &expected, "yt-dlp nightly") {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755))
-            .map_err(|error| format!("Не вдалося дозволити запуск yt-dlp nightly: {error}"))?;
-    }
-    let downloaded_version =
-        match command_version_bounded(&temporary, &["--version"], YT_DLP_VERSION_PROBE_TIMEOUT)
-            .await
-        {
-            Ok(version) => version,
-            Err(error) => {
-                let _ = fs::remove_file(&temporary);
-                return Err(error);
-            }
-        };
-    if downloaded_version.as_deref() != Some(release.tag_name.as_str()) {
-        let _ = fs::remove_file(&temporary);
-        return Err("Завантажений yt-dlp nightly повідомив неочікувану версію".into());
-    }
-    if let Err(error) = commit_ytdlp_runtime_update(
-        &temporary,
-        &destination,
-        &version_stamp,
-        &hash_stamp,
-        &release.tag_name,
-        &expected,
-        "yt-dlp nightly",
-    ) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
-    Ok(())
-}
-
-#[tauri::command]
-async fn install_ytdlp(
-    app: AppHandle,
-    maintenance: State<'_, RuntimeMaintenance>,
-    manager: State<'_, DownloadManager>,
-) -> Result<(), String> {
-    let _operation = maintenance.operation.lock().await;
-    let _process_lock = acquire_runtime_process_lock(&app)?;
-    ensure_runtime_idle(manager.inner())?;
-    let manifest = runtime_platform_manifest(&app, maintenance.inner()).await?;
-    install_ytdlp_inner(app, &manifest).await
-}
-
-#[tauri::command]
-async fn update_ytdlp(
-    app: AppHandle,
-    maintenance: State<'_, RuntimeMaintenance>,
-    manager: State<'_, DownloadManager>,
-) -> Result<(), String> {
-    let _operation = maintenance.operation.lock().await;
-    let _process_lock = acquire_runtime_process_lock(&app)?;
-    ensure_runtime_idle(manager.inner())?;
-    let result = async {
-        if !yt_dlp_path(&app)?.is_file() {
-            let manifest = runtime_platform_manifest(&app, maintenance.inner()).await?;
-            install_ytdlp_inner(app.clone(), &manifest).await?;
-        }
-        update_ytdlp_to_latest_nightly(&app).await
-    }
-    .await;
-    if let Err(error) = &result {
-        eprintln!("Не вдалося оновити yt-dlp: {error}");
-    }
-    result
-}
-
-fn clean_probe_error(stderr: &[u8]) -> String {
-    let text = String::from_utf8_lossy(stderr);
-    let raw = text
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("yt-dlp не зміг перевірити це посилання")
-        .trim()
-        .trim_start_matches("ERROR:")
-        .trim()
-        .to_string();
-    friendly_download_error(&raw)
-}
-
-fn friendly_download_error(message: &str) -> String {
-    let value = message.to_ascii_lowercase();
-    if value.contains("media sources found") {
-        return "Знайдено джерела відео. Оберіть потрібне у вікні вибору.".into();
-    }
-    if value.contains("automatic discovery found no media") {
-        return "Не вдалося знайти відео у сторінці. Спробуйте пошук у браузері.".into();
-    }
-    if value.contains("недостатньо вільного місця") || value.contains("no space left")
-    {
-        "Недостатньо вільного місця. Процес зупинено, щоб захистити диск.".into()
-    } else if ["truncated_id", "incomplete youtube id", "looks truncated"]
-        .iter()
-        .any(|pattern| value.contains(pattern))
-    {
-        "Посилання YouTube неповне. Скопіюйте його ще раз з адресного рядка або через «Поділитися»."
-            .into()
-    } else if ["private video", "this video is private"]
-        .iter()
-        .any(|pattern| value.contains(pattern))
-    {
-        "Відео приватне. Для завантаження потрібен доступ через ваш браузер.".into()
-    } else if [
-        "failed to decrypt with dpapi",
-        "failed to decrypt cookie",
-        "app-bound encryption",
-    ]
-    .iter()
-    .any(|pattern| value.contains(pattern))
-    {
-        "Windows не зміг розшифрувати cookies цього браузера. Увійдіть на сайт у Firefox і повторіть через Firefox або виберіть інший доступний браузер."
-            .into()
-    } else if [
-        "could not copy chrome cookie database",
-        "could not copy edge cookie database",
-        "database is locked",
-    ]
-    .iter()
-    .any(|pattern| value.contains(pattern))
-    {
-        "Браузер заблокував свою базу cookies. Повністю закрийте його, відкрийте знову, увійдіть на сайт і повторіть завантаження."
-            .into()
-    } else if value.contains("could not find") && value.contains("cookies database") {
-        "Cookies обраного браузера не знайдено. Оберіть браузер, у якому ви вже увійшли на цей сайт."
-            .into()
-    } else if [
-        "sign in",
-        "login required",
-        "log in",
-        "cookies are required",
-        "confirm your age",
-        "age-restricted",
-        "members-only",
-    ]
-    .iter()
-    .any(|pattern| value.contains(pattern))
-    {
-        "Сервіс просить увійти в обліковий запис. Спробуйте завантаження з cookies браузера.".into()
-    } else if value.contains("cookies.binarycookies")
-        || (value.contains("safari") && value.contains("operation not permitted"))
-    {
-        "macOS не дозволив застосунку прочитати cookies Safari. Використайте Chrome, Firefox, Edge або Brave."
-            .into()
-    } else if ["unsupported url", "no suitable extractor"]
-        .iter()
-        .any(|pattern| value.contains(pattern))
-    {
-        "Цей сайт або тип посилання поки не підтримується.".into()
-    } else if value.contains("drm") {
-        "Відео захищене DRM і не може бути завантажене.".into()
-    } else if ["geo", "country", "region"]
-        .iter()
-        .any(|pattern| value.contains(pattern))
-    {
-        "Відео недоступне у вашому регіоні.".into()
-    } else if [
-        "video unavailable",
-        "video is unavailable",
-        "not available",
-        "removed",
-    ]
-    .iter()
-    .any(|pattern| value.contains(pattern))
-    {
-        "Відео недоступне або було видалене.".into()
-    } else if ["404", "not found"]
-        .iter()
-        .any(|pattern| value.contains(pattern))
-    {
-        "За цим посиланням нічого не знайдено. Перевірте, чи воно скопійоване повністю.".into()
-    } else if ["403", "forbidden"]
-        .iter()
-        .any(|pattern| value.contains(pattern))
-    {
-        "Сайт відхилив доступ до медіафайла. Спробуйте ще раз або скористайтеся іншим підключенням."
-            .into()
-    } else {
-        "Не вдалося прочитати це посилання. Перевірте його та спробуйте ще раз.".into()
-    }
-}
-
-fn friendly_conversion_error(message: &str) -> String {
-    let value = message.to_ascii_lowercase();
-    if value.contains("недостатньо вільного місця") || value.contains("no space left")
-    {
-        "Недостатньо вільного місця. Готові файли збережено, решту обробки зупинено.".into()
-    } else if value.contains("скасовано") {
-        "Обробку скасовано. Уже готові файли залишилися у вибраній папці.".into()
-    } else if value.contains("invalid data found") || value.contains("moov atom not found") {
-        "Завантажений медіафайл пошкоджений або має формат, який не вдалося прочитати. Уже готові файли збережено.".into()
-    } else if value.contains("ffprobe") {
-        "Не вдалося перевірити завантажений файл. Спробуйте повторити; технічна причина доступна у звіті в історії.".into()
-    } else if value.contains("encoder")
-        || value.contains("videotoolbox")
-        || value.contains("libx264")
-    {
-        "Не вдалося запустити відеокодування. Уже готові файли збережено; спробуйте повторити проблемний матеріал.".into()
-    } else {
-        "Не вдалося завершити конвертацію одного з файлів. Уже готові результати збережено у вибраній папці.".into()
-    }
-}
-
-fn download_error_code(message: &str) -> &'static str {
-    let value = message.to_lowercase();
-    if value.contains("media sources found") {
-        return "selection_required";
-    }
-    if value.contains("недостатньо вільного місця") || value.contains("no space left")
-    {
-        "low_disk"
-    } else if value.contains("429")
-        || value.contains("too many requests")
-        || value.contains("rate limit")
-    {
-        "rate_limited"
-    } else if [
-        "sign in",
-        "login required",
-        "cookies are required",
-        "private video",
-    ]
-    .iter()
-    .any(|pattern| value.contains(pattern))
-    {
-        "auth_required"
-    } else if ["unsupported url", "no suitable extractor"]
-        .iter()
-        .any(|pattern| value.contains(pattern))
-    {
-        "unsupported"
-    } else if [
-        "failed to decrypt with dpapi",
-        "failed to decrypt cookie",
-        "app-bound encryption",
-        "cookie database",
-        "cookies database",
-    ]
-    .iter()
-    .any(|pattern| value.contains(pattern))
-    {
-        "auth_required"
-    } else if ["404", "not found", "removed", "unavailable"]
-        .iter()
-        .any(|pattern| value.contains(pattern))
-    {
-        "unavailable"
-    } else if ["network", "timed out", "connection", "temporary failure"]
-        .iter()
-        .any(|pattern| value.contains(pattern))
-    {
-        "network"
-    } else {
-        "unknown"
-    }
-}
-
 fn host_matches(host: &str, domain: &str) -> bool {
     host == domain || host.ends_with(&format!(".{domain}"))
 }
@@ -2291,17 +395,43 @@ fn normalize_media_url(value: &str) -> Result<Url, String> {
     Ok(parsed)
 }
 
-fn format_selector(mode: &str, quality: &str) -> &'static str {
+fn format_selector(mode: &str) -> &'static str {
     if mode == "audio" {
-        return "bestaudio/best";
+        "bestaudio/best"
+    } else {
+        // The trailing photo format id is a last resort that can match only an
+        // Instagram media item without video; every video keeps the previous order.
+        "bestvideo+bestaudio/best/baldojnyi-photo"
+    }
+}
+
+/// A quality limit is a preference, not a filter. `res` is the shorter side of
+/// the frame, so 1080x1920 counts as 1080p, and a video that exists only in a
+/// larger size or without size metadata still downloads instead of failing.
+fn quality_sort(mode: &str, quality: &str) -> Option<&'static str> {
+    if mode == "audio" {
+        return None;
     }
     match quality {
-        "2160" => "bestvideo[height<=2160]+bestaudio/best[height<=2160]",
-        "1080" => "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-        "720" => "bestvideo[height<=720]+bestaudio/best[height<=720]",
-        "480" => "bestvideo[height<=480]+bestaudio/best[height<=480]",
-        _ => "bestvideo+bestaudio/best",
+        "2160" => Some("res:2160"),
+        "1080" => Some("res:1080"),
+        "720" => Some("res:720"),
+        "480" => Some("res:480"),
+        _ => None,
     }
+}
+
+fn is_expected_photo_warning(line: &str) -> bool {
+    let value = line.to_ascii_lowercase();
+    value.starts_with("warning:")
+        && value.contains("only images are available for download")
+        && !value.contains("drm")
+}
+
+/// Audio mode never saves photos: the Instagram plugin drops photo slides and
+/// reports it, or fails with a dedicated marker when the post has no video.
+fn photo_extractor_args(mode: &str) -> Option<[&'static str; 2]> {
+    (mode == "audio").then_some(["--extractor-args", "instagram:baldojnyi_photos=skip"])
 }
 
 fn playlist_flag(multi_item: bool) -> &'static str {
@@ -2329,8 +459,14 @@ fn extraction_args(
         threads_plugin_dir(app)?.into_os_string(),
         OsString::from(playlist_flag(multi_item)),
         OsString::from("-f"),
-        OsString::from(format_selector(mode, quality)),
+        OsString::from(format_selector(mode)),
     ];
+    if let Some(sort) = quality_sort(mode, quality) {
+        args.extend([OsString::from("-S"), OsString::from(sort)]);
+    }
+    if let Some(photo_args) = photo_extractor_args(mode) {
+        args.extend(photo_args.map(OsString::from));
+    }
     if let Some(target) = impersonation {
         args.extend([OsString::from("--impersonate"), OsString::from(target)]);
     }
@@ -2346,14 +482,10 @@ fn extraction_args(
             OsString::from(browser),
         ]);
     }
-    if let Some(path) = find_deno(app)?.path {
+    if let Some(path) = managed_deno_path(app)? {
         args.extend([
             OsString::from("--js-runtimes"),
-            OsString::from(if path == "deno" {
-                "deno".to_string()
-            } else {
-                format!("deno:{path}")
-            }),
+            OsString::from(format!("deno:{}", path.display())),
         ]);
     }
     Ok(args)
@@ -2370,14 +502,6 @@ fn replace_option_value(args: &[OsString], option: &str, value: &str) -> Vec<OsS
     replaced
 }
 
-fn youtube_retry_args(args: &[OsString]) -> Vec<OsString> {
-    // Re-run extraction from scratch and let the installed yt-dlp choose its
-    // current supported YouTube clients. Hard-coded client combinations age
-    // independently of yt-dlp and can turn a recoverable expired stream URL
-    // into a persistent 403.
-    args.to_vec()
-}
-
 fn youtube_retry_message(retry_attempt: u8) -> &'static str {
     if retry_attempt == 1 {
         "YouTube перервав потік. Оновлюємо посилання й продовжуємо…"
@@ -2386,387 +510,103 @@ fn youtube_retry_message(retry_attempt: u8) -> &'static str {
     }
 }
 
-async fn probe_oembed(url: &str, endpoint: &str, extractor: &str) -> Result<MediaPreview, String> {
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(4))
-        .build()
-        .map_err(|error| format!("Не вдалося підготувати швидку перевірку: {error}"))?;
-    let response = client
-        .get(endpoint)
-        .query(&[("url", url), ("format", "json")])
-        .header("User-Agent", "yt-dlp-desktop")
-        .send()
-        .await
-        .map_err(|_| "Сервіс не відповів під час швидкої перевірки".to_string())?;
-    if !response.status().is_success() {
-        return Err("Відео не існує, закрите або недоступне".into());
-    }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|_| "Не вдалося прочитати дані про відео".to_string())?;
-    let metadata: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|_| "Сервіс повернув пошкоджені дані про відео".to_string())?;
-    let title = metadata
-        .get("title")
-        .and_then(|value| value.as_str())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "У посиланні не знайдено доступного відео".to_string())?;
-    Ok(MediaPreview {
-        title: title.to_string(),
-        thumbnail: metadata
-            .get("thumbnail_url")
-            .and_then(|value| value.as_str())
-            .map(str::to_string),
-        duration: metadata.get("duration").and_then(|value| value.as_f64()),
-        duration_is_total: true,
-        uploader: metadata
-            .get("author_name")
-            .and_then(|value| value.as_str())
-            .map(str::to_string),
-        extractor: Some(extractor.to_string()),
-        webpage_url: Some(url.to_string()),
-        item_count: Some(1),
-    })
+const PROGRESS_MARKER: &str = "__YTDLP_PROGRESS__";
+
+#[derive(Debug, Default, PartialEq)]
+struct DownloadProgress {
+    percent: Option<f32>,
+    speed: Option<String>,
+    eta: Option<String>,
+    message: Option<String>,
 }
 
-async fn probe_url_inner(
-    app: AppHandle,
-    url: String,
-    playlist: bool,
-) -> Result<MediaPreview, String> {
-    let parsed = normalize_media_url(&url)?;
-    let url = parsed.to_string();
-    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
-    let is_threads = is_threads_host(&host);
-    let is_tiktok = is_tiktok_host(&host);
-    if !playlist && (host_matches(&host, "youtube.com") || host_matches(&host, "youtu.be")) {
-        return probe_oembed(&url, "https://www.youtube.com/oembed", "YouTube").await;
-    }
-    if !playlist && host_matches(&host, "vimeo.com") {
-        return probe_oembed(&url, "https://vimeo.com/api/oembed.json", "Vimeo").await;
-    }
-
-    let yt_dlp = yt_dlp_path(&app)?;
-    if !yt_dlp.is_file() {
-        return Err("yt-dlp ще не встановлено".into());
-    }
-
-    let mut command = tokio::process::Command::new(yt_dlp);
-    configure_tokio_command(&mut command);
-    let plugin_directory = threads_plugin_dir(&app)?;
-    command.args([
-        "--ignore-config",
-        yt_dlp_output_encoding_args()[0],
-        yt_dlp_output_encoding_args()[1],
-        "--simulate",
-        "--no-warnings",
-        "--no-ignore-no-formats-error",
-        "--socket-timeout",
-        "6",
-        "--extractor-retries",
-        "1",
-    ]);
-    command.args(["--plugin-dirs", plugin_directory.to_string_lossy().as_ref()]);
-    if let Some(target) = impersonation_target(is_threads, is_tiktok) {
-        command.args(["--impersonate", target]);
-    }
-    if playlist {
-        command.args(["--yes-playlist", "--flat-playlist", "--dump-single-json"]);
-    } else {
-        command.args([
-            "--no-playlist",
-            "--print",
-            "%(.{title,thumbnail,duration,uploader,channel,extractor,extractor_key,webpage_url,playlist_count})#j",
-        ]);
-    }
-    if let Some(path) = find_deno(&app)?.path {
-        if path == "deno" {
-            command.args(["--js-runtimes", "deno"]);
-        } else {
-            command.args(["--js-runtimes", &format!("deno:{path}")]);
-        }
-    }
-    command.arg(&url).kill_on_drop(true);
-
-    let output = tokio::time::timeout(Duration::from_secs(12), command.output())
-        .await
-        .map_err(|_| "Перевірка тривала надто довго. Спробуйте ще раз".to_string())?
-        .map_err(|error| format!("Не вдалося запустити yt-dlp: {error}"))?;
-    if !output.status.success() {
-        return Err(clean_probe_error(&output.stderr));
-    }
-
-    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|_| "yt-dlp повернув пошкоджені дані про відео".to_string())?;
-    let title = metadata
-        .get("title")
-        .and_then(|value| value.as_str())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "У посиланні не знайдено доступного відео".to_string())?;
-    let string_field = |name: &str| {
-        metadata
-            .get(name)
-            .and_then(|value| value.as_str())
-            .filter(|value| !value.trim().is_empty())
-            .map(str::to_string)
-    };
-    let entries = metadata.get("entries").and_then(|value| value.as_array());
-    let first_entry = entries.and_then(|entries| entries.first());
-    let playlist_string = |name: &str| {
-        string_field(name).or_else(|| {
-            first_entry
-                .and_then(|entry| entry.get(name))
-                .and_then(|value| value.as_str())
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_string)
-        })
-    };
-    let (duration, duration_is_total) = if playlist {
-        if let Some(entries) = entries.filter(|entries| !entries.is_empty()) {
-            let durations = entries
-                .iter()
-                .filter_map(|entry| json_number(entry.get("duration")))
-                .collect::<Vec<_>>();
-            if durations.len() == entries.len() {
-                (Some(durations.into_iter().sum()), true)
-            } else {
-                (durations.first().copied(), false)
+/// `percent|speed|eta|item|items|downloaded|total|title`. Inside a playlist or
+/// carousel the bar covers the whole collection instead of restarting on every
+/// file. Speed and time left are averaged over the last seconds by `smoother`.
+fn parse_download_progress(
+    payload: &str,
+    smoother: &mut progress_speed::SpeedSmoother,
+    now: Instant,
+) -> DownloadProgress {
+    let mut values = payload.splitn(8, '|').map(str::trim);
+    let mut text = || values.next().filter(|value| !value.is_empty());
+    let percent = text().and_then(|value| value.trim_end_matches('%').trim().parse::<f32>().ok());
+    let raw_speed = text();
+    let raw_eta = text();
+    let item = text().and_then(|value| value.parse::<u32>().ok());
+    let items = text().and_then(|value| value.parse::<u32>().ok());
+    let downloaded = progress_speed::parse_byte_count(text());
+    let total = progress_speed::parse_byte_count(text());
+    let progress_speed::SpeedReading { speed, eta } =
+        smoother.sample(now, downloaded, total, raw_speed, raw_eta);
+    let collection = item
+        .zip(items)
+        .filter(|(item, items)| *items > 1 && item <= items);
+    DownloadProgress {
+        percent: match collection {
+            Some((item, items)) => {
+                percent.map(|percent| ((item - 1) as f32 + percent / 100.0) / items as f32 * 100.0)
             }
-        } else {
-            (json_number(metadata.get("duration")), true)
-        }
-    } else {
-        (json_number(metadata.get("duration")), true)
-    };
-    Ok(MediaPreview {
-        title: title.to_string(),
-        thumbnail: playlist_string("thumbnail"),
-        duration,
-        duration_is_total,
-        uploader: playlist_string("uploader").or_else(|| playlist_string("channel")),
-        extractor: playlist_string("extractor_key").or_else(|| playlist_string("extractor")),
-        webpage_url: string_field("webpage_url"),
-        item_count: if playlist {
-            json_number(metadata.get("playlist_count"))
-                .map(|value| value.round() as u64)
-                .or_else(|| entries.map(|entries| entries.len() as u64))
-        } else {
-            json_number(metadata.get("playlist_count"))
-                .map(|value| value.round() as u64)
-                .or(Some(1))
+            None => percent,
         },
-    })
+        speed,
+        eta,
+        message: collection.map(|(item, items)| format!("Файл {item} із {items}")),
+    }
 }
 
-#[tauri::command]
-async fn probe_url(
-    app: AppHandle,
-    manager: State<'_, ProbeManager>,
-    probe_id: String,
-    url: String,
-    playlist: bool,
-) -> Result<MediaPreview, String> {
-    let task = tokio::spawn(probe_url_inner(app, url, playlist));
-    let abort_handle = task.abort_handle();
-    {
-        let mut active = manager
-            .active
-            .lock()
-            .map_err(|_| "Внутрішня помилка перевірки".to_string())?;
-        if let Some((_, previous)) = active.replace((probe_id.clone(), abort_handle)) {
-            previous.abort();
-        }
-    }
-    let result = task.await.map_err(|error| {
-        if error.is_cancelled() {
-            "Перевірку скасовано через нове посилання".to_string()
-        } else {
-            format!("Не вдалося завершити перевірку: {error}")
-        }
-    })?;
-    if let Ok(mut active) = manager.active.lock() {
-        if active
-            .as_ref()
-            .map(|(active_id, _)| active_id == &probe_id)
-            .unwrap_or(false)
-        {
-            *active = None;
-        }
-    }
-    result
+fn saved_files_label(count: usize) -> String {
+    let word = match (count % 10, count % 100) {
+        (1, remainder) if remainder != 11 => "файл",
+        (2..=4, remainder) if !(12..=14).contains(&remainder) => "файли",
+        _ => "файлів",
+    };
+    format!("Готово. Збережено {count} {word}.")
 }
 
-fn is_tunnel_interface(interface_name: &str) -> bool {
-    let value = interface_name.to_ascii_lowercase();
-    ["utun", "tun", "tap", "wg", "wireguard", "ppp"]
-        .iter()
-        .any(|prefix| value.starts_with(prefix))
-        || ["vpn", "tailscale", "mullvad", "nordlynx", "proton"]
-            .iter()
-            .any(|marker| value.contains(marker))
+fn completion_message(outputs: usize, photos_skipped: bool) -> Option<String> {
+    if photos_skipped {
+        Some(PHOTOS_SKIPPED_NOTICE.into())
+    } else {
+        (outputs > 1).then(|| saved_files_label(outputs))
+    }
 }
 
-#[tauri::command]
-async fn check_vpn(host: String) -> Result<VpnStatus, String> {
-    if host.is_empty()
-        || host.len() > 253
-        || !host
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-'))
-    {
-        return Err("Некоректне доменне ім’я".into());
+fn terminal_kind(
+    cancelled: bool,
+    auth_required: bool,
+    low_disk: bool,
+    succeeded: bool,
+    conversion_failed: bool,
+) -> &'static str {
+    if cancelled {
+        "cancelled"
+    } else if auth_required {
+        "auth_required"
+    } else if !low_disk && succeeded && !conversion_failed {
+        "completed"
+    } else {
+        "failed"
     }
-
-    let ip = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::net::lookup_host((host.as_str(), 443)),
-    )
-    .await
-    .ok()
-    .and_then(Result::ok)
-    .and_then(|mut addresses| addresses.next())
-    .map(|address| address.ip().to_string());
-    tauri::async_runtime::spawn_blocking(move || check_vpn_route(ip))
-        .await
-        .map_err(|e| e.to_string())?
 }
 
-fn check_vpn_route(ip: Option<String>) -> Result<VpnStatus, String> {
-    #[cfg(target_os = "macos")]
-    {
-        let interface_name = ip.as_ref().and_then(|ip| {
-            process_runner::capture(
-                Command::new("/sbin/route").args(["-n", "get", ip]),
-                Duration::from_secs(5),
-            )
-            .ok()
-            .filter(|output| output.status.success())
-            .and_then(|output| {
-                String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .find_map(|line| line.trim().strip_prefix("interface:").map(str::trim))
-                    .map(str::to_string)
-            })
-        });
-        let routed_through_tunnel = interface_name
-            .as_deref()
-            .map(is_tunnel_interface)
-            .unwrap_or(false);
-        let detected = routed_through_tunnel;
-        let route_known = interface_name.is_some();
-        let detail = if !route_known {
-            "Не вдалося визначити маршрут до цього ресурсу"
-        } else if routed_through_tunnel {
-            "Маршрут саме до цього ресурсу проходить через VPN-тунель"
-        } else {
-            "Маршрут до цього ресурсу не проходить через VPN-тунель"
-        };
-        Ok(VpnStatus {
-            detected,
-            interface_name,
-            confidence: if route_known { "high" } else { "unknown" }.into(),
-            detail: detail.into(),
-        })
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let interface_name = ip.as_ref().and_then(|ip| {
-            let mut command = Command::new("powershell.exe");
-            configure_command(&mut command);
-            command
-                .args([
-                    "-NoLogo",
-                    "-NoProfile",
-                    "-NonInteractive",
-                ])
-                .arg("-Command")
-                .arg(windows_powershell_script(
-                    "$route = Find-NetRoute -RemoteIPAddress $env:YTDLP_ROUTE_IP -ErrorAction Stop | Select-Object -First 1; $route.InterfaceAlias",
-                ))
-                .env("YTDLP_ROUTE_IP", ip);
-            process_runner::capture(&mut command, Duration::from_secs(5))
-                .ok()
-                .filter(|output| output.status.success())
-                .and_then(|output| {
-                    String::from_utf8_lossy(&output.stdout)
-                        .lines()
-                        .map(str::trim)
-                        .find(|line| !line.is_empty())
-                        .map(str::to_string)
-                })
-        });
-        let routed_through_tunnel = interface_name
-            .as_deref()
-            .map(is_tunnel_interface)
-            .unwrap_or(false);
-        let route_known = interface_name.is_some();
-        Ok(VpnStatus {
-            detected: routed_through_tunnel,
-            interface_name,
-            confidence: if route_known { "high" } else { "unknown" }.into(),
-            detail: if routed_through_tunnel {
-                "Маршрут саме до цього ресурсу проходить через VPN-тунель"
-            } else if route_known {
-                "Маршрут до цього ресурсу не проходить через відомий VPN-інтерфейс"
-            } else {
-                "Не вдалося визначити Windows-інтерфейс для маршруту до цього ресурсу"
-            }
-            .into(),
-        })
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    Ok(VpnStatus {
-        detected: false,
-        interface_name: None,
-        confidence: "unknown".into(),
-        detail: "Перевірку VPN для цієї платформи ще не реалізовано".into(),
-    })
-}
-
-fn emit_line(app: &AppHandle, id: &str, line: &str) {
-    if !line.starts_with("__YTDLP_PROGRESS__") {
+fn emit_line(app: &AppHandle, id: &str, line: &str, smoother: &mut progress_speed::SpeedSmoother) {
+    if !line.starts_with(PROGRESS_MARKER) {
         diagnostics::record(id, line);
     }
-    const MARKER: &str = "__YTDLP_PROGRESS__";
     const POSTPROCESS_MARKER: &str = "__YTDLP_POSTPROCESS__";
-    if let Some(payload) = line.strip_prefix(MARKER) {
-        let mut values = payload.splitn(4, '|');
-        let percent = values
-            .next()
-            .map(str::trim)
-            .and_then(|value| value.trim_end_matches('%').trim().parse::<f32>().ok());
-        let speed = values
-            .next()
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        let eta = values
-            .next()
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        let message = values
-            .next()
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
+    if let Some(payload) = line.strip_prefix(PROGRESS_MARKER) {
+        let progress = parse_download_progress(payload, smoother, Instant::now());
         let _ = app.emit(
             "download-event",
             DownloadEvent {
                 id: id.into(),
                 kind: "progress".into(),
-                percent,
-                speed: speed.map(str::to_string),
-                eta: eta.map(str::to_string),
-                message: message.map(str::to_string),
-                storage: None,
-                outputs: None,
-                title: None,
-                thumbnail: None,
-                uploader: None,
-                extractor: None,
-                error_code: None,
+                percent: progress.percent,
+                speed: progress.speed,
+                eta: progress.eta,
+                message: progress.message,
+                ..Default::default()
             },
         );
     } else if let Some(payload) = line.strip_prefix(POSTPROCESS_MARKER) {
@@ -2788,17 +628,8 @@ fn emit_line(app: &AppHandle, id: &str, line: &str) {
                 DownloadEvent {
                     id: id.into(),
                     kind: "postprocess".into(),
-                    percent: None,
-                    speed: None,
-                    eta: None,
                     message: Some(message.into()),
-                    storage: None,
-                    outputs: None,
-                    title: None,
-                    thumbnail: None,
-                    uploader: None,
-                    extractor: None,
-                    error_code: None,
+                    ..Default::default()
                 },
             );
         }
@@ -2816,21 +647,12 @@ fn emit_line(app: &AppHandle, id: &str, line: &str) {
                 } else {
                     "log".into()
                 },
-                percent: None,
-                speed: is_postprocess_log.then(|| "VideoToolbox".into()),
-                eta: None,
                 message: Some(if is_postprocess_log {
                     "Об’єднуємо завантажені потоки… Не закривайте застосунок".into()
                 } else {
                     line.trim().to_string()
                 }),
-                storage: None,
-                outputs: None,
-                title: None,
-                thumbnail: None,
-                uploader: None,
-                extractor: None,
-                error_code: None,
+                ..Default::default()
             },
         );
     }
@@ -2860,13 +682,15 @@ fn looks_like_auth_error(
         && ["video unavailable", "video is unavailable"]
             .iter()
             .any(|pattern| value.contains(pattern));
-    let ambiguous_forbidden =
-        forbidden_may_need_cookies && (value.contains("403") || value.contains("forbidden"));
+    let ambiguous_forbidden = forbidden_may_need_cookies && is_forbidden_error(&value);
     explicit_auth_error || ambiguous_youtube_unavailable || ambiguous_forbidden
 }
 
+/// Only yt-dlp's own `ERROR:` lines count: progress and warnings carry titles,
+/// speeds and IDs that can contain the same words and digits by coincidence.
 fn should_request_browser_auth(line: &str, policy: AuthRetryPolicy) -> bool {
     policy.allow_browser_retry
+        && line.trim_start().to_ascii_lowercase().starts_with("error:")
         && looks_like_auth_error(
             line,
             policy.youtube_unavailable_may_need_cookies,
@@ -2913,6 +737,10 @@ fn downloaded_media_from_print(payload: &str) -> Option<DownloadedMedia> {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_ascii_lowercase),
+            photo: metadata
+                .get("baldojnyi_photo")
+                .and_then(|value| value.as_bool())
+                == Some(true),
         });
     }
 
@@ -2925,6 +753,7 @@ fn downloaded_media_from_print(payload: &str) -> Option<DownloadedMedia> {
         fps: None,
         video_codec: None,
         audio_codec: None,
+        photo: false,
     })
 }
 
@@ -2980,17 +809,11 @@ fn emit_download_metadata(app: &AppHandle, id: &str, metadata: &serde_json::Valu
         DownloadEvent {
             id: id.into(),
             kind: "metadata".into(),
-            percent: None,
-            speed: None,
-            eta: None,
-            message: None,
-            storage: None,
-            outputs: None,
             title,
             thumbnail,
             uploader,
             extractor,
-            error_code: None,
+            ..Default::default()
         },
     );
 }
@@ -3048,102 +871,43 @@ fn estimated_final_size(estimate: &SelectedMediaEstimate, tracker: &StorageTrack
         .unwrap_or(estimate.source_size)
 }
 
-fn required_space_with_reserve(intermediate: u64, output: u64) -> Option<u64> {
-    intermediate
-        .checked_add(output)
-        .and_then(|total| total.checked_add(MIN_FREE_SPACE_RESERVE))
-}
-
 fn low_disk_guard_triggered(available: u64) -> bool {
     available <= DISK_GUARD_TRIGGER
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SizeConfidence {
-    #[cfg(test)]
-    Exact,
-    Approximate,
-    Unknown,
-}
-
-#[cfg(test)]
-fn selected_media_from_value(
-    metadata: &serde_json::Value,
-) -> (Option<SelectedMediaEstimate>, SizeConfidence) {
-    let media_id = metadata
-        .get("id")
-        .and_then(|value| value.as_str())
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let duration = json_number(metadata.get("duration"));
-    let requested = metadata
-        .get("requested_formats")
-        .and_then(|value| value.as_array())
-        .filter(|formats| !formats.is_empty())
-        .or_else(|| {
-            metadata
-                .get("requested_downloads")
-                .and_then(|value| value.as_array())
-                .filter(|formats| !formats.is_empty())
-        });
-    let formats: Vec<&serde_json::Value> = requested
-        .map(|formats| formats.iter().collect())
-        .unwrap_or_else(|| vec![metadata]);
-    let mut source_size = 0_u64;
-    let mut confidence = SizeConfidence::Exact;
-    let mut height = json_number(metadata.get("height")).map(|value| value.round() as u64);
-    let mut fps = json_number(metadata.get("fps"));
-    let mut total_bitrate_kbps = json_number(metadata.get("tbr"));
-    for format in formats {
-        height =
-            height.or_else(|| json_number(format.get("height")).map(|value| value.round() as u64));
-        fps = fps.or_else(|| json_number(format.get("fps")));
-        let bitrate = json_number(format.get("tbr"))
-            .or_else(|| json_number(format.get("vbr")))
-            .or_else(|| json_number(format.get("abr")));
-        total_bitrate_kbps = total_bitrate_kbps.or(bitrate);
-        let (size, format_confidence) = if let Some(size) = json_number(format.get("filesize")) {
-            (Some(size), SizeConfidence::Exact)
-        } else if let Some(size) = json_number(format.get("filesize_approx")) {
-            (Some(size), SizeConfidence::Approximate)
-        } else if let (Some(duration), Some(bitrate)) = (duration, bitrate) {
-            (
-                Some(duration * bitrate * 1_000.0 / 8.0),
-                SizeConfidence::Approximate,
-            )
-        } else {
-            (None, SizeConfidence::Unknown)
-        };
-        let Some(size) = size.filter(|size| size.is_finite() && *size > 0.0) else {
-            return (None, SizeConfidence::Unknown);
-        };
-        if format_confidence == SizeConfidence::Approximate {
-            confidence = SizeConfidence::Approximate;
-        }
-        let Some(size) = (size <= u64::MAX as f64).then_some(size.ceil() as u64) else {
-            return (None, SizeConfidence::Unknown);
-        };
-        let Some(total) = source_size.checked_add(size) else {
-            return (None, SizeConfidence::Unknown);
-        };
-        source_size = total;
-    }
-    (
-        Some(SelectedMediaEstimate {
-            media_id,
-            source_size,
-            duration,
-            height,
-            fps,
-            total_bitrate_kbps,
-        }),
-        confidence,
-    )
-}
-
 fn available_disk_space(path: &Path) -> Option<u64> {
     fs2::available_space(path).ok()
+}
+
+/// Shown when the save folder disappears mid-job, e.g. an external drive was
+/// unplugged. `errors.rs` recognises this text to pick the error code.
+pub(crate) const DESTINATION_UNAVAILABLE_MESSAGE: &str =
+    "Папка збереження стала недоступною: диск від’єднано або папку видалено. Під’єднайте диск і повторіть.";
+
+#[derive(Debug, PartialEq)]
+enum DiskGuard {
+    Ok,
+    Low,
+    Unavailable,
+}
+
+/// Free space alone cannot tell a full disk from a missing one: an unplugged
+/// drive fails the space query, while on Windows a deleted folder on a present
+/// drive still reports the drive's space. The folder is checked first (jobs only
+/// start in an existing folder); any other unknown state still stops the job to
+/// protect the disk.
+fn disk_guard(path: &Path) -> DiskGuard {
+    if !destination_present(path) {
+        return DiskGuard::Unavailable;
+    }
+    match available_disk_space(path) {
+        Some(available) if !low_disk_guard_triggered(available) => DiskGuard::Ok,
+        _ => DiskGuard::Low,
+    }
+}
+
+fn destination_present(path: &Path) -> bool {
+    path.try_exists().unwrap_or(false)
 }
 
 #[cfg(target_os = "macos")]
@@ -3196,18 +960,6 @@ fn planning_available_disk_space(path: &Path) -> Option<u64> {
     available_disk_space(path)
 }
 
-fn scale_playlist_estimate(
-    estimate: Option<u64>,
-    item_count: u64,
-    duration_is_total: bool,
-) -> Option<u64> {
-    if duration_is_total {
-        estimate
-    } else {
-        estimate.and_then(|value| value.checked_mul(item_count))
-    }
-}
-
 #[tauri::command]
 async fn folder_free_space(path: String) -> Result<u64, String> {
     tauri::async_runtime::spawn_blocking(move || folder_free_space_inner(path))
@@ -3224,85 +976,22 @@ fn folder_free_space_inner(path: String) -> Result<u64, String> {
 }
 
 #[tauri::command]
-async fn preflight_download(request: PreflightRequest) -> Result<PreflightResult, String> {
-    tauri::async_runtime::spawn_blocking(move || preflight_download_inner(request))
+async fn preflight_download(url: String, output_dir: String) -> Result<PreflightResult, String> {
+    tauri::async_runtime::spawn_blocking(move || preflight_download_inner(&url, &output_dir))
         .await
         .map_err(|e| e.to_string())?
 }
-fn preflight_download_inner(request: PreflightRequest) -> Result<PreflightResult, String> {
-    normalize_media_url(&request.url)?;
-    let output_dir = PathBuf::from(&request.output_dir);
+fn preflight_download_inner(url: &str, output_dir: &str) -> Result<PreflightResult, String> {
+    normalize_media_url(url)?;
+    let output_dir = PathBuf::from(output_dir);
     if !output_dir.is_dir() {
         return Err("Обрана папка для завантаження недоступна".into());
     }
     let available_space = planning_available_disk_space(&output_dir)
         .ok_or_else(|| "Не вдалося визначити вільне місце в обраній папці".to_string())?;
-    let title = request
-        .title
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "Медіафайл".into());
-    let item_count = if request.multi_item {
-        request.item_count.unwrap_or(1).max(1)
-    } else {
-        1
-    };
-    let duration = request
-        .duration
-        .filter(|value| value.is_finite() && *value > 0.0);
-    let height = match request.quality.as_str() {
-        "2160" => Some(2160),
-        "1080" => Some(1080),
-        "720" => Some(720),
-        "480" => Some(480),
-        _ => None,
-    };
-    let estimate = duration.map(|duration| SelectedMediaEstimate {
-        media_id: "quick-preflight".into(),
-        source_size: 0,
-        duration: Some(duration),
-        height,
-        fps: Some(30.0),
-        total_bitrate_kbps: None,
-    });
-    let per_duration_estimate = estimate.as_ref().and_then(|estimate| {
-        estimated_output_size(estimate, request.mode != "audio", &request.audio_format)
-    });
-    let final_total = scale_playlist_estimate(
-        per_duration_estimate,
-        item_count,
-        !request.multi_item || request.duration_is_total.unwrap_or(false),
-    );
-    // A fast preflight intentionally reuses already-fetched preview metadata instead of
-    // asking yt-dlp to resolve every selected format again. At peak disk usage the source
-    // and converted output coexist, so using the output estimate for both is conservative.
-    let intermediate_total = final_total;
-    let confidence = if final_total.is_some() {
-        SizeConfidence::Approximate
-    } else {
-        SizeConfidence::Unknown
-    };
-    let required_space = intermediate_total
-        .zip(final_total)
-        .and_then(|(intermediate, output)| required_space_with_reserve(intermediate, output));
-    let sufficient = required_space
-        .map(|required| available_space >= required)
-        .unwrap_or(available_space > DISK_GUARD_TRIGGER);
     Ok(PreflightResult {
-        title,
-        item_count,
-        intermediate_size: intermediate_total,
-        final_output_size: final_total,
-        protected_reserve: MIN_FREE_SPACE_RESERVE,
-        required_space,
         available_space,
-        confidence: match confidence {
-            SizeConfidence::Approximate => "approximate",
-            SizeConfidence::Unknown => "unknown",
-            #[cfg(test)]
-            SizeConfidence::Exact => "exact",
-        }
-        .into(),
-        sufficient,
+        sufficient: available_space > DISK_GUARD_TRIGGER,
     })
 }
 
@@ -3338,22 +1027,13 @@ fn emit_storage_estimate(
         DownloadEvent {
             id: id.into(),
             kind: "storage_estimate".into(),
-            percent: None,
-            speed: None,
-            eta: None,
-            message: None,
             storage: Some(StorageEstimate {
                 estimated_size,
                 required_space,
                 available_space,
                 sufficient: available_space.map(|available| available >= required_space),
             }),
-            outputs: None,
-            title: None,
-            thumbnail: None,
-            uploader: None,
-            extractor: None,
-            error_code: None,
+            ..Default::default()
         },
     );
 }
@@ -3398,7 +1078,12 @@ fn read_output<R: Read + Send + 'static>(
     thread::spawn(move || {
         let mut reader = BufReader::new(reader);
         let mut buffer = Vec::new();
+        let mut smoother = progress_speed::SpeedSmoother::default();
         while let Ok(Some(line)) = read_lossy_line(&mut reader, &mut buffer) {
+            if line.starts_with(PROGRESS_MARKER) || line.starts_with("__YTDLP_POSTPROCESS__") {
+                emit_line(&app, &id, &line, &mut smoother);
+                continue;
+            }
             if let Some((_, payload)) = line.split_once("__YTDLP_CANDIDATES__") {
                 if payload.len() < 300_000 {
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
@@ -3430,6 +1115,14 @@ fn read_output<R: Read + Send + 'static>(
                     }
                 }
                 continue;
+            } else if line.contains(INSTAGRAM_PHOTOS_SKIPPED_MARKER) {
+                state.photos_skipped.store(true, Ordering::Relaxed);
+                continue;
+            } else if is_expected_photo_warning(&line) {
+                // yt-dlp warns about image-only formats; for a plugin photo this
+                // is the expected result, so keep it out of the progress popup.
+                diagnostics::record(&id, &line);
+                continue;
             } else if let Some(path) = line.strip_prefix("__YTDLP_FILE__") {
                 if let Some(files) = state.downloaded_files.as_ref() {
                     if let (Some(media), Ok(mut files)) =
@@ -3456,7 +1149,7 @@ fn read_output<R: Read + Send + 'static>(
                     *error = Some(line.trim().trim_start_matches("ERROR:").trim().to_string());
                 }
             }
-            emit_line(&app, &id, &line);
+            emit_line(&app, &id, &line, &mut smoother);
         }
     })
 }
@@ -3530,19 +1223,7 @@ fn stop_child_process_group(child: &Arc<Mutex<Child>>) -> Result<(), String> {
 }
 
 fn ffprobe_path(ffmpeg_path: &Path) -> PathBuf {
-    if ffmpeg_path.components().count() > 1 {
-        ffmpeg_path.with_file_name(if cfg!(target_os = "windows") {
-            "ffprobe.exe"
-        } else {
-            "ffprobe"
-        })
-    } else {
-        PathBuf::from(if cfg!(target_os = "windows") {
-            "ffprobe.exe"
-        } else {
-            "ffprobe"
-        })
-    }
+    ffmpeg_path.with_file_name(managed_binary_name("ffprobe"))
 }
 
 fn parse_frame_rate(value: &str) -> Option<f64> {
@@ -3693,190 +1374,75 @@ fn inspect_history_files_inner(paths: Vec<String>) -> Vec<HistoryFileStatus> {
         .collect()
 }
 
-fn history_thumbnail_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let directory = app
-        .path()
-        .app_local_data_dir()
-        .map_err(|error| format!("Не вдалося знайти папку застосунку: {error}"))?
-        .join("history-thumbnails");
-    fs::create_dir_all(&directory)
-        .map_err(|error| format!("Не вдалося створити кеш прев’ю: {error}"))?;
-    Ok(directory)
-}
+type JobAttempt = (
+    Arc<Mutex<Child>>,
+    Option<thread::JoinHandle<()>>,
+    Option<thread::JoinHandle<()>>,
+);
 
-fn thumbnail_extension(content_type: &str) -> Option<&'static str> {
-    match content_type
-        .split(';')
-        .next()?
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "image/jpeg" => Some("jpg"),
-        "image/png" => Some("png"),
-        "image/webp" => Some("webp"),
-        "image/gif" => Some("gif"),
-        "image/avif" => Some("avif"),
-        _ => None,
-    }
-}
-
-fn prune_history_thumbnail_cache(directory: &Path) {
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
+/// Start one yt-dlp attempt with piped output and both pipes being read.
+fn spawn_job_attempt(
+    app: &AppHandle,
+    manager: &DownloadManager,
+    id: &str,
+    program: &OsStr,
+    args: &[OsString],
+    state: &OutputReaderState,
+) -> Result<JobAttempt, String> {
+    let mut command = Command::new(program);
+    configure_command(&mut command);
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+    let (child, stdout, stderr) = job_process::spawn(manager, id, &mut command)?;
+    let reader = |pipe: Box<dyn Read + Send>| {
+        read_output(
+            app.clone(),
+            manager.clone(),
+            id.to_string(),
+            pipe,
+            state.clone(),
+        )
     };
-    let mut files = entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let metadata = entry.metadata().ok()?;
-            metadata.is_file().then(|| {
-                (
-                    metadata
-                        .modified()
-                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
-                    entry.path(),
-                )
-            })
-        })
-        .collect::<Vec<_>>();
-    if files.len() <= HISTORY_THUMBNAIL_CACHE_LIMIT {
-        return;
-    }
-    files.sort_by_key(|(modified, _)| *modified);
-    let remove_count = files.len() - HISTORY_THUMBNAIL_CACHE_LIMIT;
-    for (_, path) in files.into_iter().take(remove_count) {
-        let _ = fs::remove_file(path);
-    }
+    let stdout_reader = stdout.map(|pipe| reader(Box::new(pipe)));
+    let stderr_reader = stderr.map(|pipe| reader(Box::new(pipe)));
+    Ok((child, stdout_reader, stderr_reader))
 }
 
-#[tauri::command]
-async fn cache_history_thumbnail(
-    app: AppHandle,
-    cache: State<'_, HistoryThumbnailCache>,
-    url: String,
-) -> Result<String, String> {
-    let _operation = cache.operation.lock().await;
-    let parsed = Url::parse(&url).map_err(|_| "Некоректне посилання на прев’ю".to_string())?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-        return Err("Прев’ю має використовувати HTTP або HTTPS".into());
-    }
-    let directory = history_thumbnail_dir(&app)?;
-    let digest = format!("{:x}", Sha256::digest(url.as_bytes()));
-    for extension in ["jpg", "png", "webp", "gif", "avif"] {
-        let cached = directory.join(format!("{digest}.{extension}"));
-        if cached.is_file() {
-            return Ok(cached.to_string_lossy().into_owned());
-        }
-    }
+fn emit_retrying(app: &AppHandle, id: &str, message: &str) {
+    let _ = app.emit(
+        "download-event",
+        DownloadEvent {
+            id: id.into(),
+            kind: "retrying".into(),
+            message: Some(message.into()),
+            ..Default::default()
+        },
+    );
+}
 
-    let mut current = parsed;
-    let mut redirect_count = 0_u8;
-    let mut response = loop {
-        let client = public_thumbnail_client(&current).await?;
-        let response = client
-            .get(current.clone())
-            .header("User-Agent", "yt-dlp-desktop")
-            .send()
-            .await
-            .map_err(|error| format!("Не вдалося завантажити прев’ю: {error}"))?;
-        if response.status().is_redirection() {
-            if redirect_count >= 10 {
-                return Err("Сервер прев’ю виконав забагато перенаправлень".into());
+fn prepare_retry_dir(directory: &Path, last_error: &Mutex<Option<String>>) -> bool {
+    match reset_download_temp_dir(directory) {
+        Ok(()) => true,
+        Err(error) => {
+            if let Ok(mut last_error) = last_error.lock() {
+                *last_error = Some(error);
             }
-            let location = response
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|value| value.to_str().ok())
-                .ok_or_else(|| "Сервер прев’ю повернув некоректне перенаправлення".to_string())?;
-            current = current
-                .join(location)
-                .map_err(|_| "Сервер прев’ю повернув некоректну нову адресу".to_string())?;
-            if !matches!(current.scheme(), "http" | "https") || current.host_str().is_none() {
-                return Err("Перенаправлення прев’ю використовує непідтримувану адресу".into());
-            }
-            redirect_count += 1;
-            continue;
+            false
         }
-        break response
-            .error_for_status()
-            .map_err(|error| format!("Сервер прев’ю повернув помилку: {error}"))?;
-    };
-    if response
-        .content_length()
-        .is_some_and(|size| size > MAX_HISTORY_THUMBNAIL_BYTES)
-    {
-        return Err("Прев’ю завелике для локального кешу".into());
     }
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    let extension = thumbnail_extension(content_type)
-        .ok_or_else(|| "Сервер повернув непідтримуваний формат прев’ю".to_string())?;
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| format!("Не вдалося прочитати прев’ю: {error}"))?
-    {
-        if (bytes.len() as u64).saturating_add(chunk.len() as u64) > MAX_HISTORY_THUMBNAIL_BYTES {
-            return Err("Прев’ю завелике для локального кешу".into());
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    if bytes.is_empty() {
-        return Err("Сервер повернув порожнє прев’ю".into());
-    }
-    let destination = directory.join(format!("{digest}.{extension}"));
-    let temporary = directory.join(format!(".{digest}.{}.part", Uuid::new_v4()));
-    tokio::fs::write(&temporary, bytes)
-        .await
-        .map_err(|error| format!("Не вдалося записати кеш прев’ю: {error}"))?;
-    if let Err(error) = tokio::fs::rename(&temporary, &destination).await {
-        let _ = tokio::fs::remove_file(&temporary).await;
-        return Err(format!("Не вдалося завершити кешування прев’ю: {error}"));
-    }
-    prune_history_thumbnail_cache(&directory);
-    Ok(destination.to_string_lossy().into_owned())
 }
 
-#[tauri::command]
-async fn clear_history_thumbnail_cache(
-    app: AppHandle,
-    cache: State<'_, HistoryThumbnailCache>,
-) -> Result<(), String> {
-    let _operation = cache.operation.lock().await;
-    let directory = app
-        .path()
-        .app_local_data_dir()
-        .map_err(|error| format!("Не вдалося знайти папку застосунку: {error}"))?
-        .join("history-thumbnails");
-    if directory.exists() {
-        fs::remove_dir_all(&directory)
-            .map_err(|error| format!("Не вдалося очистити кеш прев’ю: {error}"))?;
-    }
-    fs::create_dir_all(directory)
-        .map_err(|error| format!("Не вдалося відновити кеш прев’ю: {error}"))
-}
-
-#[tauri::command]
-async fn delete_history_thumbnail(
-    app: AppHandle,
-    cache: State<'_, HistoryThumbnailCache>,
-    path: String,
-) -> Result<(), String> {
-    let _operation = cache.operation.lock().await;
-    let directory = history_thumbnail_dir(&app)?;
-    let candidate = PathBuf::from(path);
-    if candidate.parent() != Some(directory.as_path()) {
-        return Err("Можна видаляти лише файли кешу прев’ю".into());
-    }
-    if candidate.exists() {
-        fs::remove_file(candidate)
-            .map_err(|error| format!("Не вдалося видалити прев’ю з кешу: {error}"))?;
-    }
-    Ok(())
+/// yt-dlp reports an existing file with the same name as if it had just saved
+/// it. Only a file created after this job began is ours to replace; if the time
+/// cannot be read, the file stays.
+fn source_created_by_job(path: &Path, job_started: SystemTime) -> bool {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.created())
+        .is_ok_and(|created| created >= job_started)
 }
 
 #[tauri::command]
@@ -3936,11 +1502,7 @@ async fn start_download(
     }
     let available_space = planning_available_disk_space(&output_dir)
         .ok_or_else(|| "Не вдалося визначити вільне місце в обраній папці".to_string())?;
-    let enough_space = request
-        .expected_required_space
-        .map(|required| available_space >= required)
-        .unwrap_or(available_space > DISK_GUARD_TRIGGER);
-    if !enough_space {
+    if available_space <= DISK_GUARD_TRIGGER {
         return Err("Недостатньо вільного місця для безпечного завантаження".into());
     }
     let yt_dlp = yt_dlp_path(&app)?;
@@ -3955,6 +1517,9 @@ async fn start_download(
         yt_dlp_output_encoding_args()[0],
         yt_dlp_output_encoding_args()[1],
         "--no-simulate",
+        // File dates mean "saved here"; a server date could also rewrite the
+        // creation time that proves a file belongs to this job.
+        "--no-mtime",
         "--newline",
         "--no-colors",
         "--progress",
@@ -3963,7 +1528,7 @@ async fn start_download(
         "--progress-delta",
         "0.25",
         "--progress-template",
-        "__YTDLP_PROGRESS__%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(info.title)s",
+        "__YTDLP_PROGRESS__%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(info.playlist_autonumber)s|%(info.n_entries)s|%(progress.downloaded_bytes)s|%(progress.total_bytes,progress.total_bytes_estimate)s|%(info.title)s",
         "--progress-template",
         "postprocess:__YTDLP_POSTPROCESS__%(progress.status)s|%(progress.postprocessor)s|%(info.title)s",
         "-o",
@@ -3991,22 +1556,12 @@ async fn start_download(
             "7",
         ]);
     }
-    let ffmpeg = find_ffmpeg(&app)?;
-    if let Some(path) = ffmpeg
-        .path
-        .as_ref()
-        .filter(|path| path.as_str() != "ffmpeg")
-    {
-        let ffmpeg_directory = Path::new(&path).parent().unwrap_or(&runtime);
-        command.args([
-            "--ffmpeg-location",
-            ffmpeg_directory.to_string_lossy().as_ref(),
-        ]);
-    }
+    let ffmpeg_path = managed_ffmpeg_path(&app)?;
+    command.args(["--ffmpeg-location", runtime.to_string_lossy().as_ref()]);
 
     command.args([
         "--print",
-        "after_move:__YTDLP_FILE__%(.{filepath,duration,height,fps,vcodec,acodec,webpage_url,title,thumbnail,uploader,extractor})j",
+        "after_move:__YTDLP_FILE__%(.{filepath,duration,height,fps,vcodec,acodec,webpage_url,title,thumbnail,uploader,extractor,baldojnyi_photo})j",
     ]);
     if request.mode != "audio" {
         command.args(["--merge-output-format", "mkv"]);
@@ -4014,6 +1569,7 @@ async fn start_download(
     if request.subtitles {
         command.args(["--write-subs", "--write-auto-subs", "--sub-langs", "uk,en"]);
     }
+    let job_started = SystemTime::now();
     let job_temp_dir = create_download_temp_dir(&output_dir, &id)?;
     if let Err(error) = recovery::record(&app, &id, &job_temp_dir) {
         cleanup_download_temp_dir(&job_temp_dir);
@@ -4025,29 +1581,16 @@ async fn start_download(
     if selected_source.is_some() {
         command.args(["--referer", parsed.as_str()]);
     }
-    command
-        .arg(
-            selected_source
-                .as_ref()
-                .map(|url| format!("baldoj-source:{url}"))
-                .unwrap_or_else(|| parsed.to_string()),
-        )
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    #[cfg(unix)]
-    command.process_group(0);
+    command.arg(
+        selected_source
+            .as_ref()
+            .map(|url| format!("baldoj-source:{url}"))
+            .unwrap_or_else(|| parsed.to_string()),
+    );
 
     let retry_program: OsString = command.get_program().to_os_string();
     let retry_args: Vec<OsString> = command.get_args().map(OsString::from).collect();
     let tiktok_retry_args = replace_option_value(&retry_args, "--impersonate", "chrome");
-    let (child, stdout, stderr) = match job_process::spawn(manager.inner(), &id, &mut command) {
-        Ok(child) => child,
-        Err(error) => {
-            cleanup_download_temp_dir(&job_temp_dir);
-            return Err(format!("Не вдалося запустити yt-dlp: {error}"));
-        }
-    };
     let downloaded_files = Arc::new(Mutex::new(Vec::<DownloadedMedia>::new()));
     let storage_tracker = StorageTracker {
         output_dir,
@@ -4056,31 +1599,30 @@ async fn start_download(
         audio_format: request.audio_format.clone(),
     };
     let last_error = Arc::new(Mutex::new(None::<String>));
+    let photos_skipped = Arc::new(AtomicBool::new(false));
     let output_reader_state = OutputReaderState {
         downloaded_files: Some(downloaded_files.clone()),
         storage_tracker: Some(storage_tracker.clone()),
         last_error: last_error.clone(),
         auth_retry,
+        photos_skipped: photos_skipped.clone(),
     };
-
-    let stdout_reader = stdout.map(|stdout| {
-        read_output(
-            app.clone(),
-            manager.inner().clone(),
-            id.clone(),
-            stdout,
-            output_reader_state.clone(),
-        )
-    });
-    let stderr_reader = stderr.map(|stderr| {
-        read_output(
-            app.clone(),
-            manager.inner().clone(),
-            id.clone(),
-            stderr,
-            output_reader_state.clone(),
-        )
-    });
+    let first_attempt = spawn_job_attempt(
+        &app,
+        manager.inner(),
+        &id,
+        &retry_program,
+        &retry_args,
+        &output_reader_state,
+    );
+    let (child, stdout_reader, stderr_reader) = match first_attempt {
+        Ok(attempt) => attempt,
+        Err(error) => {
+            cleanup_download_temp_dir(&job_temp_dir);
+            recovery::finish(&app, &id, &job_temp_dir);
+            return Err(format!("Не вдалося запустити yt-dlp: {error}"));
+        }
+    };
 
     let manager = manager.inner().clone();
     let monitor_app = app.clone();
@@ -4091,10 +1633,6 @@ async fn start_download(
     } else {
         "mp4".into()
     };
-    let ffmpeg_path = ffmpeg
-        .path
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("ffmpeg"));
     thread::spawn(move || {
         let mut active_child = child;
         let mut stdout_reader = stdout_reader;
@@ -4105,6 +1643,7 @@ async fn start_download(
         let mut discovery_started: Option<Instant> = None;
         let mut last_disk_check = Instant::now();
         let mut low_disk = false;
+        let mut destination_unavailable = false;
         loop {
             if discovery_started.is_some_and(|start| start.elapsed() > Duration::from_secs(25)) {
                 discovery_started = None;
@@ -4115,13 +1654,17 @@ async fn start_download(
             }
             if !low_disk && last_disk_check.elapsed() >= Duration::from_secs(1) {
                 last_disk_check = Instant::now();
-                if available_disk_space(&monitored_output_dir)
-                    .map(low_disk_guard_triggered)
-                    .unwrap_or(true)
-                {
+                let guard = disk_guard(&monitored_output_dir);
+                if guard != DiskGuard::Ok {
+                    // Both stop the job the same way; only the explanation differs.
                     low_disk = true;
+                    destination_unavailable = guard == DiskGuard::Unavailable;
                     if let Ok(mut error) = last_error.lock() {
-                        *error = Some("Недостатньо вільного місця. Процес зупинено, щоб зберегти резерв 500 МіБ.".into());
+                        *error = Some(if destination_unavailable {
+                            DESTINATION_UNAVAILABLE_MESSAGE.into()
+                        } else {
+                            "Недостатньо вільного місця. Процес зупинено, щоб зберегти резерв 500 МіБ.".into()
+                        });
                     }
                     let _ = stop_child_process_group(&active_child);
                 }
@@ -4140,26 +1683,14 @@ async fn start_download(
                 }
                 let mut cancelled = download_was_cancelled(&manager, &monitor_id);
                 let failure_message = last_error.lock().ok().and_then(|error| error.clone());
-                let tiktok_403 = is_tiktok
-                    && !status.success()
+                let failed_with_403 = !status.success()
                     && !low_disk
-                    && failure_message
-                        .as_deref()
-                        .map(|message| message.contains("403"))
-                        .unwrap_or(false);
-                let tiktok_retry_ready = if tiktok_403 && !cancelled && !tiktok_retry_used {
-                    match reset_download_temp_dir(&job_temp_dir) {
-                        Ok(()) => true,
-                        Err(error) => {
-                            if let Ok(mut last_error) = last_error.lock() {
-                                *last_error = Some(error);
-                            }
-                            false
-                        }
-                    }
-                } else {
-                    false
-                };
+                    && failure_message.as_deref().is_some_and(is_forbidden_error);
+                let tiktok_retry_ready = is_tiktok
+                    && failed_with_403
+                    && !cancelled
+                    && !tiktok_retry_used
+                    && prepare_retry_dir(&job_temp_dir, &last_error);
                 if tiktok_retry_ready {
                     tiktok_retry_used = true;
                     manager
@@ -4167,59 +1698,24 @@ async fn start_download(
                         .lock()
                         .ok()
                         .map(|mut jobs| jobs.remove(&monitor_id));
-                    let retry_message =
-                        "TikTok відхилив запит. Перемикаємо профіль з’єднання й повторюємо…";
-                    let _ = monitor_app.emit(
-                        "download-event",
-                        DownloadEvent {
-                            id: monitor_id.clone(),
-                            kind: "retrying".into(),
-                            percent: None,
-                            speed: None,
-                            eta: None,
-                            message: Some(retry_message.into()),
-                            storage: None,
-                            outputs: None,
-                            title: None,
-                            thumbnail: None,
-                            uploader: None,
-                            extractor: None,
-                            error_code: None,
-                        },
+                    emit_retrying(
+                        &monitor_app,
+                        &monitor_id,
+                        "TikTok відхилив запит. Перемикаємо профіль з’єднання й повторюємо…",
                     );
                     if let Ok(mut error) = last_error.lock() {
                         *error = None;
                     }
-                    let mut retry_command = Command::new(&retry_program);
-                    configure_command(&mut retry_command);
-                    retry_command
-                        .args(&tiktok_retry_args)
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped());
-                    #[cfg(unix)]
-                    retry_command.process_group(0);
-
-                    match job_process::spawn(&manager, &monitor_id, &mut retry_command) {
-                        Ok((retry_child, retry_stdout, retry_stderr)) => {
-                            active_child = retry_child;
-                            stdout_reader = retry_stdout.map(|stdout| {
-                                read_output(
-                                    monitor_app.clone(),
-                                    manager.clone(),
-                                    monitor_id.clone(),
-                                    stdout,
-                                    output_reader_state.clone(),
-                                )
-                            });
-                            stderr_reader = retry_stderr.map(|stderr| {
-                                read_output(
-                                    monitor_app.clone(),
-                                    manager.clone(),
-                                    monitor_id.clone(),
-                                    stderr,
-                                    output_reader_state.clone(),
-                                )
-                            });
+                    match spawn_job_attempt(
+                        &monitor_app,
+                        &manager,
+                        &monitor_id,
+                        &retry_program,
+                        &tiktok_retry_args,
+                        &output_reader_state,
+                    ) {
+                        Ok(attempt) => {
+                            (active_child, stdout_reader, stderr_reader) = attempt;
                             continue;
                         }
                         Err(error) => {
@@ -4230,80 +1726,34 @@ async fn start_download(
                         }
                     }
                 }
-                let youtube_403 = is_youtube
-                    && !status.success()
-                    && !low_disk
-                    && failure_message
-                        .as_deref()
-                        .map(|message| message.contains("403"))
-                        .unwrap_or(false);
-                let youtube_retry_ready = if youtube_403 && !cancelled && retry_attempt < 2 {
-                    match reset_download_temp_dir(&job_temp_dir) {
-                        Ok(()) => true,
-                        Err(error) => {
-                            if let Ok(mut last_error) = last_error.lock() {
-                                *last_error = Some(error);
-                            }
-                            false
-                        }
-                    }
-                } else {
-                    false
-                };
+                let youtube_retry_ready = is_youtube
+                    && failed_with_403
+                    && !cancelled
+                    && retry_attempt < 2
+                    && prepare_retry_dir(&job_temp_dir, &last_error);
                 if youtube_retry_ready {
                     retry_attempt += 1;
-                    let retry_message = youtube_retry_message(retry_attempt);
-                    let _ = monitor_app.emit(
-                        "download-event",
-                        DownloadEvent {
-                            id: monitor_id.clone(),
-                            kind: "retrying".into(),
-                            percent: None,
-                            speed: None,
-                            eta: None,
-                            message: Some(retry_message.into()),
-                            storage: None,
-                            outputs: None,
-                            title: None,
-                            thumbnail: None,
-                            uploader: None,
-                            extractor: None,
-                            error_code: None,
-                        },
+                    emit_retrying(
+                        &monitor_app,
+                        &monitor_id,
+                        youtube_retry_message(retry_attempt),
                     );
                     if let Ok(mut error) = last_error.lock() {
                         *error = None;
                     }
-                    let mut retry_command = Command::new(&retry_program);
-                    configure_command(&mut retry_command);
-                    retry_command
-                        .args(youtube_retry_args(&retry_args))
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped());
-                    #[cfg(unix)]
-                    retry_command.process_group(0);
-
-                    match job_process::spawn(&manager, &monitor_id, &mut retry_command) {
-                        Ok((retry_child, retry_stdout, retry_stderr)) => {
-                            active_child = retry_child;
-                            stdout_reader = retry_stdout.map(|stdout| {
-                                read_output(
-                                    monitor_app.clone(),
-                                    manager.clone(),
-                                    monitor_id.clone(),
-                                    stdout,
-                                    output_reader_state.clone(),
-                                )
-                            });
-                            stderr_reader = retry_stderr.map(|stderr| {
-                                read_output(
-                                    monitor_app.clone(),
-                                    manager.clone(),
-                                    monitor_id.clone(),
-                                    stderr,
-                                    output_reader_state.clone(),
-                                )
-                            });
+                    // Re-run extraction from scratch and let the installed yt-dlp
+                    // choose its current YouTube clients: hard-coded ones age and
+                    // can turn a recoverable expired stream URL into a lasting 403.
+                    match spawn_job_attempt(
+                        &monitor_app,
+                        &manager,
+                        &monitor_id,
+                        &retry_program,
+                        &retry_args,
+                        &output_reader_state,
+                    ) {
+                        Ok(attempt) => {
+                            (active_child, stdout_reader, stderr_reader) = attempt;
                             continue;
                         }
                         Err(error) => {
@@ -4325,75 +1775,37 @@ async fn start_download(
                 {
                     discovery_retry_used = true;
                     discovery_started = Some(Instant::now());
-                    let _ = monitor_app.emit(
-                        "download-event",
-                        DownloadEvent {
-                            id: monitor_id.clone(),
-                            kind: "retrying".into(),
-                            message: Some(
-                                "Стандартний спосіб не знайшов відео. Шукаємо джерело на сторінці…"
-                                    .into(),
-                            ),
-                            percent: None,
-                            speed: None,
-                            eta: None,
-                            storage: None,
-                            outputs: None,
-                            title: None,
-                            thumbnail: None,
-                            uploader: None,
-                            extractor: None,
-                            error_code: None,
-                        },
-                    );
-                    diagnostics::record(
-                        &monitor_id,
-                        "Стандартний спосіб не знайшов відео. Шукаємо джерело на сторінці…",
-                    );
+                    let notice =
+                        "Стандартний спосіб не знайшов відео. Шукаємо джерело на сторінці…";
+                    emit_retrying(&monitor_app, &monitor_id, notice);
+                    diagnostics::record(&monitor_id, notice);
                     let mut args = retry_args.clone();
                     if let Some(url) = args.last_mut() {
                         *url = format!("baldoj-discover:{}", parsed.as_str()).into();
                     }
-                    let mut command = Command::new(&retry_program);
-                    configure_command(&mut command);
-                    command
-                        .args(args)
-                        .args(["--socket-timeout", "10", "--extractor-retries", "0"])
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped());
-                    #[cfg(unix)]
-                    command.process_group(0);
-                    if let Ok((child, stdout, stderr)) =
-                        job_process::spawn(&manager, &monitor_id, &mut command)
-                    {
-                        active_child = child;
-                        stdout_reader = stdout.map(|pipe| {
-                            read_output(
-                                monitor_app.clone(),
-                                manager.clone(),
-                                monitor_id.clone(),
-                                pipe,
-                                output_reader_state.clone(),
-                            )
-                        });
-                        stderr_reader = stderr.map(|pipe| {
-                            read_output(
-                                monitor_app.clone(),
-                                manager.clone(),
-                                monitor_id.clone(),
-                                pipe,
-                                output_reader_state.clone(),
-                            )
-                        });
+                    args.extend(
+                        ["--socket-timeout", "10", "--extractor-retries", "0"].map(OsString::from),
+                    );
+                    if let Ok(attempt) = spawn_job_attempt(
+                        &monitor_app,
+                        &manager,
+                        &monitor_id,
+                        &retry_program,
+                        &args,
+                        &output_reader_state,
+                    ) {
+                        (active_child, stdout_reader, stderr_reader) = attempt;
                         continue;
                     }
                 }
+                // A finished process proves that no sign-in was needed after all.
                 let auth_required = manager
                     .auth_required
                     .lock()
                     .ok()
                     .map(|mut jobs| jobs.remove(&monitor_id))
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+                    && !status.success();
                 let mut conversion_error = None;
                 let mut completed_outputs = Vec::new();
                 {
@@ -4456,6 +1868,7 @@ async fn start_download(
                                 file,
                                 (index, files.len()),
                                 &output_format,
+                                source_created_by_job(&file.path, job_started),
                             ) {
                                 Ok(output) => {
                                     let size = fs::metadata(&output)
@@ -4484,20 +1897,28 @@ async fn start_download(
                 cleanup_download_temp_dir(&job_temp_dir);
                 recovery::finish(&monitor_app, &monitor_id, &job_temp_dir);
                 cancelled |= job_process::finish(&manager, &monitor_id);
-                let kind = if cancelled {
-                    "cancelled"
-                } else if auth_required && !status.success() {
-                    "auth_required"
-                } else if !low_disk
-                    && !auth_required
-                    && status.success()
-                    && conversion_error.is_none()
+                // A write error from yt-dlp or FFmpeg can arrive before the
+                // next disk check; a vanished folder explains it either way.
+                if !cancelled
+                    && (!status.success() || conversion_error.is_some())
+                    && !destination_present(&monitored_output_dir)
                 {
-                    "completed"
+                    low_disk = true;
+                    destination_unavailable = true;
+                }
+                let kind = terminal_kind(
+                    cancelled,
+                    auth_required,
+                    low_disk,
+                    status.success(),
+                    conversion_error.is_some(),
+                );
+                let raw_error = if destination_unavailable {
+                    Some(DESTINATION_UNAVAILABLE_MESSAGE.to_string())
                 } else {
-                    "failed"
-                };
-                let raw_error = conversion_error.clone().or_else(|| {
+                    conversion_error.clone()
+                }
+                .or_else(|| {
                     if low_disk {
                         return Some(
                             "Недостатньо вільного місця. Процес зупинено, щоб захистити диск."
@@ -4511,10 +1932,17 @@ async fn start_download(
                 if let Some(error) = raw_error.as_deref() {
                     diagnostics::record(&monitor_id, error);
                 }
-                let message = if conversion_error.is_some() {
+                let message = if destination_unavailable {
+                    raw_error.clone()
+                } else if conversion_error.is_some() {
                     raw_error.as_deref().map(friendly_conversion_error)
                 } else if low_disk {
                     raw_error.clone()
+                } else if kind == "completed" {
+                    completion_message(
+                        completed_outputs.len(),
+                        photos_skipped.load(Ordering::Relaxed),
+                    )
                 } else {
                     raw_error.as_deref().map(friendly_download_error)
                 };
@@ -4522,6 +1950,7 @@ async fn start_download(
                     "completed" => None,
                     "cancelled" => Some("cancelled".into()),
                     "auth_required" => Some("auth_required".into()),
+                    _ if destination_unavailable => Some("destination_unavailable".into()),
                     _ if low_disk => Some("low_disk".into()),
                     _ if conversion_error.is_some() => {
                         Some(conversion_error_code(raw_error.as_deref().unwrap_or_default()).into())
@@ -4534,16 +1963,10 @@ async fn start_download(
                         id: monitor_id,
                         kind: kind.into(),
                         percent: (kind == "completed").then_some(100.0),
-                        speed: None,
-                        eta: None,
                         message,
-                        storage: None,
                         outputs: (!completed_outputs.is_empty()).then_some(completed_outputs),
-                        title: None,
-                        thumbnail: None,
-                        uploader: None,
-                        extractor: None,
                         error_code,
+                        ..Default::default()
                     },
                 );
                 break;
@@ -4726,7 +2149,6 @@ pub fn run() {
             }
         }))
         .manage(DownloadManager::default())
-        .manage(ProbeManager::default())
         .manage(HistoryThumbnailCache::default())
         .manage(RuntimeMaintenance::default())
         .manage(discovery::DiscoveryState::default())
@@ -4744,13 +2166,12 @@ pub fn run() {
             discovery::open_media_browser,
             discovery::select_media_candidate,
             discovery::dismiss_media_candidates,
-            runtime_status,
-            install_ytdlp,
-            install_ffmpeg,
-            install_deno,
-            update_ytdlp,
-            probe_url,
-            check_vpn,
+            runtime::runtime_status,
+            runtime::install_ytdlp,
+            runtime::install_ffmpeg,
+            runtime::install_deno,
+            runtime::update_ytdlp,
+            vpn::check_vpn,
             folder_free_space,
             preflight_download,
             start_download,
@@ -4764,9 +2185,9 @@ pub fn run() {
             cancel_app_exit_approval,
             confirm_app_close,
             inspect_history_files,
-            cache_history_thumbnail,
-            clear_history_thumbnail_cache,
-            delete_history_thumbnail
+            thumbnails::cache_history_thumbnail,
+            thumbnails::clear_history_thumbnail_cache,
+            thumbnails::delete_history_thumbnail
         ])
         .on_window_event(|window, event| {
             if window.label() != "main" {
@@ -4799,14 +2220,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn youtube_retries_refresh_without_forcing_stale_clients() {
-        let original = vec![
-            OsString::from("--format"),
-            OsString::from("bestvideo+bestaudio/best"),
-            OsString::from("https://www.youtube.com/watch?v=example"),
-        ];
-
-        assert_eq!(youtube_retry_args(&original), original);
+    fn youtube_retry_messages_follow_the_attempt() {
         assert_eq!(
             youtube_retry_message(1),
             "YouTube перервав потік. Оновлюємо посилання й продовжуємо…"
@@ -4815,77 +2229,6 @@ mod tests {
             youtube_retry_message(2),
             "YouTube знову перервав потік. Отримуємо ще одне свіже посилання…"
         );
-    }
-
-    #[test]
-    fn parses_exact_selected_format_size() {
-        let metadata = serde_json::json!({
-            "id": "video",
-            "duration": 100.0,
-            "height": 1080,
-            "fps": 30,
-            "requested_formats": [
-                {"filesize": 1_000_000, "height": 1080, "fps": 30},
-                {"filesize": 200_000, "abr": 128}
-            ]
-        });
-        let (estimate, confidence) = selected_media_from_value(&metadata);
-        assert_eq!(confidence, SizeConfidence::Exact);
-        assert_eq!(estimate.unwrap().source_size, 1_200_000);
-    }
-
-    #[test]
-    fn marks_approximate_and_unknown_sizes() {
-        let approximate = serde_json::json!({
-            "id": "approx",
-            "duration": 10.0,
-            "requested_formats": [{"filesize_approx": 500_000}]
-        });
-        let unknown = serde_json::json!({
-            "id": "unknown",
-            "duration": 10.0,
-            "requested_formats": [{"format_id": "mystery"}]
-        });
-        assert_eq!(
-            selected_media_from_value(&approximate).1,
-            SizeConfidence::Approximate
-        );
-        assert_eq!(
-            selected_media_from_value(&unknown).1,
-            SizeConfidence::Unknown
-        );
-        assert!(selected_media_from_value(&unknown).0.is_none());
-    }
-
-    #[test]
-    fn finds_named_asset_in_multi_file_checksum_list() {
-        let checksums = b"aaaaaaaa  other.zip\nbbbbbbbb *ffmpeg-master-latest-win64-gpl.zip\n";
-        assert_eq!(
-            checksum_for_asset(checksums, "ffmpeg-master-latest-win64-gpl.zip").unwrap(),
-            "bbbbbbbb"
-        );
-        assert!(checksum_for_asset(checksums, "missing.zip").is_err());
-    }
-
-    #[test]
-    fn parses_gnu_and_windows_powershell_sha256_files() {
-        let expected = "68ed08b05c56cf887e9aa509947dc3f468f7e12f47a13e5c1abd51d46d1453ef";
-        let gnu = format!("{expected}  deno-x86_64-pc-windows-msvc.zip\n");
-        let powershell = format!(
-            "\r\nAlgorithm : SHA256\r\nHash      : {}\r\nPath      : C:\\a\\deno\\deno-x86_64-pc-windows-msvc.zip\r\n",
-            expected.to_ascii_uppercase()
-        );
-
-        assert_eq!(checksum_value(gnu.as_bytes(), "Deno").unwrap(), expected);
-        assert_eq!(
-            checksum_value(powershell.as_bytes(), "Deno").unwrap(),
-            expected
-        );
-        assert!(checksum_value(b"Algorithm : SHA256", "Deno").is_err());
-        let ambiguous = format!(
-            "{expected}\nffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n"
-        );
-        assert!(checksum_value(ambiguous.as_bytes(), "Deno").is_err());
     }
 
     #[test]
@@ -4974,6 +2317,101 @@ mod tests {
     }
 
     #[test]
+    fn instagram_photo_is_last_resort_in_every_video_selector_only() {
+        assert!(format_selector("video").ends_with(&format!("/{INSTAGRAM_PHOTO_FORMAT_ID}")));
+        assert!(!format_selector("audio").contains(INSTAGRAM_PHOTO_FORMAT_ID));
+        assert_eq!(
+            photo_extractor_args("audio"),
+            Some(["--extractor-args", "instagram:baldojnyi_photos=skip"])
+        );
+        assert_eq!(photo_extractor_args("video"), None);
+    }
+
+    #[test]
+    fn instagram_plugin_markers_match_app_contract() {
+        for marker in [
+            INSTAGRAM_PHOTO_FORMAT_ID,
+            INSTAGRAM_PHOTO_ONLY_MARKER,
+            INSTAGRAM_PHOTOS_SKIPPED_MARKER,
+            "baldojnyi_photos",
+            "PHOTO_FIELD = 'baldojnyi_photo'",
+            "plugin_name='baldojnyi'",
+        ] {
+            assert!(
+                INSTAGRAM_PHOTOS_SOURCE.contains(marker),
+                "plugin is missing {marker}"
+            );
+        }
+        let error = format!(
+            "[Instagram] DeRf1RKjLc7: {INSTAGRAM_PHOTO_ONLY_MARKER}: this Instagram post contains only photos"
+        );
+        assert_eq!(download_error_code(&error), "photo_only");
+        assert!(friendly_download_error(&error).contains("лише фото"));
+        assert!(!friendly_download_error(&error).contains(INSTAGRAM_PHOTO_ONLY_MARKER));
+        assert!(!discovery::should_retry(&error));
+        assert!(is_expected_photo_warning(
+            "WARNING: Only images are available for download. use --list-formats to see them"
+        ));
+        assert!(!is_expected_photo_warning(
+            "WARNING: This video is drm protected and only images are available for download. use --list-formats to see them"
+        ));
+        assert!(!is_expected_photo_warning(
+            "ERROR: only images are available for download"
+        ));
+    }
+
+    #[test]
+    fn download_handoff_marks_only_plugin_photos() {
+        let photo = downloaded_media_from_print(
+            r#"{"filepath":"Photo by a [1].jpg","vcodec":"none","acodec":"none","baldojnyi_photo":true}"#,
+        )
+        .unwrap();
+        assert!(photo.photo);
+        for payload in [
+            r#"{"filepath":"clip.mp4"}"#,
+            r#"{"filepath":"clip.mp4","baldojnyi_photo":false}"#,
+            r#"{"filepath":"clip.mp4","baldojnyi_photo":"skipped"}"#,
+            r#"{"filepath":"clip.mp4","baldojnyi_photo":"NA"}"#,
+        ] {
+            assert!(
+                !downloaded_media_from_print(payload).unwrap().photo,
+                "{payload}"
+            );
+        }
+        assert!(!downloaded_media_from_print("/tmp/raw.jpg").unwrap().photo);
+    }
+
+    #[test]
+    fn photos_are_kept_as_downloaded_but_flag_never_bypasses_video() {
+        let ffmpeg_path = Path::new("/definitely/missing/ffmpeg");
+        let photo = DownloadedMedia {
+            identity: MediaIdentity::default(),
+            path: PathBuf::from("Photo by author [1].JPG"),
+            duration: None,
+            height: Some(1350),
+            fps: None,
+            video_codec: Some("none".into()),
+            audio_codec: Some("none".into()),
+            photo: true,
+        };
+        for output_format in ["mp4", "mp3", "m4a", "opus", "wav"] {
+            assert!(!requires_app_conversion(&photo, output_format, ffmpeg_path).unwrap());
+        }
+        let disguised = DownloadedMedia {
+            path: PathBuf::from("clip.mkv"),
+            ..photo.clone()
+        };
+        assert!(!is_downloaded_photo(&disguised));
+        assert!(requires_app_conversion(&disguised, "mp4", ffmpeg_path).unwrap());
+        assert!(requires_app_conversion(&disguised, "mp3", ffmpeg_path).unwrap());
+        let unflagged = DownloadedMedia {
+            photo: false,
+            ..photo
+        };
+        assert!(!is_downloaded_photo(&unflagged));
+    }
+
+    #[test]
     fn download_handoff_reports_selected_codecs() {
         let direct = downloaded_media_from_print(
             r#"{"filepath":"clip.mp4","duration":12,"vcodec":"avc1.640028","acodec":"mp4a.40.2"}"#,
@@ -5055,50 +2493,6 @@ mod tests {
         assert!(is_public_thumbnail_ip(
             "2606:4700:4700::1111".parse().unwrap()
         ));
-    }
-
-    #[test]
-    fn playlist_estimate_scales_only_sample_duration() {
-        assert_eq!(scale_playlist_estimate(Some(100), 12, false), Some(1200));
-        assert_eq!(scale_playlist_estimate(Some(1200), 12, true), Some(1200));
-        assert_eq!(scale_playlist_estimate(Some(u64::MAX), 2, false), None);
-    }
-
-    #[test]
-    fn recognizes_common_macos_and_windows_vpn_interfaces() {
-        assert!(is_tunnel_interface("utun4"));
-        assert!(is_tunnel_interface("WireGuard Tunnel"));
-        assert!(is_tunnel_interface("NordLynx"));
-        assert!(is_tunnel_interface("ProtonVPN"));
-        assert!(!is_tunnel_interface("Ethernet"));
-    }
-
-    #[test]
-    fn reads_release_version_from_redirected_download_url() {
-        let release = Url::parse(
-            "https://github.com/yt-dlp/yt-dlp/releases/download/2026.07.04/SHA2-256SUMS",
-        )
-        .unwrap();
-        let unresolved =
-            Url::parse("https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS")
-                .unwrap();
-        let malformed =
-            Url::parse("https://github.com/yt-dlp/yt-dlp/download/2026.07.04/SHA2-256SUMS")
-                .unwrap();
-        let missing_file =
-            Url::parse("https://github.com/yt-dlp/yt-dlp/releases/download/2026.07.04/").unwrap();
-        let non_github = Url::parse(
-            "https://example.com/yt-dlp/yt-dlp/releases/download/2026.07.04/SHA2-256SUMS",
-        )
-        .unwrap();
-        assert_eq!(
-            release_version_from_download_url(&release).as_deref(),
-            Some("2026.07.04")
-        );
-        assert_eq!(release_version_from_download_url(&unresolved), None);
-        assert_eq!(release_version_from_download_url(&malformed), None);
-        assert_eq!(release_version_from_download_url(&missing_file), None);
-        assert_eq!(release_version_from_download_url(&non_github), None);
     }
 
     #[test]
@@ -5272,19 +2666,30 @@ mod tests {
     }
 
     #[test]
-    fn required_space_includes_protected_reserve_and_handles_overflow() {
-        assert_eq!(
-            required_space_with_reserve(2_000, 13_000),
-            Some(15_000 + MIN_FREE_SPACE_RESERVE)
-        );
-        assert_eq!(required_space_with_reserve(u64::MAX, 1), None);
-    }
-
-    #[test]
     fn runtime_disk_guard_triggers_before_protected_reserve() {
         assert!(low_disk_guard_triggered(DISK_GUARD_TRIGGER));
         assert!(low_disk_guard_triggered(MIN_FREE_SPACE_RESERVE));
         assert!(!low_disk_guard_triggered(DISK_GUARD_TRIGGER + 1));
+    }
+
+    #[test]
+    fn an_unplugged_drive_is_not_reported_as_a_full_disk() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("unplugged drive").join("Downloads");
+        assert_eq!(disk_guard(&missing), DiskGuard::Unavailable);
+        assert_ne!(disk_guard(directory.path()), DiskGuard::Unavailable);
+        assert_eq!(
+            download_error_code(DESTINATION_UNAVAILABLE_MESSAGE),
+            "destination_unavailable"
+        );
+        assert_eq!(
+            conversion_error_code(DESTINATION_UNAVAILABLE_MESSAGE),
+            "destination_unavailable"
+        );
+        assert_eq!(
+            friendly_conversion_error(DESTINATION_UNAVAILABLE_MESSAGE),
+            DESTINATION_UNAVAILABLE_MESSAGE
+        );
     }
 
     #[test]
@@ -5396,6 +2801,7 @@ mod tests {
             fps: Some(30.0),
             video_codec: Some("avc1.640028".into()),
             audio_codec: Some("mp4a.40.2".into()),
+            photo: false,
         };
         // Metadata alone cannot prove bit depth/HDR; a nonexistent file is not ready.
         assert!(requires_app_conversion(&compatible, "mp4", ffmpeg_path).is_err());
@@ -5412,25 +2818,6 @@ mod tests {
             ..compatible.clone()
         };
         assert!(requires_app_conversion(&merged_streams, "mp4", ffmpeg_path).unwrap());
-    }
-
-    #[test]
-    fn ffprobe_codec_metadata_recognizes_h264_aac_and_silent_mp4() {
-        let compatible = serde_json::json!({
-            "streams": [
-                {"codec_type": "video", "codec_name": "h264"},
-                {"codec_type": "audio", "codec_name": "aac"}
-            ]
-        });
-        assert_eq!(
-            parse_media_codecs(&compatible),
-            Some(("h264".into(), vec!["aac".into()]))
-        );
-
-        let silent = serde_json::json!({
-            "streams": [{"codec_type": "video", "codec_name": "h264"}]
-        });
-        assert_eq!(parse_media_codecs(&silent), Some(("h264".into(), vec![])));
     }
 
     #[test]
@@ -5481,23 +2868,41 @@ mod tests {
         fs::write(&unrelated, b"keep").unwrap();
 
         let installed_root = install_threads_plugin_at(&root).unwrap();
-        let installed = installed_root
+        let extractors = installed_root
             .join("baldojnyi")
             .join("yt_dlp_plugins")
-            .join("extractor")
-            .join("threads_baldojnyi.py");
+            .join("extractor");
+        let installed = extractors.join("threads_baldojnyi.py");
         assert_eq!(
             fs::read(&installed).unwrap(),
             THREADS_EXTRACTOR_SOURCE.as_bytes()
         );
+        for (filename, source, _) in YT_DLP_PLUGIN_MODULES {
+            assert_eq!(
+                fs::read(extractors.join(filename)).unwrap(),
+                source.as_bytes()
+            );
+        }
 
         fs::write(&installed, b"outdated").unwrap();
+        let instagram = extractors.join("instagram_baldojnyi.py");
+        fs::write(&instagram, b"outdated").unwrap();
         install_threads_plugin_at(&root).unwrap();
         assert_eq!(
             fs::read(&installed).unwrap(),
             THREADS_EXTRACTOR_SOURCE.as_bytes()
         );
+        assert_eq!(
+            fs::read(&instagram).unwrap(),
+            INSTAGRAM_PHOTOS_SOURCE.as_bytes()
+        );
         assert_eq!(fs::read(&unrelated).unwrap(), b"keep");
+        let leftovers: Vec<_> = fs::read_dir(&extractors)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -5535,10 +2940,13 @@ mod tests {
     #[test]
     fn selector_and_playlist_intent_are_explicit() {
         assert_eq!(
-            format_selector("video", "1080"),
-            "bestvideo[height<=1080]+bestaudio/best[height<=1080]"
+            format_selector("video"),
+            "bestvideo+bestaudio/best/baldojnyi-photo"
         );
-        assert_eq!(format_selector("audio", "best"), "bestaudio/best");
+        assert_eq!(format_selector("audio"), "bestaudio/best");
+        assert_eq!(quality_sort("video", "720"), Some("res:720"));
+        assert_eq!(quality_sort("video", "best"), None);
+        assert_eq!(quality_sort("audio", "720"), None);
         assert_eq!(
             impersonation_target(false, true),
             Some("Chrome-99:Android-12")
@@ -5665,6 +3073,104 @@ mod tests {
                 forbidden_may_need_cookies: true,
             }
         ));
+    }
+
+    #[test]
+    fn titles_and_speeds_in_progress_never_look_like_a_sign_in_request() {
+        let policy = AuthRetryPolicy {
+            allow_browser_retry: true,
+            youtube_unavailable_may_need_cookies: true,
+            forbidden_may_need_cookies: true,
+        };
+        for line in [
+            "__YTDLP_PROGRESS__ 52.0%|1.00MiB/s|00:03|NA|NA|How to log in to Gmail",
+            "__YTDLP_PROGRESS__ 52.0%|403.21KiB/s|00:03|NA|NA|Cooking",
+            "__YTDLP_PROGRESS__ 52.0%|1.00MiB/s|00:03|NA|NA|The forbidden city",
+            "WARNING: [youtube] Private video list could not be read",
+        ] {
+            assert!(!should_request_browser_auth(line, policy), "{line}");
+        }
+        assert!(should_request_browser_auth(
+            "ERROR: [youtube] abc: Sign in to confirm you’re not a bot",
+            policy
+        ));
+    }
+
+    #[test]
+    fn a_successful_process_is_never_reported_as_failed_or_needing_sign_in() {
+        assert_eq!(terminal_kind(false, false, false, true, false), "completed");
+        assert_eq!(
+            terminal_kind(false, true, false, false, false),
+            "auth_required"
+        );
+        assert_eq!(terminal_kind(false, false, false, true, true), "failed");
+        assert_eq!(terminal_kind(false, false, true, true, false), "failed");
+        assert_eq!(terminal_kind(true, true, true, true, true), "cancelled");
+    }
+
+    #[test]
+    fn collection_progress_covers_the_whole_carousel() {
+        let now = Instant::now();
+        let progress = parse_download_progress(
+            " 50.0%|1.00MiB/s|00:03|3|10|1048576|2097152|Назва | із рискою",
+            &mut progress_speed::SpeedSmoother::default(),
+            now,
+        );
+        assert_eq!(progress.percent, Some(25.0));
+        assert_eq!(progress.message.as_deref(), Some("Файл 3 із 10"));
+        assert_eq!(progress.speed.as_deref(), Some("1.00MiB/s"));
+        let single = parse_download_progress(
+            " 50.0%|1.00MiB/s|00:03|NA|NA|NA|NA|Назва",
+            &mut progress_speed::SpeedSmoother::default(),
+            now,
+        );
+        assert_eq!(single.percent, Some(50.0));
+        assert_eq!(single.message, None);
+    }
+
+    #[test]
+    fn completion_message_counts_files_in_ukrainian() {
+        for (count, expected) in [
+            (2, "2 файли"),
+            (5, "5 файлів"),
+            (11, "11 файлів"),
+            (21, "21 файл"),
+            (22, "22 файли"),
+        ] {
+            assert!(saved_files_label(count).contains(expected), "{count}");
+        }
+        assert_eq!(completion_message(1, false), None);
+        assert_eq!(
+            completion_message(3, true).as_deref(),
+            Some(PHOTOS_SKIPPED_NOTICE)
+        );
+    }
+
+    #[test]
+    fn only_a_file_created_during_the_job_counts_as_its_own() {
+        let directory = tempfile::tempdir().unwrap();
+        let earlier = directory.path().join("kept from before.mp4");
+        fs::write(&earlier, b"user file").unwrap();
+        thread::sleep(Duration::from_millis(20));
+        let job_started = SystemTime::now();
+        thread::sleep(Duration::from_millis(20));
+        let created = directory.path().join("from this job.mp4");
+        fs::write(&created, b"new file").unwrap();
+
+        assert!(!source_created_by_job(&earlier, job_started));
+        assert!(source_created_by_job(&created, job_started));
+        assert!(!source_created_by_job(
+            &directory.path().join("missing"),
+            job_started
+        ));
+    }
+
+    #[test]
+    fn missing_managed_ffmpeg_is_not_replaced_by_a_bare_command() {
+        assert_eq!(
+            ffprobe_path(Path::new("/runtime/ffmpeg")),
+            Path::new("/runtime").join(managed_binary_name("ffprobe"))
+        );
     }
 
     #[test]
