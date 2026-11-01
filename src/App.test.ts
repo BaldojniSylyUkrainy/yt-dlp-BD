@@ -15,7 +15,7 @@ import {
   parseHistoryStorage,
   playlistIntentToMultiItem,
   preflightAllowsStart,
-  preflightConfidenceLabel,
+  isWholeCollectionUrl,
   runtimeInstallCommand,
   runtimeUpdateKey,
   shouldShowRuntimeRetry,
@@ -293,6 +293,21 @@ describe("playlist intent detection", () => {
     expect(shouldShowMultiItemIntent("https://www.threads.com/@author")).toBe(false);
   });
 
+  it("treats an address without a current video as a whole collection", () => {
+    for (const url of ["https://www.youtube.com/playlist?list=PL1", "https://soundcloud.com/a/sets/b"]) {
+      expect(isWholeCollectionUrl(url)).toBe(true);
+      const markup = renderToStaticMarkup(createElement(DownloadCollectionIntent, { url, intent: "single", onIntentChange: () => undefined }));
+      expect(markup).toContain("Це ціла добірка");
+      expect(markup).not.toContain("Лише це відео");
+    }
+    for (const url of [
+      "https://www.youtube.com/watch?v=abc&list=PL1",
+      "https://youtu.be/abc?list=PL1",
+      "https://www.threads.com/@author/post/POST",
+      "https://www.instagram.com/p/DeRf1RKjLc7/",
+    ]) expect(isWholeCollectionUrl(url)).toBe(false);
+  });
+
   it("wires a real Threads URL into the rendered single/all selector", () => {
     const markup = renderToStaticMarkup(createElement(DownloadCollectionIntent, {
       url: "https://www.threads.com/@author/post/POST",
@@ -308,23 +323,28 @@ describe("playlist intent detection", () => {
   });
 });
 
+describe("job progress text and results", () => {
+  const job = (status: Job["status"]): Job => ({ id: "1", url: "https://x.test", title: "T", status, percent: 0, speed: "—", eta: "—", message: "Підключення…", storage: null, playlist: false, outputFormat: "MP4" });
+  const event = (kind: DownloadEvent["kind"], rest: Partial<DownloadEvent>): DownloadEvent => ({ id: "1", kind, percent: null, speed: null, eta: null, message: null, storage: null, outputs: null, ...rest });
+
+  it("replaces the connecting text once bytes flow and shows the file counter", () => {
+    expect(applyDownloadEvent(job("starting"), event("progress", { percent: 5 }))?.message).toBe("Завантажуємо…");
+    expect(applyDownloadEvent(job("downloading"), event("progress", { percent: 5, message: "Файл 3 із 10" }))?.message).toBe("Файл 3 із 10");
+  });
+
+  it("keeps saved paths for the reveal button", () => {
+    const done = applyDownloadEvent(job("downloading"), event("completed", { outputs: [{ path: "/d/a.jpg", size: 1 }, { path: "/d/b.jpg", size: 1 }], message: "Готово. Збережено 2 файли." }));
+    expect(done?.outputPaths).toEqual(["/d/a.jpg", "/d/b.jpg"]);
+    expect(done?.message).toBe("Готово. Збережено 2 файли.");
+  });
+});
+
 describe("preflight and retry guards", () => {
   it("blocks start when preflight reports insufficient space", () => {
     expect(preflightAllowsStart({
-      title: "Video",
-      itemCount: 1,
-      intermediateSize: 2_000,
-      finalOutputSize: 13_000,
-      protectedReserve: 500,
-      requiredSpace: 15_500,
       availableSpace: 10_000,
-      confidence: "approximate",
       sufficient: false,
     })).toBe(false);
-  });
-
-  it("labels an unknown estimate without inventing a number", () => {
-    expect(preflightConfidenceLabel("unknown")).toBe("Розмір частково невідомий");
   });
 
   it("maps every runtime retry to its own backend command", () => {
@@ -334,7 +354,7 @@ describe("preflight and retry guards", () => {
   });
 
   it("uses the nightly schedule key for every yt-dlp maintenance path", () => {
-    expect(runtimeUpdateKey("ytDlp")).toBe("runtimeUpdate.ytDlpNightly.v1");
+    expect(runtimeUpdateKey("ytDlp")).toBe("runtimeUpdate.ytDlpNightly.v2");
     expect(runtimeUpdateKey("ffmpeg")).toBe("runtimeUpdate.ffmpeg");
     expect(runtimeUpdateKey("deno")).toBe("runtimeUpdate.deno");
   });

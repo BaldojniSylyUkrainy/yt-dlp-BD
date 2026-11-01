@@ -228,6 +228,22 @@ pub(crate) async fn select_media_candidate(
     Ok(())
 }
 
+/// Closing is asynchronous, and a new window cannot reuse the label until the
+/// old one has really gone.
+async fn close_previous_browser(app: &AppHandle) -> Result<(), String> {
+    let Some(window) = app.get_webview_window("media-discovery") else {
+        return Ok(());
+    };
+    window.destroy().map_err(|e| e.to_string())?;
+    for _ in 0..80 {
+        if app.get_webview_window("media-discovery").is_none() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    Err("Попереднє вікно пошуку ще закривається. Спробуйте за мить".into())
+}
+
 #[tauri::command]
 pub(crate) async fn open_media_browser(
     app: AppHandle,
@@ -240,9 +256,7 @@ pub(crate) async fn open_media_browser(
         .and_then(|p| normalize_media_url(p.as_str()).ok())
         .ok_or("Потрібне публічне HTTP(S)-посилання")?;
     let _ = public_thumbnail_client(&page).await?;
-    if let Some(window) = app.get_webview_window("media-discovery") {
-        window.close().map_err(|e| e.to_string())?;
-    }
+    close_previous_browser(&app).await?;
     let captured_app = app.clone();
     let session = begin(&app, &job_id, page.as_str());
     let lifetime_session = session.clone();

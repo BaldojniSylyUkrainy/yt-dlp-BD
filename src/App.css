@@ -554,3 +554,21 @@ select:focus { border-color: var(--pink); }
 .recovery-notice { background: #201d20; border: 1px solid #71686e; padding: 16px; margin-bottom: 20px; }
 .recovery-notice div { display: flex; gap: 12px; align-items: center; margin-bottom: 10px; }
 .recovery-notice code { overflow-wrap: anywhere; font-size: 12px; }
+
+.job-reveal {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  width: fit-content;
+}
+
+.inline-notice {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(255, 196, 87, 0.12);
+  color: inherit;
+  font-size: 13px;
+  line-height: 1.4;
+}

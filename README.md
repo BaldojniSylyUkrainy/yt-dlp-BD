@@ -4,6 +4,8 @@
 
 [**Завантажити останню версію для macOS або Windows**](https://github.com/BaldojniSylyUkrainy/yt-dlp-BD/releases/latest)
 
+![Головне вікно Baldojnyi Downloader](docs/screenshot.png)
+
 ## Що вміє застосунок
 
 - завантажує відео, аудіо, субтитри, плейлисти та каруселі;

@@ -141,6 +141,38 @@ fn probe_uncached(ffmpeg: &Path, input: &Path) -> Result<ProcessingPlan, String>
     Ok(from_streams(&value))
 }
 
+/// Audio already in the requested codec only needs a new container, not a
+/// lossy second encode. Any probe failure simply falls back to encoding.
+fn audio_stream_copyable(ffmpeg: &Path, input: &Path, output_format: &str) -> bool {
+    let mut command = Command::new(ffprobe_path(ffmpeg));
+    command.args(LOCAL_INPUT_PROTOCOLS).args([
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=codec_name",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+    ]);
+    process_runner::capture(command.arg(input), Duration::from_secs(15))
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| {
+            audio_codec_matches_format(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                output_format,
+            )
+        })
+}
+
+fn audio_codec_matches_format(codec: &str, output_format: &str) -> bool {
+    matches!(
+        (codec, output_format),
+        ("aac", "m4a") | ("mp3", "mp3") | ("opus", "opus")
+    )
+}
+
 fn redacted_probe_stderr(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr)
         .lines()
@@ -387,27 +419,6 @@ pub(super) fn remember_windows_video_encoder(ffmpeg_path: &Path, encoder: VideoE
     }
 }
 
-#[cfg(test)]
-pub(super) fn parse_media_codecs(metadata: &serde_json::Value) -> Option<(String, Vec<String>)> {
-    let streams = metadata.get("streams")?.as_array()?;
-    let video = streams.iter().find_map(|stream| {
-        if stream.get("codec_type")?.as_str()? != "video" {
-            return None;
-        }
-        Some(stream.get("codec_name")?.as_str()?.to_ascii_lowercase())
-    })?;
-    let audio = streams
-        .iter()
-        .filter_map(|stream| {
-            if stream.get("codec_type")?.as_str()? != "audio" {
-                return None;
-            }
-            Some(stream.get("codec_name")?.as_str()?.to_ascii_lowercase())
-        })
-        .collect();
-    Some((video, audio))
-}
-
 pub(super) fn is_ready_compatible_mp4(
     media: &DownloadedMedia,
     ffmpeg_path: &Path,
@@ -602,6 +613,12 @@ pub(super) fn run_conversion_attempt(
     } else {
         command.args(["-map", "0:a:0", "-vn", "-map_metadata", "0"]);
         match output_format {
+            _ if processing.copy_audio => {
+                command.args(["-c:a", "copy"]);
+                if output_format == "m4a" {
+                    command.args(["-movflags", "+faststart"]);
+                }
+            }
             "m4a" => {
                 command.args(["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]);
             }
@@ -647,12 +664,10 @@ pub(super) fn run_conversion_attempt(
     let mut out_time_us = 0.0;
     let mut speed_value = 0.0;
     let format_label = output_format.to_ascii_uppercase();
-    let encoder_label = if processing.copy_video {
-        if processing.copy_audio {
-            "Без перекодування"
-        } else {
-            "Копіюємо відео · AAC"
-        }
+    let encoder_label = if processing.copy_audio && (processing.copy_video || media.is_none()) {
+        "Без перекодування"
+    } else if processing.copy_video {
+        "Копіюємо відео · AAC"
     } else if media.is_some() {
         encoder.label()
     } else {
@@ -709,13 +724,7 @@ pub(super) fn run_conversion_attempt(
                         } else {
                             format!("Створюємо {format_label}… Не закривайте застосунок")
                         }),
-                        storage: None,
-                        outputs: None,
-                        title: None,
-                        thumbnail: None,
-                        uploader: None,
-                        extractor: None,
-                        error_code: None,
+                        ..Default::default()
                     },
                 );
             }
@@ -759,6 +768,19 @@ pub(super) fn run_conversion_attempt(
     Ok(())
 }
 
+/// Where the finished file goes. A job's own source with the same name is
+/// replaced by its result, so no needless ` (1)` appears; a file that was
+/// already in the folder is never touched.
+pub(super) fn conversion_output_path(input: &Path, extension: &str, source_owned: bool) -> PathBuf {
+    let preferred = input.with_extension(extension);
+    if source_owned && preferred == input {
+        preferred
+    } else {
+        available_output_path(input, extension)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn convert_downloaded_media(
     app: &AppHandle,
     manager: &DownloadManager,
@@ -767,6 +789,7 @@ pub(super) fn convert_downloaded_media(
     downloaded: &DownloadedMedia,
     file_position: (usize, usize),
     output_format: &str,
+    source_owned: bool,
 ) -> Result<PathBuf, String> {
     let input = &downloaded.path;
     if download_was_cancelled(manager, id) {
@@ -777,7 +800,10 @@ pub(super) fn convert_downloaded_media(
     let processing = if is_video {
         conversion::probe(ffmpeg_path, input)?
     } else {
-        conversion::ProcessingPlan::default()
+        conversion::ProcessingPlan {
+            copy_audio: audio_stream_copyable(ffmpeg_path, input, output_format),
+            ..Default::default()
+        }
     };
     let media = is_video
         .then(|| {
@@ -799,7 +825,7 @@ pub(super) fn convert_downloaded_media(
     } else {
         media_duration(ffmpeg_path, input)?
     };
-    let output = available_output_path(input, output_format);
+    let output = conversion_output_path(input, output_format, source_owned);
     let output_dir = output
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -860,13 +886,7 @@ pub(super) fn convert_downloaded_media(
                         "Апаратний кодер не завершив обробку — продовжуємо через {}…",
                         encoder.label()
                     )),
-                    storage: None,
-                    outputs: None,
-                    title: None,
-                    thumbnail: None,
-                    uploader: None,
-                    extractor: None,
-                    error_code: None,
+                    ..Default::default()
                 },
             );
         }
@@ -897,7 +917,9 @@ pub(super) fn convert_downloaded_media(
                         "Не вдалося зберегти готовий {format_label}: {error}"
                     ));
                 }
-                let _ = fs::remove_file(input);
+                if source_owned && output != *input {
+                    let _ = fs::remove_file(input);
+                }
                 return Ok(output);
             }
             Err(ConversionAttemptError::Cancelled) => {
@@ -955,6 +977,27 @@ mod tests {
             .expect_err("A failed probe must never request speculative conversion");
         assert!(error.contains("ffprobe"));
         assert!(!friendly_conversion_error(&error).contains("пошкоджений"));
+    }
+
+    #[test]
+    fn same_codec_audio_is_copied_and_keeps_its_plain_name() {
+        assert!(audio_codec_matches_format("aac", "m4a"));
+        assert!(audio_codec_matches_format("opus", "opus"));
+        assert!(!audio_codec_matches_format("opus", "mp3"));
+        assert!(!audio_codec_matches_format("aac", "wav"));
+
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("song [id].m4a");
+        fs::write(&input, b"source").unwrap();
+        assert_eq!(conversion_output_path(&input, "m4a", true), input);
+        assert_eq!(
+            conversion_output_path(&input, "m4a", false),
+            directory.path().join("song [id] (1).m4a")
+        );
+        assert_eq!(
+            conversion_output_path(&input, "mp3", false),
+            directory.path().join("song [id].mp3")
+        );
     }
 
     #[test]

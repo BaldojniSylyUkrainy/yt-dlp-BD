@@ -29,8 +29,8 @@ PLUGIN = ROOT / 'src-tauri/resources/instagram_photos.py'
 YT_DLP_SOURCE = os.environ.get('YT_DLP_SOURCE')
 
 # Mirrors src-tauri/src/lib.rs. The Rust tests assert the same strings.
-VIDEO_SELECTOR = 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/baldojnyi-photo'
 BEST_SELECTOR = 'bestvideo+bestaudio/best/baldojnyi-photo'
+VIDEO_SELECTOR = BEST_SELECTOR  # quality limits are a separate `-S res:N` sort
 AUDIO_SELECTOR = 'bestaudio/best'
 AFTER_MOVE = ('after_move:__YTDLP_FILE__%(.{filepath,duration,height,fps,vcodec,acodec,'
               'webpage_url,title,thumbnail,uploader,extractor,baldojnyi_photo})j')
