@@ -82,6 +82,14 @@ type DownloadOutput = {
   extractor?: string | null;
 };
 
+/** The low-space warning stays on screen through every stage, so name the stage that is still running. */
+export function storageWarningContinuation(status: string): string {
+  if (status === "converting") return " Конвертація продовжується.";
+  if (status === "postprocessing") return " Обробка продовжується.";
+  if (status === "starting" || status === "downloading") return " Завантаження продовжується.";
+  return "";
+}
+
 export function isBlockingQueueFailure(kind: string, code?: string | null): boolean {
   return kind === "auth_required" || ["low_disk", "rate_limited", "selection_required", "auth_required", "destination_unavailable"].includes(code || "");
 }
@@ -1910,7 +1918,7 @@ function App() {
             {job.storage && <div className={`storage-estimate ${job.storage.sufficient === false ? "warning" : job.storage.sufficient === true ? "ready" : "unknown"}`}>
               {job.storage.sufficient === false ? <Icon name="shield" size={15}/> : <span className="storage-estimate-dot"/>}
               <span>{job.storage.sufficient === false
-                ? `Може не вистачити місця: вільно ${job.storage.availableSpace === null ? "невідомо" : formatByteSize(job.storage.availableSpace)} · потрібно до ${formatByteSize(job.storage.requiredSpace)}. Завантаження продовжується.`
+                ? `Може не вистачити місця: вільно ${job.storage.availableSpace === null ? "невідомо" : formatByteSize(job.storage.availableSpace)} · потрібно до ${formatByteSize(job.storage.requiredSpace)}.${storageWarningContinuation(job.status)}`
                 : `${job.storage.availableSpace === null ? "Вільне місце невідоме" : `Вільно ${formatByteSize(job.storage.availableSpace)}`} · потрібно до ${formatByteSize(job.storage.requiredSpace)}`}</span>
             </div>}
             <div className={`progress-track ${job.status === "postprocessing" ? "indeterminate" : ""}`} role="progressbar" aria-label={job.status === "postprocessing" ? "Об’єднання завантажених потоків" : job.status === "converting" ? "Конвертація відео" : "Завантаження відео"} aria-valuenow={job.status === "postprocessing" ? undefined : Math.round(job.percent)}><span style={job.status === "postprocessing" ? undefined : { width: `${job.percent}%` }}/></div>

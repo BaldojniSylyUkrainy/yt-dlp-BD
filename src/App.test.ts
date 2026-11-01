@@ -2,6 +2,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import {
+  storageWarningContinuation,
   applyDownloadEvent,
   appCloseActivityLabels,
   applyHistoryFileStatuses,
@@ -396,5 +397,14 @@ describe("platform defaults", () => {
 describe("application updates", () => {
   it("checks immediately and retries after short startup delays", () => {
     expect(UPDATE_CHECK_DELAYS).toEqual([0, 5_000, 30_000]);
+  });
+});
+
+describe("storage warning", () => {
+  it("names the stage that is still running", () => {
+    expect(storageWarningContinuation("downloading")).toBe(" Завантаження продовжується.");
+    expect(storageWarningContinuation("converting")).toBe(" Конвертація продовжується.");
+    expect(storageWarningContinuation("postprocessing")).toBe(" Обробка продовжується.");
+    expect(storageWarningContinuation("completed")).toBe("");
   });
 });
