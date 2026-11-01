@@ -59,6 +59,16 @@ const DISK_GUARD_TRIGGER: u64 = MIN_FREE_SPACE_RESERVE + 128 * 1024 * 1024;
 const MAX_HISTORY_THUMBNAIL_BYTES: u64 = 8 * 1024 * 1024;
 const HISTORY_THUMBNAIL_CACHE_LIMIT: usize = 550;
 const THREADS_EXTRACTOR_SOURCE: &str = include_str!("../resources/threads_extractor.py");
+const DISCOVERY_EXTRACTOR_SOURCE: &str = include_str!("../resources/discovery_extractor.py");
+const INSTAGRAM_PHOTOS_SOURCE: &str = include_str!("../resources/instagram_photos.py");
+/// yt-dlp format id that the Instagram plugin gives to a still photo (spelled
+/// out in `format_selector`). It only exists on media items without any video.
+#[cfg(test)]
+const INSTAGRAM_PHOTO_FORMAT_ID: &str = "baldojnyi-photo";
+const INSTAGRAM_PHOTO_ONLY_MARKER: &str = "BALDOJNYI_PHOTO_ONLY";
+const INSTAGRAM_PHOTOS_SKIPPED_MARKER: &str = "BALDOJNYI_PHOTOS_SKIPPED";
+const PHOTOS_SKIPPED_NOTICE: &str =
+    "Готово. Фото з поста пропущено: режим «Аудіо» зберігає лише звук.";
 const YTDLP_OUTPUT_TEMPLATE: &str = "%(title).140B [%(id).40B].%(ext)s";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -303,6 +313,8 @@ struct DownloadedMedia {
     fps: Option<f64>,
     video_codec: Option<String>,
     audio_codec: Option<String>,
+    /// A still photo saved by the Instagram plugin; never probed or converted.
+    photo: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -367,6 +379,8 @@ struct OutputReaderState {
     storage_tracker: Option<StorageTracker>,
     last_error: Arc<Mutex<Option<String>>>,
     auth_retry: AuthRetryPolicy,
+    /// Set when the Instagram plugin dropped photo slides in audio mode.
+    photos_skipped: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Default)]
@@ -529,33 +543,54 @@ fn yt_dlp_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(runtime_dir(app)?.join(filename))
 }
 
+/// yt-dlp extractor modules bundled with the app: (installed filename, source, label).
+const YT_DLP_PLUGIN_MODULES: [(&str, &str, &str); 3] = [
+    (
+        "discovery_baldojnyi.py",
+        DISCOVERY_EXTRACTOR_SOURCE,
+        "модуль пошуку",
+    ),
+    (
+        "threads_baldojnyi.py",
+        THREADS_EXTRACTOR_SOURCE,
+        "Threads-модуль",
+    ),
+    (
+        "instagram_baldojnyi.py",
+        INSTAGRAM_PHOTOS_SOURCE,
+        "Instagram-модуль",
+    ),
+];
+
+fn install_plugin_module(
+    extractor_directory: &Path,
+    filename: &str,
+    source: &str,
+    label: &str,
+) -> Result<(), String> {
+    let destination = extractor_directory.join(filename);
+    if fs::read(&destination).ok().as_deref() == Some(source.as_bytes()) {
+        return Ok(());
+    }
+    let temporary = extractor_directory.join(format!(".{filename}-{}.tmp", Uuid::new_v4()));
+    fs::write(&temporary, source)
+        .map_err(|error| format!("Не вдалося записати {label}: {error}"))?;
+    if let Err(error) = replace_runtime_file(&temporary, &destination, label) {
+        let _ = fs::remove_file(temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn install_threads_plugin_at(plugin_root: &Path) -> Result<PathBuf, String> {
     let extractor_directory = plugin_root
         .join("baldojnyi")
         .join("yt_dlp_plugins")
         .join("extractor");
     fs::create_dir_all(&extractor_directory)
-        .map_err(|error| format!("Не вдалося підготувати Threads-модуль: {error}"))?;
-    let discovery_destination = extractor_directory.join("discovery_baldojnyi.py");
-    let discovery_source = include_str!("../resources/discovery_extractor.py");
-    if fs::read(&discovery_destination).ok().as_deref() != Some(discovery_source.as_bytes()) {
-        let temporary = extractor_directory.join(format!(".discovery-{}.tmp", Uuid::new_v4()));
-        fs::write(&temporary, discovery_source).map_err(|e| e.to_string())?;
-        replace_runtime_file(&temporary, &discovery_destination, "модуль пошуку")?;
-    }
-    let destination = extractor_directory.join("threads_baldojnyi.py");
-    if fs::read(&destination)
-        .map(|content| content == THREADS_EXTRACTOR_SOURCE.as_bytes())
-        .unwrap_or(false)
-    {
-        return Ok(plugin_root.to_path_buf());
-    }
-    let temporary = extractor_directory.join(format!(".threads_baldojnyi-{}.tmp", Uuid::new_v4()));
-    fs::write(&temporary, THREADS_EXTRACTOR_SOURCE)
-        .map_err(|error| format!("Не вдалося записати Threads-модуль: {error}"))?;
-    if let Err(error) = replace_runtime_file(&temporary, &destination, "Threads-модуль") {
-        let _ = fs::remove_file(temporary);
-        return Err(error);
+        .map_err(|error| format!("Не вдалося підготувати модулі yt-dlp: {error}"))?;
+    for (filename, source, label) in YT_DLP_PLUGIN_MODULES {
+        install_plugin_module(&extractor_directory, filename, source, label)?;
     }
     Ok(plugin_root.to_path_buf())
 }
@@ -2061,6 +2096,9 @@ fn clean_probe_error(stderr: &[u8]) -> String {
 }
 
 fn friendly_download_error(message: &str) -> String {
+    if message.contains(INSTAGRAM_PHOTO_ONLY_MARKER) {
+        return "У цьому пості лише фото. Щоб зберегти їх, виберіть режим «Відео».".into();
+    }
     let value = message.to_ascii_lowercase();
     if value.contains("media sources found") {
         return "Знайдено джерела відео. Оберіть потрібне у вікні вибору.".into();
@@ -2183,6 +2221,9 @@ fn friendly_conversion_error(message: &str) -> String {
 }
 
 fn download_error_code(message: &str) -> &'static str {
+    if message.contains(INSTAGRAM_PHOTO_ONLY_MARKER) {
+        return "photo_only";
+    }
     let value = message.to_lowercase();
     if value.contains("media sources found") {
         return "selection_required";
@@ -2295,13 +2336,28 @@ fn format_selector(mode: &str, quality: &str) -> &'static str {
     if mode == "audio" {
         return "bestaudio/best";
     }
+    // The trailing photo format id is a last resort that can match only an
+    // Instagram media item without video; every video keeps the previous order.
     match quality {
-        "2160" => "bestvideo[height<=2160]+bestaudio/best[height<=2160]",
-        "1080" => "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-        "720" => "bestvideo[height<=720]+bestaudio/best[height<=720]",
-        "480" => "bestvideo[height<=480]+bestaudio/best[height<=480]",
-        _ => "bestvideo+bestaudio/best",
+        "2160" => "bestvideo[height<=2160]+bestaudio/best[height<=2160]/baldojnyi-photo",
+        "1080" => "bestvideo[height<=1080]+bestaudio/best[height<=1080]/baldojnyi-photo",
+        "720" => "bestvideo[height<=720]+bestaudio/best[height<=720]/baldojnyi-photo",
+        "480" => "bestvideo[height<=480]+bestaudio/best[height<=480]/baldojnyi-photo",
+        _ => "bestvideo+bestaudio/best/baldojnyi-photo",
     }
+}
+
+fn is_expected_photo_warning(line: &str) -> bool {
+    let value = line.to_ascii_lowercase();
+    value.starts_with("warning:")
+        && value.contains("only images are available for download")
+        && !value.contains("drm")
+}
+
+/// Audio mode never saves photos: the Instagram plugin drops photo slides and
+/// reports it, or fails with a dedicated marker when the post has no video.
+fn photo_extractor_args(mode: &str) -> Option<[&'static str; 2]> {
+    (mode == "audio").then_some(["--extractor-args", "instagram:baldojnyi_photos=skip"])
 }
 
 fn playlist_flag(multi_item: bool) -> &'static str {
@@ -2331,6 +2387,9 @@ fn extraction_args(
         OsString::from("-f"),
         OsString::from(format_selector(mode, quality)),
     ];
+    if let Some(photo_args) = photo_extractor_args(mode) {
+        args.extend(photo_args.map(OsString::from));
+    }
     if let Some(target) = impersonation {
         args.extend([OsString::from("--impersonate"), OsString::from(target)]);
     }
@@ -2913,6 +2972,10 @@ fn downloaded_media_from_print(payload: &str) -> Option<DownloadedMedia> {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_ascii_lowercase),
+            photo: metadata
+                .get("baldojnyi_photo")
+                .and_then(|value| value.as_bool())
+                == Some(true),
         });
     }
 
@@ -2925,6 +2988,7 @@ fn downloaded_media_from_print(payload: &str) -> Option<DownloadedMedia> {
         fps: None,
         video_codec: None,
         audio_codec: None,
+        photo: false,
     })
 }
 
@@ -3429,6 +3493,14 @@ fn read_output<R: Read + Send + 'static>(
                         emit_storage_estimate(&app, &id, tracker, estimate);
                     }
                 }
+                continue;
+            } else if line.contains(INSTAGRAM_PHOTOS_SKIPPED_MARKER) {
+                state.photos_skipped.store(true, Ordering::Relaxed);
+                continue;
+            } else if is_expected_photo_warning(&line) {
+                // yt-dlp warns about image-only formats; for a plugin photo this
+                // is the expected result, so keep it out of the progress popup.
+                diagnostics::record(&id, &line);
                 continue;
             } else if let Some(path) = line.strip_prefix("__YTDLP_FILE__") {
                 if let Some(files) = state.downloaded_files.as_ref() {
@@ -4006,7 +4078,7 @@ async fn start_download(
 
     command.args([
         "--print",
-        "after_move:__YTDLP_FILE__%(.{filepath,duration,height,fps,vcodec,acodec,webpage_url,title,thumbnail,uploader,extractor})j",
+        "after_move:__YTDLP_FILE__%(.{filepath,duration,height,fps,vcodec,acodec,webpage_url,title,thumbnail,uploader,extractor,baldojnyi_photo})j",
     ]);
     if request.mode != "audio" {
         command.args(["--merge-output-format", "mkv"]);
@@ -4056,11 +4128,13 @@ async fn start_download(
         audio_format: request.audio_format.clone(),
     };
     let last_error = Arc::new(Mutex::new(None::<String>));
+    let photos_skipped = Arc::new(AtomicBool::new(false));
     let output_reader_state = OutputReaderState {
         downloaded_files: Some(downloaded_files.clone()),
         storage_tracker: Some(storage_tracker.clone()),
         last_error: last_error.clone(),
         auth_retry,
+        photos_skipped: photos_skipped.clone(),
     };
 
     let stdout_reader = stdout.map(|stdout| {
@@ -4515,6 +4589,8 @@ async fn start_download(
                     raw_error.as_deref().map(friendly_conversion_error)
                 } else if low_disk {
                     raw_error.clone()
+                } else if kind == "completed" && photos_skipped.load(Ordering::Relaxed) {
+                    Some(PHOTOS_SKIPPED_NOTICE.into())
                 } else {
                     raw_error.as_deref().map(friendly_download_error)
                 };
@@ -4974,6 +5050,121 @@ mod tests {
     }
 
     #[test]
+    fn instagram_photo_is_last_resort_in_every_video_selector_only() {
+        let previous = [
+            (
+                "2160",
+                "bestvideo[height<=2160]+bestaudio/best[height<=2160]",
+            ),
+            (
+                "1080",
+                "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+            ),
+            ("720", "bestvideo[height<=720]+bestaudio/best[height<=720]"),
+            ("480", "bestvideo[height<=480]+bestaudio/best[height<=480]"),
+            ("best", "bestvideo+bestaudio/best"),
+        ];
+        for (quality, before) in previous {
+            assert_eq!(
+                format_selector("video", quality),
+                format!("{before}/{INSTAGRAM_PHOTO_FORMAT_ID}")
+            );
+        }
+        for quality in ["2160", "1080", "best"] {
+            assert!(!format_selector("audio", quality).contains(INSTAGRAM_PHOTO_FORMAT_ID));
+        }
+        assert_eq!(
+            photo_extractor_args("audio"),
+            Some(["--extractor-args", "instagram:baldojnyi_photos=skip"])
+        );
+        assert_eq!(photo_extractor_args("video"), None);
+    }
+
+    #[test]
+    fn instagram_plugin_markers_match_app_contract() {
+        for marker in [
+            INSTAGRAM_PHOTO_FORMAT_ID,
+            INSTAGRAM_PHOTO_ONLY_MARKER,
+            INSTAGRAM_PHOTOS_SKIPPED_MARKER,
+            "baldojnyi_photos",
+            "PHOTO_FIELD = 'baldojnyi_photo'",
+            "plugin_name='baldojnyi'",
+        ] {
+            assert!(
+                INSTAGRAM_PHOTOS_SOURCE.contains(marker),
+                "plugin is missing {marker}"
+            );
+        }
+        let error = format!(
+            "[Instagram] DeRf1RKjLc7: {INSTAGRAM_PHOTO_ONLY_MARKER}: this Instagram post contains only photos"
+        );
+        assert_eq!(download_error_code(&error), "photo_only");
+        assert!(friendly_download_error(&error).contains("лише фото"));
+        assert!(!friendly_download_error(&error).contains(INSTAGRAM_PHOTO_ONLY_MARKER));
+        assert!(!discovery::should_retry(&error));
+        assert!(is_expected_photo_warning(
+            "WARNING: Only images are available for download. use --list-formats to see them"
+        ));
+        assert!(!is_expected_photo_warning(
+            "WARNING: This video is drm protected and only images are available for download. use --list-formats to see them"
+        ));
+        assert!(!is_expected_photo_warning(
+            "ERROR: only images are available for download"
+        ));
+    }
+
+    #[test]
+    fn download_handoff_marks_only_plugin_photos() {
+        let photo = downloaded_media_from_print(
+            r#"{"filepath":"Photo by a [1].jpg","vcodec":"none","acodec":"none","baldojnyi_photo":true}"#,
+        )
+        .unwrap();
+        assert!(photo.photo);
+        for payload in [
+            r#"{"filepath":"clip.mp4"}"#,
+            r#"{"filepath":"clip.mp4","baldojnyi_photo":false}"#,
+            r#"{"filepath":"clip.mp4","baldojnyi_photo":"skipped"}"#,
+            r#"{"filepath":"clip.mp4","baldojnyi_photo":"NA"}"#,
+        ] {
+            assert!(
+                !downloaded_media_from_print(payload).unwrap().photo,
+                "{payload}"
+            );
+        }
+        assert!(!downloaded_media_from_print("/tmp/raw.jpg").unwrap().photo);
+    }
+
+    #[test]
+    fn photos_are_kept_as_downloaded_but_flag_never_bypasses_video() {
+        let ffmpeg_path = Path::new("/definitely/missing/ffmpeg");
+        let photo = DownloadedMedia {
+            identity: MediaIdentity::default(),
+            path: PathBuf::from("Photo by author [1].JPG"),
+            duration: None,
+            height: Some(1350),
+            fps: None,
+            video_codec: Some("none".into()),
+            audio_codec: Some("none".into()),
+            photo: true,
+        };
+        for output_format in ["mp4", "mp3", "m4a", "opus", "wav"] {
+            assert!(!requires_app_conversion(&photo, output_format, ffmpeg_path).unwrap());
+        }
+        let disguised = DownloadedMedia {
+            path: PathBuf::from("clip.mkv"),
+            ..photo.clone()
+        };
+        assert!(!is_downloaded_photo(&disguised));
+        assert!(requires_app_conversion(&disguised, "mp4", ffmpeg_path).unwrap());
+        assert!(requires_app_conversion(&disguised, "mp3", ffmpeg_path).unwrap());
+        let unflagged = DownloadedMedia {
+            photo: false,
+            ..photo
+        };
+        assert!(!is_downloaded_photo(&unflagged));
+    }
+
+    #[test]
     fn download_handoff_reports_selected_codecs() {
         let direct = downloaded_media_from_print(
             r#"{"filepath":"clip.mp4","duration":12,"vcodec":"avc1.640028","acodec":"mp4a.40.2"}"#,
@@ -5396,6 +5587,7 @@ mod tests {
             fps: Some(30.0),
             video_codec: Some("avc1.640028".into()),
             audio_codec: Some("mp4a.40.2".into()),
+            photo: false,
         };
         // Metadata alone cannot prove bit depth/HDR; a nonexistent file is not ready.
         assert!(requires_app_conversion(&compatible, "mp4", ffmpeg_path).is_err());
@@ -5481,23 +5673,41 @@ mod tests {
         fs::write(&unrelated, b"keep").unwrap();
 
         let installed_root = install_threads_plugin_at(&root).unwrap();
-        let installed = installed_root
+        let extractors = installed_root
             .join("baldojnyi")
             .join("yt_dlp_plugins")
-            .join("extractor")
-            .join("threads_baldojnyi.py");
+            .join("extractor");
+        let installed = extractors.join("threads_baldojnyi.py");
         assert_eq!(
             fs::read(&installed).unwrap(),
             THREADS_EXTRACTOR_SOURCE.as_bytes()
         );
+        for (filename, source, _) in YT_DLP_PLUGIN_MODULES {
+            assert_eq!(
+                fs::read(extractors.join(filename)).unwrap(),
+                source.as_bytes()
+            );
+        }
 
         fs::write(&installed, b"outdated").unwrap();
+        let instagram = extractors.join("instagram_baldojnyi.py");
+        fs::write(&instagram, b"outdated").unwrap();
         install_threads_plugin_at(&root).unwrap();
         assert_eq!(
             fs::read(&installed).unwrap(),
             THREADS_EXTRACTOR_SOURCE.as_bytes()
         );
+        assert_eq!(
+            fs::read(&instagram).unwrap(),
+            INSTAGRAM_PHOTOS_SOURCE.as_bytes()
+        );
         assert_eq!(fs::read(&unrelated).unwrap(), b"keep");
+        let leftovers: Vec<_> = fs::read_dir(&extractors)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -5536,7 +5746,7 @@ mod tests {
     fn selector_and_playlist_intent_are_explicit() {
         assert_eq!(
             format_selector("video", "1080"),
-            "bestvideo[height<=1080]+bestaudio/best[height<=1080]"
+            "bestvideo[height<=1080]+bestaudio/best[height<=1080]/baldojnyi-photo"
         );
         assert_eq!(format_selector("audio", "best"), "bestaudio/best");
         assert_eq!(

@@ -129,6 +129,7 @@ fn remux_preserves_every_decoded_video_pixel_in_cyrillic_path() {
         fps: Some(24.0),
         video_codec: Some("h264".into()),
         audio_codec: Some("aac".into()),
+        photo: false,
     };
     assert!(!requires_app_conversion(&ready, "mp4", &ffmpeg).unwrap());
     // A corrupt browser-delivered MP4 must expose the probe failure, not

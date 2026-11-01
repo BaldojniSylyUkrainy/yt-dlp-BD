@@ -287,7 +287,9 @@ export function applyDownloadEvent(current: Job, payload: DownloadEvent): Job | 
     status: payload.kind,
     errorCode: payload.errorCode,
     percent: payload.kind === "completed" ? 100 : current.percent,
-    message: payload.kind === "auth_required" ? "Потрібен вхід через браузер" : payload.message || current.message,
+    message: payload.kind === "auth_required"
+      ? "Потрібен вхід через браузер"
+      : payload.kind === "completed" ? payload.message || "Готово" : payload.message || current.message,
   };
 }
 
@@ -1353,7 +1355,7 @@ function App() {
             if (payload.kind === "retrying") return { ...item, status: "starting" as const, message: payload.message || "Повторюємо спробу…" };
             if (payload.kind === "completed") {
               const outputs = payload.outputs || [];
-              return { ...item, status: "completed" as const, percent: 100, message: "Готово", outputs, finalSize: outputs.reduce((sum, output) => sum + output.size, 0), errorCode: null };
+              return { ...item, status: "completed" as const, percent: 100, message: payload.message || "Готово", outputs, finalSize: outputs.reduce((sum, output) => sum + output.size, 0), errorCode: null };
             }
             if (payload.kind === "cancelled") {
               const status = cancellationIntent === "skip" ? "skipped" as const : "interrupted" as const;
@@ -2172,7 +2174,7 @@ function App() {
             <div className="job-icon" aria-label={`Етап ${jobStageNumber(job.status)}`}><span className="job-stage"><small>ЕТАП</small><strong>{jobStageNumber(job.status)}</strong></span></div>
           )}
           <div className="job-body">
-            <div className="job-title"><div ref={jobTitleTextRef}><strong id="download-progress-title">{job.title}</strong><small>{job.status === "completed" ? "Готово" : job.status === "failed" ? job.message || "Помилка завантаження" : job.status === "cancelled" ? "Скасовано" : job.message}</small></div><span style={{ fontSize: `${jobValueFontSize}px` }}>{job.status === "postprocessing" || job.status === "converting" ? job.outputFormat : `${Math.round(job.percent)}%`}</span></div>
+            <div className="job-title"><div ref={jobTitleTextRef}><strong id="download-progress-title">{job.title}</strong><small>{job.status === "completed" ? job.message || "Готово" : job.status === "failed" ? job.message || "Помилка завантаження" : job.status === "cancelled" ? "Скасовано" : job.message}</small></div><span style={{ fontSize: `${jobValueFontSize}px` }}>{job.status === "postprocessing" || job.status === "converting" ? job.outputFormat : `${Math.round(job.percent)}%`}</span></div>
             <div className="job-source" title={job.url}><Icon name="link" size={12}/><span>{job.url}</span></div>
             {!active && job.status === "failed" && <DownloadTools url={job.url} jobId={job.id} canDiscover={canOfferBrowserDiscovery(job.errorCode)}/>}
             {job.storage && <div className={`storage-estimate ${job.storage.sufficient === false ? "warning" : job.storage.sufficient === true ? "ready" : "unknown"}`}>

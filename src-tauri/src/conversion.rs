@@ -457,11 +457,31 @@ fn storage_errors_survive_conversion_classification() {
     assert_eq!(conversion_error_code("Encoder failed"), "conversion_failed");
 }
 
+const PHOTO_EXTENSIONS: [&str; 6] = ["jpg", "jpeg", "png", "webp", "heic", "avif"];
+
+/// A still photo from the Instagram plugin is kept exactly as downloaded. The
+/// extension check keeps the metadata flag from ever bypassing video handling.
+pub(super) fn is_downloaded_photo(media: &DownloadedMedia) -> bool {
+    media.photo
+        && media
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                PHOTO_EXTENSIONS
+                    .iter()
+                    .any(|allowed| extension.eq_ignore_ascii_case(allowed))
+            })
+}
+
 pub(super) fn requires_app_conversion(
     media: &DownloadedMedia,
     output_format: &str,
     ffmpeg_path: &Path,
 ) -> Result<bool, String> {
+    if is_downloaded_photo(media) {
+        return Ok(false);
+    }
     if output_format != "mp4" {
         return Ok(true);
     }
@@ -929,6 +949,7 @@ mod tests {
             fps: None,
             video_codec: Some("h264".into()),
             audio_codec: Some("aac".into()),
+            photo: false,
         };
         let error = requires_app_conversion(&media, "mp4", &missing.join("ffmpeg"))
             .expect_err("A failed probe must never request speculative conversion");

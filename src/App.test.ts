@@ -103,6 +103,13 @@ describe("download event state", () => {
     expect(next).toMatchObject({ status: "auth_required", message: "Потрібен вхід через браузер" });
   });
 
+  it("shows a completion notice from the backend and never a stale progress line", () => {
+    const busy = { ...startingJob, message: "Завантаження 40%" };
+    expect(applyDownloadEvent(busy, event("completed"))).toMatchObject({ status: "completed", message: "Готово" });
+    const notice = "Готово. Фото з поста пропущено: режим «Аудіо» зберігає лише звук.";
+    expect(applyDownloadEvent(busy, event("completed", { message: notice }))).toMatchObject({ status: "completed", message: notice });
+  });
+
   it("removes a cancelled job", () => {
     expect(applyDownloadEvent(startingJob, event("cancelled"))).toBeNull();
   });

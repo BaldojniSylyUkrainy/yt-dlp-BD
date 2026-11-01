@@ -57,6 +57,9 @@ jobs:
       - run: python scripts/discovery-extractor-test.py
         env:
           PYTHONDONTWRITEBYTECODE: 1
+      - run: python scripts/instagram-photo-test.py
+        env:
+          PYTHONDONTWRITEBYTECODE: 1
       - run: npm run build
       - name: Select stable Rust
         run: |

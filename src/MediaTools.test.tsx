@@ -12,7 +12,7 @@ afterEach(() => { cleanup(); vi.clearAllMocks(); });
 
 describe("interactive recovery and diagnostic controls", () => {
   it("does not offer media discovery for conversion, disk, login or network problems", () => {
-    for (const code of ["low_disk", "auth_required", "conversion_failed", "network", "rate_limited", "start_failed"]) expect(canOfferBrowserDiscovery(code)).toBe(false);
+    for (const code of ["low_disk", "auth_required", "conversion_failed", "network", "rate_limited", "start_failed", "photo_only"]) expect(canOfferBrowserDiscovery(code)).toBe(false);
     expect(canOfferBrowserDiscovery("unsupported")).toBe(true);
     render(<DownloadTools url="https://example.com/video" jobId="job"/>);
     expect(screen.queryByRole("button")).toBeNull();
