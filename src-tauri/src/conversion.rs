@@ -447,6 +447,9 @@ pub(super) fn is_ready_compatible_mp4(
 }
 
 pub(super) fn conversion_error_code(error: &str) -> &'static str {
+    if error.contains(DESTINATION_UNAVAILABLE_MESSAGE) {
+        return "destination_unavailable";
+    }
     if error.to_lowercase().contains("недостатньо вільного місця") {
         return "low_disk";
     }
@@ -675,6 +678,7 @@ pub(super) fn run_conversion_attempt(
     };
     let mut speed_label = encoder_label.to_string();
     let mut low_disk = false;
+    let mut destination_unavailable = false;
     if let Some(stdout) = stdout {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             if let Some(value) = line.strip_prefix("out_time_us=") {
@@ -691,11 +695,10 @@ pub(super) fn run_conversion_attempt(
                     .parse::<f64>()
                     .unwrap_or(speed_value);
             } else if line.starts_with("progress=") {
-                if available_disk_space(output_dir)
-                    .map(low_disk_guard_triggered)
-                    .unwrap_or(true)
-                {
+                let guard = disk_guard(output_dir);
+                if guard != DiskGuard::Ok {
                     low_disk = true;
+                    destination_unavailable = guard == DiskGuard::Unavailable;
                     let _ = stop_child_process_group(&child);
                     break;
                 }
@@ -752,6 +755,9 @@ pub(super) fn run_conversion_attempt(
 
     if download_was_cancelled(manager, id) {
         return Err(ConversionAttemptError::Cancelled);
+    }
+    if destination_unavailable || (!status.success() && !destination_present(output_dir)) {
+        return Err(ConversionAttemptError::DestinationUnavailable);
     }
     if low_disk {
         return Err(ConversionAttemptError::LowDisk);
@@ -830,13 +836,14 @@ pub(super) fn convert_downloaded_media(
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
-    if available_disk_space(&output_dir)
-        .map(low_disk_guard_triggered)
-        .unwrap_or(true)
-    {
-        return Err(
-            "Недостатньо вільного місця. Конвертацію не розпочато, щоб захистити диск.".into(),
-        );
+    match disk_guard(&output_dir) {
+        DiskGuard::Ok => {}
+        DiskGuard::Unavailable => return Err(DESTINATION_UNAVAILABLE_MESSAGE.into()),
+        DiskGuard::Low => {
+            return Err(
+                "Недостатньо вільного місця. Конвертацію не розпочато, щоб захистити диск.".into(),
+            )
+        }
     }
     let temporary = output_dir
         .join(format!(".yt-dlp-bd-{id}.tmp"))
@@ -925,6 +932,10 @@ pub(super) fn convert_downloaded_media(
             Err(ConversionAttemptError::Cancelled) => {
                 cleanup_failed_conversion(&temporary);
                 return Err("Завантаження скасовано".into());
+            }
+            Err(ConversionAttemptError::DestinationUnavailable) => {
+                cleanup_failed_conversion(&temporary);
+                return Err(DESTINATION_UNAVAILABLE_MESSAGE.into());
             }
             Err(ConversionAttemptError::LowDisk) => {
                 cleanup_failed_conversion(&temporary);
