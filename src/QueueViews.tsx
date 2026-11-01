@@ -17,6 +17,20 @@ function queueStatusLabel(item: QueueItem): string {
   return "Перервано";
 }
 
+const GENERIC_PROGRESS_MESSAGES = new Set(["Завантаження…", "Завантажуємо…", "Створюємо сумісний файл…"]);
+
+/** Status line of a queue row: what is happening, plus speed and time left while it runs. */
+export function queueItemDetail(item: QueueItem): string {
+  const status = queueStatusLabel(item);
+  const parts = [status];
+  if (item.message && item.message !== status && !GENERIC_PROGRESS_MESSAGES.has(item.message)) parts.push(item.message);
+  if (item.status === "downloading" || item.status === "converting") {
+    if (item.speed && item.speed !== "—") parts.push(item.speed);
+    if (item.eta && item.eta !== "—") parts.push(`залишилось ${item.eta}`);
+  }
+  return parts.join(" · ");
+}
+
 function queueStorageLabel(item: QueueItem): string | null {
   if (!item.storage) return null;
   const available = item.storage.availableSpace === null ? "вільне місце невідоме" : `вільно ${formatByteSize(item.storage.availableSpace)}`;
@@ -93,7 +107,7 @@ export function QueueView({ queue, input, notice, runtimeReady, singleDownloadAc
           {itemEditable
             ? <input value={item.url} aria-label={`Посилання ${index + 1}`} onChange={(event) => onChangeItem(item.id, event.target.value)} />
             : <strong title={item.url}>{item.title || item.url}</strong>}
-          <small className={normalizeHttpUrl(item.url) ? "" : "invalid"}>{queueStatusLabel(item)}{item.message && item.message !== queueStatusLabel(item) ? ` · ${item.message}` : ""}</small>
+          <small className={normalizeHttpUrl(item.url) ? "" : "invalid"}>{queueItemDetail(item)}</small>
           {storageLabel && <small className={item.storage?.sufficient === false ? "invalid" : "queue-storage"}>{storageLabel}</small>}
           {item.id === activeItem?.id && <div className={`queue-item-progress ${item.status === "postprocessing" ? "indeterminate" : ""}`}><span style={item.status === "postprocessing" ? undefined : { width: `${item.percent}%` }}/></div>}
         </div>
@@ -167,7 +181,7 @@ export function QueueProgressModal({ queue, alert, singleDownloadActive, onClose
             <span className="queue-progress-index">{String(index + 1).padStart(2, "0")}</span>
             <div className="queue-progress-copy">
               <strong title={item.title || item.url}>{item.title || item.url}</strong>
-              <small>{queueStatusLabel(item)}{item.message && item.message !== queueStatusLabel(item) ? ` · ${item.message}` : ""}</small>
+              <small>{queueItemDetail(item)}</small>
               {!activeItem && ["failed", "interrupted"].includes(item.status) && item.jobId && <DownloadTools url={item.url} jobId={item.jobId} canDiscover={canOfferBrowserDiscovery(item.errorCode)}/>}
               {active && <div className={`queue-item-progress ${item.status === "postprocessing" ? "indeterminate" : ""}`}><span style={item.status === "postprocessing" ? undefined : { width: `${item.percent}%` }}/></div>}
             </div>
