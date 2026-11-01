@@ -59,7 +59,7 @@ export function StartupOverlay({ progress, message }: { progress: number; messag
   </div>;
 }
 
-export function RuntimePreparationOverlay({ stage, runtime, progress }: { stage: RuntimeStage; runtime: RuntimeStatus | null; progress: RuntimeInstallProgress | null }) {
+export function RuntimePreparationOverlay({ stage, runtime, progress, pending = [] }: { stage: RuntimeStage; runtime: RuntimeStatus | null; progress: RuntimeInstallProgress | null; pending?: ReadonlyArray<Exclude<RuntimeStage, null>> }) {
   const components = [
     { key: "ytDlp", label: "yt-dlp", component: runtime?.ytDlp },
     { key: "ffmpeg", label: "ffmpeg", component: runtime?.ffmpeg },
@@ -75,11 +75,14 @@ export function RuntimePreparationOverlay({ stage, runtime, progress }: { stage:
       <div className="runtime-preparation-list" aria-label="Стан компонентів">
         {components.map(({ key, label, component }) => {
           const activeStage = stage === key;
-          const ready = Boolean(component?.installed) && !activeStage;
+          // A component still queued in this run is not "ready", even if an older
+          // version is installed: it may be about to be downloaded again.
+          const queued = !activeStage && pending.includes(key);
+          const ready = Boolean(component?.installed) && !activeStage && !queued;
           return <div className={activeStage ? "active" : ready ? "ready" : "waiting"} key={key}>
             <span className="runtime-preparation-status">{ready ? <Icon name="check" size={14}/> : <i/>}</span>
             <strong>{label}</strong>
-            <small>{activeStage ? progress?.component === key && progress.total ? `${Math.min(100, Math.round((progress.downloaded / progress.total) * 100))}%` : "Встановлюємо…" : ready ? "Готово" : "Очікує"}</small>
+            <small>{activeStage ? progress?.component === key && progress.total ? `${Math.min(100, Math.round((progress.downloaded / progress.total) * 100))}%` : "Встановлюємо…" : ready ? "Готово" : queued ? "У черзі" : "Очікує"}</small>
           </div>;
         })}
       </div>
