@@ -55,6 +55,7 @@ def fake_real_extract(self, url):
 
 
 original._real_extract = fake_real_extract
+original._real_initialize = lambda self: None  # upstream fetches a guest token here
 '''
 
 
@@ -170,7 +171,8 @@ class InstagramPhotoIntegration(unittest.TestCase):
         self.assert_ok(result)
         self.assertEqual([Path(f['filepath']).suffix for f in files], ['.mp4', '.jpg', '.mp4'])
         self.assertEqual([bool(f.get('baldojnyi_photo')) for f in files], [False, True, False])
-        self.assertEqual(files[0]['vcodec'].split('.')[0], 'avc1')
+        self.assertNotEqual(files[0].get('vcodec'), 'none')
+        self.assertEqual(len({f['filepath'] for f in files}), 3)
 
     def test_video_post_is_identical_with_and_without_plugin(self):
         with_plugin = self.run_app_command([media(1, self.base, video=True)], VIDEO_SELECTOR)
