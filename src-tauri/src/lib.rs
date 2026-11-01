@@ -233,6 +233,7 @@ impl VideoEncoder {
 enum ConversionAttemptError {
     Cancelled,
     LowDisk,
+    DestinationUnavailable,
     Failed(String),
 }
 
@@ -876,6 +877,34 @@ fn low_disk_guard_triggered(available: u64) -> bool {
 
 fn available_disk_space(path: &Path) -> Option<u64> {
     fs2::available_space(path).ok()
+}
+
+/// Shown when the save folder disappears mid-job, e.g. an external drive was
+/// unplugged. `errors.rs` recognises this text to pick the error code.
+pub(crate) const DESTINATION_UNAVAILABLE_MESSAGE: &str =
+    "Папка збереження стала недоступною: диск від’єднано або папку видалено. Під’єднайте диск і повторіть.";
+
+#[derive(Debug, PartialEq)]
+enum DiskGuard {
+    Ok,
+    Low,
+    Unavailable,
+}
+
+/// Free space alone cannot tell a full disk from a missing one: both fail the
+/// space query. A folder that no longer exists is reported as unavailable; any
+/// other unknown state still stops the job to protect the disk.
+fn disk_guard(path: &Path) -> DiskGuard {
+    match available_disk_space(path) {
+        Some(available) if low_disk_guard_triggered(available) => DiskGuard::Low,
+        Some(_) => DiskGuard::Ok,
+        None if !destination_present(path) => DiskGuard::Unavailable,
+        None => DiskGuard::Low,
+    }
+}
+
+fn destination_present(path: &Path) -> bool {
+    path.try_exists().unwrap_or(false)
 }
 
 #[cfg(target_os = "macos")]
@@ -1611,6 +1640,7 @@ async fn start_download(
         let mut discovery_started: Option<Instant> = None;
         let mut last_disk_check = Instant::now();
         let mut low_disk = false;
+        let mut destination_unavailable = false;
         loop {
             if discovery_started.is_some_and(|start| start.elapsed() > Duration::from_secs(25)) {
                 discovery_started = None;
@@ -1621,13 +1651,17 @@ async fn start_download(
             }
             if !low_disk && last_disk_check.elapsed() >= Duration::from_secs(1) {
                 last_disk_check = Instant::now();
-                if available_disk_space(&monitored_output_dir)
-                    .map(low_disk_guard_triggered)
-                    .unwrap_or(true)
-                {
+                let guard = disk_guard(&monitored_output_dir);
+                if guard != DiskGuard::Ok {
+                    // Both stop the job the same way; only the explanation differs.
                     low_disk = true;
+                    destination_unavailable = guard == DiskGuard::Unavailable;
                     if let Ok(mut error) = last_error.lock() {
-                        *error = Some("Недостатньо вільного місця. Процес зупинено, щоб зберегти резерв 500 МіБ.".into());
+                        *error = Some(if destination_unavailable {
+                            DESTINATION_UNAVAILABLE_MESSAGE.into()
+                        } else {
+                            "Недостатньо вільного місця. Процес зупинено, щоб зберегти резерв 500 МіБ.".into()
+                        });
                     }
                     let _ = stop_child_process_group(&active_child);
                 }
@@ -1860,6 +1894,15 @@ async fn start_download(
                 cleanup_download_temp_dir(&job_temp_dir);
                 recovery::finish(&monitor_app, &monitor_id, &job_temp_dir);
                 cancelled |= job_process::finish(&manager, &monitor_id);
+                // A write error from yt-dlp or FFmpeg can arrive before the
+                // next disk check; a vanished folder explains it either way.
+                if !cancelled
+                    && (!status.success() || conversion_error.is_some())
+                    && !destination_present(&monitored_output_dir)
+                {
+                    low_disk = true;
+                    destination_unavailable = true;
+                }
                 let kind = terminal_kind(
                     cancelled,
                     auth_required,
@@ -1867,7 +1910,12 @@ async fn start_download(
                     status.success(),
                     conversion_error.is_some(),
                 );
-                let raw_error = conversion_error.clone().or_else(|| {
+                let raw_error = if destination_unavailable {
+                    Some(DESTINATION_UNAVAILABLE_MESSAGE.to_string())
+                } else {
+                    conversion_error.clone()
+                }
+                .or_else(|| {
                     if low_disk {
                         return Some(
                             "Недостатньо вільного місця. Процес зупинено, щоб захистити диск."
@@ -1881,7 +1929,9 @@ async fn start_download(
                 if let Some(error) = raw_error.as_deref() {
                     diagnostics::record(&monitor_id, error);
                 }
-                let message = if conversion_error.is_some() {
+                let message = if destination_unavailable {
+                    raw_error.clone()
+                } else if conversion_error.is_some() {
                     raw_error.as_deref().map(friendly_conversion_error)
                 } else if low_disk {
                     raw_error.clone()
@@ -1897,6 +1947,7 @@ async fn start_download(
                     "completed" => None,
                     "cancelled" => Some("cancelled".into()),
                     "auth_required" => Some("auth_required".into()),
+                    _ if destination_unavailable => Some("destination_unavailable".into()),
                     _ if low_disk => Some("low_disk".into()),
                     _ if conversion_error.is_some() => {
                         Some(conversion_error_code(raw_error.as_deref().unwrap_or_default()).into())
@@ -2616,6 +2667,26 @@ mod tests {
         assert!(low_disk_guard_triggered(DISK_GUARD_TRIGGER));
         assert!(low_disk_guard_triggered(MIN_FREE_SPACE_RESERVE));
         assert!(!low_disk_guard_triggered(DISK_GUARD_TRIGGER + 1));
+    }
+
+    #[test]
+    fn an_unplugged_drive_is_not_reported_as_a_full_disk() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("unplugged drive").join("Downloads");
+        assert_eq!(disk_guard(&missing), DiskGuard::Unavailable);
+        assert_ne!(disk_guard(directory.path()), DiskGuard::Unavailable);
+        assert_eq!(
+            download_error_code(DESTINATION_UNAVAILABLE_MESSAGE),
+            "destination_unavailable"
+        );
+        assert_eq!(
+            conversion_error_code(DESTINATION_UNAVAILABLE_MESSAGE),
+            "destination_unavailable"
+        );
+        assert_eq!(
+            friendly_conversion_error(DESTINATION_UNAVAILABLE_MESSAGE),
+            DESTINATION_UNAVAILABLE_MESSAGE
+        );
     }
 
     #[test]

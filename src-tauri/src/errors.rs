@@ -45,6 +45,9 @@ fn is_network_failure(value: &str) -> bool {
 }
 
 pub(crate) fn friendly_download_error(message: &str) -> String {
+    if message.contains(crate::DESTINATION_UNAVAILABLE_MESSAGE) {
+        return crate::DESTINATION_UNAVAILABLE_MESSAGE.into();
+    }
     if message.contains(INSTAGRAM_PHOTO_ONLY_MARKER) {
         return "У цьому пості лише фото. Щоб зберегти їх, виберіть режим «Відео».".into();
     }
@@ -157,6 +160,9 @@ pub(crate) fn friendly_download_error(message: &str) -> String {
 }
 
 pub(crate) fn friendly_conversion_error(message: &str) -> String {
+    if message.contains(crate::DESTINATION_UNAVAILABLE_MESSAGE) {
+        return crate::DESTINATION_UNAVAILABLE_MESSAGE.into();
+    }
     let value = message.to_ascii_lowercase();
     if value.contains("недостатньо вільного місця") || value.contains("no space left")
     {
@@ -178,6 +184,9 @@ pub(crate) fn friendly_conversion_error(message: &str) -> String {
 }
 
 pub(crate) fn download_error_code(message: &str) -> &'static str {
+    if message.contains(crate::DESTINATION_UNAVAILABLE_MESSAGE) {
+        return "destination_unavailable";
+    }
     if message.contains(INSTAGRAM_PHOTO_ONLY_MARKER) {
         return "photo_only";
     }
